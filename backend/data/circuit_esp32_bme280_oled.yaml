@@ -1,0 +1,130 @@
+# FundiLoop target circuit: ESP32 DevKit + BME280 + SSD1306 OLED + LED.
+# This is the ONLY circuit the MVP supports.
+name: ESP32 + BME280 + OLED assembly
+patient_board: ESP32 DevKit (USB serial, 115200 baud)
+
+i2c:
+  sda_gpio: 21
+  scl_gpio: 22
+  expected:
+    bme280: ["0x76", "0x77"]  # either address is acceptable
+    oled: ["0x3C"]
+
+led:
+  gpio: 2
+  active_high: true
+  series_resistor_ohm: 220
+
+steps:
+  - step_id: S1_MOUNT_ESP32
+    instruction_student: >-
+      Place the ESP32 DevKit on the bench with the USB port facing you and
+      plug the USB cable into the laptop. Do not wire anything yet.
+    instruction_pro: Seat ESP32 DevKit, connect USB serial to host.
+    expected_component: ESP32 DevKit
+    verification_test: PING
+    success_criteria: Patient board replies to PING with status OK.
+
+  - step_id: S2_GND_RAIL
+    instruction_student: >-
+      Connect a black jumper wire from any GND pin on the ESP32 to the
+      breadboard ground rail. Tug it gently to confirm it is seated.
+    instruction_pro: Wire ESP32 GND to breadboard ground rail.
+    expected_component: GND jumper wire
+    verification_test: PING
+    success_criteria: Board still replies to PING (no short introduced).
+
+  - step_id: S3_3V3_RAIL
+    instruction_student: >-
+      Connect a red jumper wire from the 3V3 pin on the ESP32 to the
+      breadboard power rail. Double-check you used 3V3, not 5V or VIN.
+    instruction_pro: Wire ESP32 3V3 to breadboard power rail.
+    expected_component: 3V3 jumper wire
+    verification_test: PING
+    success_criteria: Board still replies to PING (rails powered, no short).
+
+  - step_id: S4_BME280_WIRING
+    instruction_student: >-
+      Wire the BME280 module: VCC to 3V3 rail, GND to ground rail,
+      SDA to GPIO 21, SCL to GPIO 22. Check SDA and SCL are not swapped.
+    instruction_pro: Wire BME280 (VCC/3V3, GND, SDA/21, SCL/22).
+    expected_component: BME280 sensor module
+    verification_test: RUN_I2C_SCAN
+    success_criteria: I2C scan finds the BME280 at 0x76 or 0x77.
+    expect_i2c_any: [["0x76", "0x77"]]
+
+  - step_id: S5_BME280_READING
+    instruction_student: >-
+      Keep your hands off the board. The system will now read a live
+      temperature, humidity, and pressure sample from the BME280.
+    instruction_pro: Confirm live BME280 environmental sample.
+    expected_component: BME280 sensor module
+    verification_test: READ_SENSOR
+    success_criteria: Sensor returns temperature between 10 and 40 C.
+    expect_i2c_any: [["0x76", "0x77"]]
+
+  - step_id: S6_OLED_WIRING
+    instruction_student: >-
+      Wire the OLED display: VCC to 3V3 rail, GND to ground rail,
+      SDA to GPIO 21, SCL to GPIO 22 (shared I2C bus with the BME280).
+    instruction_pro: Wire SSD1306 OLED onto the shared I2C bus.
+    expected_component: SSD1306 OLED display
+    verification_test: RUN_I2C_SCAN
+    success_criteria: I2C scan finds both the BME280 and the OLED at 0x3C.
+    expect_i2c: ["0x3C"]
+    expect_i2c_any: [["0x76", "0x77"]]
+
+  - step_id: S7_OLED_DISPLAY
+    instruction_student: >-
+      Look at the OLED screen. It should light up and show live sensor
+      values. If it stays dark, check its VCC and GND wires first.
+    instruction_pro: Confirm OLED renders live sensor values.
+    expected_component: SSD1306 OLED display
+    verification_test: CHECK_OLED
+    success_criteria: OLED lights and renders text without I2C errors.
+    expect_i2c: ["0x3C"]
+    expect_i2c_any: [["0x76", "0x77"]]
+    expect_oled_lit: true
+
+  - step_id: S8_LED_SELFTEST
+    instruction_student: >-
+      Connect the LED anode (long leg) through a 220 ohm resistor to
+      GPIO 2, and the cathode (short leg) to ground. Then run the full
+      self-test: the LED must blink and every check must pass.
+    instruction_pro: Wire LED (GPIO 2, 220R) and run full SELFTEST.
+    expected_component: LED on GPIO 2
+    verification_test: SELFTEST
+    success_criteria: >-
+      SELFTEST passes: I2C finds 0x3C and 0x76/0x77, OLED lit,
+      sensor reads valid, LED blinks.
+    expect_i2c: ["0x3C"]
+    expect_i2c_any: [["0x76", "0x77"]]
+    expect_oled_lit: true
+    expect_led: true
+
+faults:
+  SDA_SCL_SWAPPED:
+    description: SDA and SCL wires are swapped on a module.
+    observable_evidence:
+      - I2C scan finds no devices even though wiring looks complete
+      - Swapping the two middle wires makes devices appear
+  LOOSE_GND:
+    description: Ground connection is loose or missing.
+    observable_evidence:
+      - I2C scan intermittently finds devices or finds none
+      - Pressing on the GND wire changes the scan result
+  CODE_PIN_MISMATCH:
+    description: Firmware uses different pins than the wired circuit.
+    observable_evidence:
+      - Wiring matches the guide but LED or bus stays dead
+      - User code snippet references a different GPIO than the config
+  SENSOR_DISCONNECTED:
+    description: BME280 module is not on the bus.
+    observable_evidence:
+      - I2C scan finds 0x3C but neither 0x76 nor 0x77
+      - Sensor read returns an error
+  LED_REVERSED:
+    description: LED is installed backwards (cathode toward GPIO).
+    observable_evidence:
+      - GPIO 2 toggles but the LED never lights
+      - Flipping the LED fixes it with no other change

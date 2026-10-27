@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FundiLoop</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>FundiLoop</h1>
+    <p class="sub">verifiable assembly + diagnostic agent</p>
+  </div>
+  <span id="fallback-badge" hidden></span>
+</header>
+
+<div class="mode-row" role="tablist" aria-label="Mode">
+  <button id="mode-guided" class="mode active" type="button">Guided Assembly</button>
+  <button id="mode-diag" class="mode" type="button">Diagnostic</button>
+</div>
+
+<figure class="cam">
+  <img id="preview" alt="overhead camera view of the circuit">
+  <div id="cam-overlay" hidden></div>
+</figure>
+<div id="cam-src" class="fine"></div>
+
+<div id="instruction" role="status">Loading session…</div>
+<div id="state-line" class="fine"></div>
+
+<button id="check" class="big primary" type="button">CHECK NOW</button>
+<button id="talk" class="big secondary" type="button">PUSH TO TALK</button>
+<div class="btn-row">
+  <button id="replay" class="small" type="button">REPLAY</button>
+  <button id="mute" class="small" type="button">MUTE</button>
+  <button id="demo" class="small" type="button">DEMO: ON</button>
+</div>
+<div id="talk-hint" class="fine"></div>
+
+<section>
+  <h2>Verification</h2>
+  <div id="verify" class="panel">No measurements yet. Press CHECK NOW.</div>
+</section>
+
+<section>
+  <h2>Steps</h2>
+  <ol id="checklist" class="panel list"></ol>
+</section>
+
+<section id="passport-sec" hidden>
+  <h2>Passport</h2>
+  <div id="passport" class="panel"></div>
+</section>
+
+<details>
+  <summary>Advanced: code snippet + fault injection (mock testing)</summary>
+  <label for="code">Paste patient-board code to check pin usage:</label>
+  <textarea id="code" placeholder="e.g. #define LED_PIN 4"></textarea>
+  <label for="fault">Simulate fault:</label>
+  <select id="fault">
+    <option value="">none (healthy circuit)</option>
+    <option>SDA_SCL_SWAPPED</option>
+    <option>LOOSE_GND</option>
+    <option>CODE_PIN_MISMATCH</option>
+    <option>SENSOR_DISCONNECTED</option>
+    <option>LED_REVERSED</option>
+  </select>
+  <div class="fine">Fault injection only affects mock probe data. Clear it and press CHECK NOW to verify the fix.</div>
+  <label for="voice">Spoken voice:</label>
+  <select id="voice">
+    <option value="">Auto (best available)</option>
+  </select>
+</details>
+
+<script src="/app.js"></script>
+</body>
+</html>

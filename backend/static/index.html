@@ -6,43 +6,160 @@
 <title>FundiLoop</title>
 <style>
   body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; padding: 16px; background: #111; color: #f2f2f2; }
-  h1 { font-size: 32px; margin: 0 0 12px; }
-  #instruction { font-size: 20px; line-height: 1.4; background: #1e1e1e; border: 1px solid #444; padding: 16px; min-height: 80px; margin-bottom: 12px; }
-  .btn { display: block; width: 100%; min-height: 64px; font-size: 22px; font-weight: 700; margin: 8px 0; border: 0; cursor: pointer; }
+  h1 { font-size: 32px; margin: 0 0 8px; }
+  h2 { font-size: 18px; margin: 16px 0 8px; color: #bbb; }
+  #instruction { font-size: 22px; line-height: 1.4; background: #1e1e1e; border: 2px solid #888; padding: 16px; min-height: 80px; margin: 12px 0; }
+  #indicator { font-size: 20px; font-weight: 700; text-align: center; background: #f9a825; color: #111; padding: 12px; margin: 8px 0; }
+  .btn { display: block; width: 100%; min-height: 64px; font-size: 22px; font-weight: 700; margin: 8px 0; border: 0; cursor: pointer; touch-action: none; }
   #check { background: #2e7d32; color: #fff; }
-  #talk { background: #1565c0; color: #fff; }
+  #test-cam { background: #00695c; color: #fff; }
+  #preview { width: 100%; margin: 8px 0 0; display: block; }
+  #cam-status { font-size: 14px; color: #bbb; margin: 4px 0 8px; word-break: break-all; }
+  #talk { background: #1565c0; color: #fff; user-select: none; -webkit-user-select: none; }
   #talk.rec { background: #b71c1c; }
+  .btn-row { display: flex; gap: 8px; }
+  .btn-row .btn { min-height: 56px; font-size: 18px; }
+  #mute { background: #6a1b9a; color: #fff; }
   #reset { background: #424242; color: #fff; }
-  #status { background: #1e1e1e; border: 1px solid #444; padding: 12px; font-size: 14px; white-space: pre-wrap; margin-top: 12px; }
-  #manual { width: 100%; box-sizing: border-box; min-height: 64px; margin-top: 12px; font-size: 13px; }
+  .turn { background: #1e1e1e; border: 1px solid #444; padding: 12px; margin: 8px 0; font-size: 16px; line-height: 1.5; }
+  .turn.empty { color: #888; }
+  #status { background: #1e1e1e; border: 1px solid #444; padding: 12px; font-size: 14px; white-space: pre-wrap; }
+  #manual { width: 100%; box-sizing: border-box; min-height: 64px; margin-top: 8px; font-size: 13px; }
   label { font-size: 14px; color: #bbb; }
   #cam { font-size: 12px; color: #888; margin-bottom: 8px; word-break: break-all; }
+  details { background: #1e1e1e; border: 1px solid #444; padding: 8px 12px; margin-bottom: 8px; }
+  summary { font-size: 16px; cursor: pointer; padding: 4px 0; }
+  input[type="text"] { font-size: 18px; padding: 10px; width: 100%; box-sizing: border-box; margin: 8px 0; }
+  #save-host, #send-typed { font-size: 18px; font-weight: 700; padding: 12px 20px; min-height: 52px; cursor: pointer; }
+  #save-host { background: #2e7d32; color: #fff; border: 0; width: 100%; }
+  #send-typed { background: #1565c0; color: #fff; border: 0; width: 100%; margin-top: 4px; }
+  #settings-msg, #fallback-msg { font-size: 14px; color: #bbb; margin-top: 4px; }
+  #fallback { background: #1e1e1e; border: 2px solid #f9a825; padding: 12px; margin: 8px 0; }
 </style>
 </head>
 <body>
 <h1>FundiLoop</h1>
 <div id="cam">cam: …</div>
-<div id="instruction">Press CHECK NOW to start.</div>
+<details id="settings">
+  <summary>Settings</summary>
+  <label for="host">Camera host (mDNS name or IP):</label>
+  <input id="host" type="text" value="fundiloop.local" autocomplete="off">
+  <button id="save-host">Save</button>
+  <div id="settings-msg"></div>
+</details>
+<div id="instruction" role="status">Press CHECK NOW to start.</div>
+<div id="indicator" hidden></div>
 <button class="btn" id="check">CHECK NOW</button>
+<button class="btn" id="test-cam">TEST CAMERA</button>
+<img id="preview" hidden alt="camera preview">
+<div id="cam-status"></div>
 <button class="btn" id="talk">PUSH TO TALK</button>
-<button class="btn" id="reset">RESET</button>
+<div class="btn-row">
+  <button class="btn" id="mute">MUTE</button>
+  <button class="btn" id="reset">RESET</button>
+</div>
+<div id="fallback" hidden>
+  <div id="fallback-msg">Microphone unavailable — type instead:</div>
+  <label for="typed">Say it in text:</label>
+  <input id="typed" type="text" placeholder="type what you would say" autocomplete="off">
+  <button id="send-typed">Send</button>
+</div>
+
+<h2>Loop</h2>
+<div id="turns"><div class="turn empty">No turns yet.</div></div>
+<h2>Status</h2>
 <div id="status">state: —</div>
 <label for="manual">Manual probe JSON (optional, overrides /probe):</label>
 <textarea id="manual" placeholder='{"found":["0x3C"],"missing":["0x76"],"raw":"manual","timestamp":""}'></textarea>
 
 <script>
 let history = [];
-let camUrl = "http://192.0.2.10/capture"; // placeholder; edit or set ESP32_CAM_URL
+let turns = [];
+let camUrl = "http://fundiloop.local/capture";
+let camHost = "fundiloop.local";
+let muted = false;
 const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-fetch("/config").then((r) => r.json()).then((c) => {
-  if (c.cam_url) camUrl = c.cam_url;
+async function loadConfig() {
+  try {
+    const c = await (await fetch("/config")).json();
+    if (c.esp32_host) { camHost = c.esp32_host; $("host").value = camHost; }
+    if (c.cam_url) camUrl = c.cam_url;
+  } catch (e) { console.log("config load failed", e); }
   $("cam").textContent = "cam: " + camUrl;
-}).catch(() => { $("cam").textContent = "cam: " + camUrl; });
+}
+loadConfig();
+
+$("save-host").onclick = async () => {
+  const v = $("host").value.trim();
+  if (!v) { $("settings-msg").textContent = "Enter a host first."; return; }
+  try {
+    const c = await (await fetch("/config", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ esp32_host: v }),
+    })).json();
+    if (c.esp32_host) camHost = c.esp32_host;
+    if (c.cam_url) camUrl = c.cam_url;
+    $("cam").textContent = "cam: " + camUrl;
+    $("settings-msg").textContent = "Saved — no restart needed.";
+  } catch (e) { $("settings-msg").textContent = "Save failed: " + e.message; }
+};
+
+function speak(text) {
+  if (muted || !text) return;
+  try {
+    if (!("speechSynthesis" in window)) return;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "en-US";
+    speechSynthesis.speak(u);
+  } catch (e) { console.log("speech failed", e); }
+}
 
 function setInstruction(t) {
-  $("instruction").textContent = t;
-  try { speechSynthesis.cancel(); speechSynthesis.speak(new SpeechSynthesisUtterance(t)); } catch (e) {}
+  $("instruction").textContent = t; // prominent text always; speech on top
+  speak(t);
+}
+
+$("mute").onclick = () => {
+  muted = !muted;
+  if (muted) { try { speechSynthesis.cancel(); } catch (e) {} }
+  $("mute").textContent = muted ? "UNMUTE" : "MUTE";
+};
+
+function showIndicator(t) {
+  const el = $("indicator");
+  if (!t) { el.hidden = true; el.textContent = ""; return; }
+  el.hidden = false; el.textContent = t;
+}
+
+function showFallback(msg) {
+  $("fallback").hidden = false;
+  if (msg) $("fallback-msg").textContent = msg;
+}
+
+function addTurn(t) {
+  turns.unshift(t);
+  turns = turns.slice(0, 4);
+  renderTurns();
+}
+
+function renderTurns() {
+  if (!turns.length) {
+    $("turns").innerHTML = '<div class="turn empty">No turns yet.</div>';
+    return;
+  }
+  $("turns").innerHTML = turns.map((t) =>
+    '<div class="turn">' +
+    "<div><b>You:</b> " + esc(t.tech || "—") + "</div>" +
+    "<div><b>Loop:</b> " + esc(t.loop || "—") + "</div>" +
+    "<div><b>Probe:</b> found [" + esc((t.found || []).join(", ") || "—") +
+    "] missing [" + esc((t.missing || []).join(", ") || "—") + "]</div>" +
+    "<div><b>State:</b> " + esc(t.state || "—") +
+    " (" + esc(String(t.confidence ?? "—")) + ")</div>" +
+    "</div>"
+  ).join("");
 }
 
 function setStatus(d) {
@@ -53,17 +170,82 @@ function setStatus(d) {
     "verify: " + (d.verification_test || "—");
 }
 
-async function captureBlob() {
-  try {
-    const r = await fetch(camUrl);
-    if (r.ok) return await r.blob();
-  } catch (e) { console.log("cam fetch failed, using placeholder", e); }
+async function placeholderBlob() {
   const c = document.createElement("canvas");
   c.width = 320; c.height = 240;
   c.getContext("2d").fillStyle = "#333";
   c.getContext("2d").fillRect(0, 0, 320, 240);
-  return await new Promise((res) => c.toBlob(res, "image/jpeg"));
+  return new Promise((res) => c.toBlob(res, "image/jpeg"));
 }
+
+function previewBlob(blob, label) {
+  const img = $("preview");
+  if (img.src.startsWith("blob:")) URL.revokeObjectURL(img.src);
+  img.onload = null;
+  img.onerror = null;
+  img.hidden = false;
+  img.src = URL.createObjectURL(blob);
+  if (label) $("cam-status").textContent = label;
+}
+
+function previewBackendFrame(framePath, label) {
+  const name = String(framePath).split(/[/\\]/).pop();
+  const img = $("preview");
+  if (img.src.startsWith("blob:")) URL.revokeObjectURL(img.src);
+  img.onload = null;
+  img.onerror = () => { $("cam-status").textContent = "frame saved but preview failed"; };
+  img.hidden = false;
+  img.src = "/frames/" + encodeURIComponent(name);
+  if (label) $("cam-status").textContent = label;
+}
+
+async function uploadFrame() {
+  try { // 1. phone fetches the camera directly
+    const r = await fetch(camUrl);
+    if (r.ok) {
+      const blob = await r.blob();
+      const fd = new FormData();
+      fd.append("file", blob, "frame.jpg");
+      const f = await (await fetch("/frame", { method: "POST", body: fd })).json();
+      if (f.path) { previewBlob(blob, "frame: phone-direct"); return f; }
+    }
+  } catch (e) { console.log("phone cam fetch failed", e); }
+  try { // 2. backend grabs from the camera (laptop-side mDNS)
+    const f = await (await fetch("/frame", { method: "POST" })).json();
+    if (f.path) { previewBackendFrame(f.path, "frame: backend grab"); return f; }
+    console.log("backend grab failed", f.error || f);
+  } catch (e) { console.log("backend grab failed", e); }
+  const fd = new FormData(); // 3. placeholder so the demo never stalls
+  const ph = await placeholderBlob();
+  fd.append("file", ph, "frame.jpg");
+  previewBlob(ph, "frame: placeholder (camera unreachable)");
+  return (await fetch("/frame", { method: "POST", body: fd })).json();
+}
+
+function testCamera() {
+  const img = $("preview");
+  if (img.src.startsWith("blob:")) URL.revokeObjectURL(img.src);
+  img.hidden = false;
+  $("cam-status").textContent = "Testing phone → camera…";
+  const url = camUrl + (camUrl.includes("?") ? "&" : "?") + "t=" + Date.now();
+  img.onload = () => { $("cam-status").textContent = "OK — phone reached " + camUrl; };
+  img.onerror = async () => {
+    $("cam-status").textContent = "Phone can't reach camera, trying backend…";
+    try {
+      const f = await (await fetch("/frame", { method: "POST" })).json();
+      if (f.path) {
+        previewBackendFrame(f.path, "OK — backend grabbed frame (phone could not)");
+        return;
+      }
+      $("cam-status").textContent = "Backend grab failed: " + (f.error || "unknown error");
+    } catch (e) {
+      $("cam-status").textContent = "Camera test failed: " + e.message;
+    }
+  };
+  img.src = url;
+}
+
+$("test-cam").onclick = () => testCamera();
 
 function manualProbe() {
   const t = $("manual").value.trim();
@@ -71,12 +253,10 @@ function manualProbe() {
   try { return JSON.parse(t); } catch (e) { console.log("bad manual probe JSON", e); return null; }
 }
 
-async function pipeline() {
+async function pipeline(techText) {
+  if (techText) history.push({ role: "user", content: techText });
   setInstruction("Working…");
-  const blob = await captureBlob();
-  const fd = new FormData();
-  fd.append("file", blob, "frame.jpg");
-  const frame = await (await fetch("/frame", { method: "POST", body: fd })).json();
+  const frame = await uploadFrame();
   console.log("frame", frame);
   let probe = manualProbe();
   if (!probe) {
@@ -88,38 +268,104 @@ async function pipeline() {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   })).json();
   console.log("diagnose", diag);
-  history.push({ role: "assistant", content: diag.speak_to_tech || "" });
-  setInstruction(diag.speak_to_tech || "(no instruction)");
+  const loopText = diag.speak_to_tech || "(no instruction)";
+  history.push({ role: "assistant", content: loopText });
+  addTurn({
+    tech: techText || "—", loop: loopText,
+    found: probe.found || [], missing: probe.missing || [],
+    state: diag.state, confidence: diag.confidence,
+  });
+  setInstruction(loopText);
   setStatus(diag);
 }
 
-$("check").onclick = () => pipeline().catch((e) => setInstruction("Error: " + e.message));
+$("check").onclick = () => pipeline(null).catch((e) => setInstruction("Error: " + e.message));
 
-let recorder = null, chunks = [];
-$("talk").onclick = async () => {
-  if (recorder && recorder.state === "recording") { recorder.stop(); return; }
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+let recorder = null, chunks = [], recording = false, starting = false, recStream = null;
+
+function micSupported() {
+  return ("MediaRecorder" in window) && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+}
+
+async function startRec() {
+  if (recording || starting) return;
+  if (!micSupported()) { showFallback("Microphone not available in this browser — type instead."); return; }
+  starting = true;
+  try {
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    console.log("mic denied", e);
+    starting = false;
+    showFallback("Microphone blocked — type instead.");
+    return;
+  }
   chunks = [];
-  recorder = new MediaRecorder(stream);
-  recorder.ondataavailable = (e) => chunks.push(e.data);
-  recorder.onstop = async () => {
-    $("talk").classList.remove("rec");
-    $("talk").textContent = "PUSH TO TALK";
+  recorder = new MediaRecorder(recStream);
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = onRecStop;
+  recorder.start();
+  starting = false;
+  recording = true;
+  showIndicator("Recording…");
+  $("talk").classList.add("rec");
+  $("talk").textContent = "RECORDING — RELEASE TO STOP";
+}
+
+function stopRec() {
+  if (!recording || !recorder) return;
+  recording = false;
+  showIndicator("Transcribing…");
+  $("talk").classList.remove("rec");
+  $("talk").textContent = "PUSH TO TALK";
+  try { recorder.stop(); } catch (e) { console.log("recorder stop failed", e); }
+  if (recStream) { recStream.getTracks().forEach((t) => t.stop()); recStream = null; }
+}
+
+async function onRecStop() {
+  const data = chunks.slice();
+  chunks = [];
+  try {
     const fd = new FormData();
-    fd.append("file", new Blob(chunks, { type: "audio/webm" }), "talk.webm");
+    fd.append("file", new Blob(data, { type: "audio/webm" }), "talk.webm");
     const t = await (await fetch("/transcribe", { method: "POST", body: fd })).json();
     console.log("transcribe", t);
-    if (t.text) history.push({ role: "user", content: t.text });
-    pipeline().catch((e) => setInstruction("Error: " + e.message));
-  };
-  recorder.start();
-  $("talk").classList.add("rec");
-  $("talk").textContent = "RECORDING — TAP TO STOP";
+    showIndicator(null);
+    if (t.text) {
+      pipeline(t.text).catch((e) => setInstruction("Error: " + e.message));
+    } else {
+      showFallback("Transcription empty" + (t.error ? ": " + t.error : "") + " — type instead.");
+      setInstruction("I didn't catch that. Type below or try again.");
+    }
+  } catch (e) {
+    showIndicator(null);
+    showFallback("Transcription failed — type instead.");
+    setInstruction("Error: " + e.message);
+  }
+}
+
+const talk = $("talk");
+talk.addEventListener("pointerdown", (e) => { e.preventDefault(); startRec(); });
+talk.addEventListener("pointerup", (e) => { e.preventDefault(); stopRec(); });
+talk.addEventListener("pointercancel", stopRec);
+talk.addEventListener("pointerleave", () => { if (recording) stopRec(); });
+talk.addEventListener("touchstart", (e) => { e.preventDefault(); startRec(); }, { passive: false });
+talk.addEventListener("touchend", (e) => { e.preventDefault(); stopRec(); });
+talk.addEventListener("contextmenu", (e) => e.preventDefault());
+
+$("send-typed").onclick = () => {
+  const v = $("typed").value.trim();
+  if (!v) return;
+  $("typed").value = "";
+  pipeline(v).catch((e) => setInstruction("Error: " + e.message));
 };
 
 $("reset").onclick = () => {
   history = [];
+  turns = [];
+  renderTurns();
   $("manual").value = "";
+  $("fallback").hidden = true;
+  showIndicator(null);
   setInstruction("Press CHECK NOW to start.");
   $("status").textContent = "state: —";
 };

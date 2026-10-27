@@ -4,3 +4,8 @@ pyserial
 openai
 python-multipart
 pydantic
+pydub
+pyyaml
+python-dotenv
+opencv-python-headless
+numpy
