@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FundiLoop</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; padding: 16px; background: #111; color: #f2f2f2; }
+  h1 { font-size: 32px; margin: 0 0 12px; }
+  #instruction { font-size: 20px; line-height: 1.4; background: #1e1e1e; border: 1px solid #444; padding: 16px; min-height: 80px; margin-bottom: 12px; }
+  .btn { display: block; width: 100%; min-height: 64px; font-size: 22px; font-weight: 700; margin: 8px 0; border: 0; cursor: pointer; }
+  #check { background: #2e7d32; color: #fff; }
+  #talk { background: #1565c0; color: #fff; }
+  #talk.rec { background: #b71c1c; }
+  #reset { background: #424242; color: #fff; }
+  #status { background: #1e1e1e; border: 1px solid #444; padding: 12px; font-size: 14px; white-space: pre-wrap; margin-top: 12px; }
+  #manual { width: 100%; box-sizing: border-box; min-height: 64px; margin-top: 12px; font-size: 13px; }
+  label { font-size: 14px; color: #bbb; }
+  #cam { font-size: 12px; color: #888; margin-bottom: 8px; word-break: break-all; }
+</style>
+</head>
+<body>
+<h1>FundiLoop</h1>
+<div id="cam">cam: …</div>
+<div id="instruction">Press CHECK NOW to start.</div>
+<button class="btn" id="check">CHECK NOW</button>
+<button class="btn" id="talk">PUSH TO TALK</button>
+<button class="btn" id="reset">RESET</button>
+<div id="status">state: —</div>
+<label for="manual">Manual probe JSON (optional, overrides /probe):</label>
+<textarea id="manual" placeholder='{"found":["0x3C"],"missing":["0x76"],"raw":"manual","timestamp":""}'></textarea>
+
+<script>
+let history = [];
+let camUrl = "http://192.0.2.10/capture"; // placeholder; edit or set ESP32_CAM_URL
+const $ = (id) => document.getElementById(id);
+
+fetch("/config").then((r) => r.json()).then((c) => {
+  if (c.cam_url) camUrl = c.cam_url;
+  $("cam").textContent = "cam: " + camUrl;
+}).catch(() => { $("cam").textContent = "cam: " + camUrl; });
+
+function setInstruction(t) {
+  $("instruction").textContent = t;
+  try { speechSynthesis.cancel(); speechSynthesis.speak(new SpeechSynthesisUtterance(t)); } catch (e) {}
+}
+
+function setStatus(d) {
+  $("status").textContent =
+    "state: " + (d.state || "—") + "\n" +
+    "fault: " + (d.fault_hypothesis || "—") + "\n" +
+    "confidence: " + (d.confidence ?? "—") + "\n" +
+    "verify: " + (d.verification_test || "—");
+}
+
+async function captureBlob() {
+  try {
+    const r = await fetch(camUrl);
+    if (r.ok) return await r.blob();
+  } catch (e) { console.log("cam fetch failed, using placeholder", e); }
+  const c = document.createElement("canvas");
+  c.width = 320; c.height = 240;
+  c.getContext("2d").fillStyle = "#333";
+  c.getContext("2d").fillRect(0, 0, 320, 240);
+  return await new Promise((res) => c.toBlob(res, "image/jpeg"));
+}
+
+function manualProbe() {
+  const t = $("manual").value.trim();
+  if (!t) return null;
+  try { return JSON.parse(t); } catch (e) { console.log("bad manual probe JSON", e); return null; }
+}
+
+async function pipeline() {
+  setInstruction("Working…");
+  const blob = await captureBlob();
+  const fd = new FormData();
+  fd.append("file", blob, "frame.jpg");
+  const frame = await (await fetch("/frame", { method: "POST", body: fd })).json();
+  console.log("frame", frame);
+  let probe = manualProbe();
+  if (!probe) {
+    probe = await (await fetch("/probe", { method: "POST" })).json();
+  }
+  console.log("probe", probe);
+  const body = { frame_path: frame.path || "", probe_result: probe, conversation_history: history };
+  const diag = await (await fetch("/diagnose", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  })).json();
+  console.log("diagnose", diag);
+  history.push({ role: "assistant", content: diag.speak_to_tech || "" });
+  setInstruction(diag.speak_to_tech || "(no instruction)");
+  setStatus(diag);
+}
+
+$("check").onclick = () => pipeline().catch((e) => setInstruction("Error: " + e.message));
+
+let recorder = null, chunks = [];
+$("talk").onclick = async () => {
+  if (recorder && recorder.state === "recording") { recorder.stop(); return; }
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  chunks = [];
+  recorder = new MediaRecorder(stream);
+  recorder.ondataavailable = (e) => chunks.push(e.data);
+  recorder.onstop = async () => {
+    $("talk").classList.remove("rec");
+    $("talk").textContent = "PUSH TO TALK";
+    const fd = new FormData();
+    fd.append("file", new Blob(chunks, { type: "audio/webm" }), "talk.webm");
+    const t = await (await fetch("/transcribe", { method: "POST", body: fd })).json();
+    console.log("transcribe", t);
+    if (t.text) history.push({ role: "user", content: t.text });
+    pipeline().catch((e) => setInstruction("Error: " + e.message));
+  };
+  recorder.start();
+  $("talk").classList.add("rec");
+  $("talk").textContent = "RECORDING — TAP TO STOP";
+};
+
+$("reset").onclick = () => {
+  history = [];
+  $("manual").value = "";
+  setInstruction("Press CHECK NOW to start.");
+  $("status").textContent = "state: —";
+};
+</script>
+</body>
+</html>
