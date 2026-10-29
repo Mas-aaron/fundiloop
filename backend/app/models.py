@@ -96,6 +96,7 @@ class StepCheck(BaseModel):
 
 class StartSessionRequest(BaseModel):
     mode: Mode = Mode.GUIDED_ASSEMBLY
+    board: str = "esp32_devkit"
 
 
 class CheckNowRequest(BaseModel):
@@ -117,3 +118,4 @@ class Passport(BaseModel):
     completed_at: str = ""
     total_attempts: int = 0
     failed_attempts: int = 0
+    technician_confirmed: int = 0

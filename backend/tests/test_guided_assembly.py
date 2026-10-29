@@ -12,20 +12,21 @@ from backend.app.adapters.muse_adapter import MetaClaudeAdapter
 from backend.app.adapters.sam_adapter import MetaSAMAdapter
 from backend.app.adapters.voice_adapter import MetaVoiceAdapter
 from backend.app.agent_orchestrator import AgentOrchestrator
-from backend.app.camera_client import CameraClient
 from backend.app.change_detector import MotionSettler
 from backend.app.circuit_graph import load_circuit_graph
 from backend.app.models import CheckNowRequest, Mode
 from backend.app.serial_probe import SerialProbe
+from backend.tests.helpers import make_camera, use_mock_env
 
 
 class GuidedAssemblyTest(unittest.TestCase):
     def setUp(self):
+        use_mock_env(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.log_path = os.path.join(self.tmp.name, "attempts.jsonl")
         self.orc = AgentOrchestrator(
             graph=load_circuit_graph(),
-            camera=CameraClient(mock=True),
+            camera=make_camera(self.tmp.name),
             settler=MotionSettler(settle_seconds=1.0),
             probe=SerialProbe(mock=True),
             sam=MetaSAMAdapter(mock=True),

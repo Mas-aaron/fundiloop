@@ -27,8 +27,9 @@ steps:
 
   - step_id: S2_GND_RAIL
     instruction_student: >-
-      Connect a black jumper wire from any GND pin on the ESP32 to the
-      breadboard ground rail. Tug it gently to confirm it is seated.
+      Connect a jumper wire from any GND pin on the ESP32 to the breadboard
+      ground rail. Use black if you have it, otherwise any color, and tug it
+      gently to confirm it is seated.
     instruction_pro: Wire ESP32 GND to breadboard ground rail.
     expected_component: GND jumper wire
     verification_test: PING
@@ -36,8 +37,9 @@ steps:
 
   - step_id: S3_3V3_RAIL
     instruction_student: >-
-      Connect a red jumper wire from the 3V3 pin on the ESP32 to the
-      breadboard power rail. Double-check you used 3V3, not 5V or VIN.
+      Connect a jumper wire from the 3V3 pin on the ESP32 to the breadboard
+      power rail. Use red if you have it, otherwise any color. Double-check
+      you used 3V3, not 5V or VIN.
     instruction_pro: Wire ESP32 3V3 to breadboard power rail.
     expected_component: 3V3 jumper wire
     verification_test: PING

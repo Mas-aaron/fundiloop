@@ -4,32 +4,54 @@ Serves the mobile web UI at / and the session API:
   GET  /api/status           session + config status
   POST /api/session/start    start a guided/diagnostic session
   POST /api/session/check-now run one Sense->Reason->Instruct->Verify turn
+  POST /api/session/check-now/stream same turn as server-sent events
   GET  /api/camera/latest    latest overhead frame (JPEG/PNG)
+  GET  /api/frames/{name}     one saved analysis still (evidence)
   POST /api/voice/transcribe transcribe push-to-talk audio upload
+  WS   /api/live/session     live loop: audio in, clips in, guidance out
+  POST /api/vision/track-clip SAM 3.1 video tracking over one clip
   GET  /api/session/{id}/passport full verifiable log for a session
-  POST /api/config/demo      toggle demo-mode fallback ({"enabled": bool})
+  POST /discover/parts        scene understanding for a saved frame
+  POST /discover/projects     validated generated build plans
+  POST /discover/capture      capture a still for /discover/parts
+  POST /discover/upload       save an equipment photo for /discover/parts
+  POST /diagnose              start a learning session (mode="learning")
+  POST /project/{id}/code     verified firmware (409 until DONE)
 
 Run from the repo root:
   uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
 """
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
 import os
+import queue
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(ROOT / ".env")
 
-from .adapters import MetaAPIError  # noqa: E402
+from .adapters import MetaAPIError, mock_meta_enabled  # noqa: E402
+from .adapters.sam_adapter import DEFAULT_VIDEO_MIME  # noqa: E402
 from .agent_orchestrator import AgentOrchestrator  # noqa: E402
+from .camera_client import CameraError  # noqa: E402
+from .discovery import detect_parts, plan_projects, understand_scene  # noqa: E402
+from .learning import generate_code  # noqa: E402
+from .live import LiveGuide  # noqa: E402
 from .models import CheckNowRequest, StartSessionRequest  # noqa: E402
+from backend.schemas import DiagnoseRequest  # noqa: E402
 
 FRONTEND = ROOT / "frontend"
+MAX_CLIP_BYTES = 12 * 1024 * 1024
+MAX_UPLOAD_BYTES = 6 * 1024 * 1024
 
 app = FastAPI(title="FundiLoop")
 app.add_middleware(
@@ -40,10 +62,7 @@ app.add_middleware(
 )
 
 orchestrator = AgentOrchestrator()
-
-
-def _mock_meta() -> bool:
-    return os.environ.get("MOCK_META", "true").lower() in ("1", "true", "yes")
+live_guide = LiveGuide()
 
 
 # -- frontend -------------------------------------------------------------
@@ -66,28 +85,121 @@ def style_css():
 @app.get("/api/status")
 def api_status():
     view = orchestrator.status()
+    cam = orchestrator.camera.camera_status()
     view["config"] = {
-        "mock_meta": _mock_meta(),
+        "mock_meta": mock_meta_enabled(),
+        "camera_online": cam["camera_online"],
+        "camera_last_frame_age_ms": cam["camera_last_frame_age_ms"],
+        "camera_last_frame_size_bytes": cam["camera_last_frame_size_bytes"],
+        "camera_error": cam["camera_error"],
+        "sam_mode": "mock" if orchestrator.sam.mock else "real",
+        "muse_mode": "mock" if orchestrator.Muse.mock else "real",
+        "meta_api_configured": bool(os.environ.get("META_API_KEY")),
         "meta_api_key_set": bool(os.environ.get("META_API_KEY")),
-        "camera_frame_url_set": bool(os.environ.get("CAMERA_FRAME_URL")),
+        "camera_stream_url": orchestrator.camera.stream_url,
+        "camera_capture_url": orchestrator.camera.capture_url,
+        "camera_frame_url_set": bool(orchestrator.camera.capture_url),
+        "camera_frame_url": orchestrator.camera.capture_url,
+        "camera_source": orchestrator.camera.describe_source(),
         "serial_port": os.environ.get("SERIAL_PORT") or "(default)",
         "muse_model": os.environ.get("MUSE_MODEL", "muse-spark-1.3"),
         "sam_model": os.environ.get("SAM_MODEL", "sam-3.1"),
-        "voice_model": os.environ.get("VOICE_MODEL", "meta-voice-1"),
+        "voice_model": os.environ.get("VOICE_MODEL", "muse-voice-transcribe-1.0"),
         "voice_live": not orchestrator.voice.mock,
-        "demo_mode": orchestrator.demo_mode,
     }
     return view
 
 
 @app.post("/api/session/start")
 def api_session_start(req: StartSessionRequest):
-    return orchestrator.start_session(mode=req.mode)
+    try:
+        return orchestrator.start_session(mode=req.mode, board=req.board)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except (CameraError, MetaAPIError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 @app.post("/api/session/check-now")
 def api_check_now(req: CheckNowRequest | None = None):
-    return orchestrator.check_now(req or CheckNowRequest())
+    try:
+        return orchestrator.check_now(req or CheckNowRequest())
+    except (CameraError, MetaAPIError) as exc:
+        # Real error, surfaced: the step stops, nothing is faked.
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+def _sse(event: str, payload: dict) -> str:
+    return "event: %s\ndata: %s\n\n" % (event, json.dumps(payload))
+
+
+def iter_check_now_events(body: CheckNowRequest):
+    """Yield SSE frames for one turn: ack -> sense -> reason -> verify ->
+    done (full turn view) or error (real CameraError/MetaAPIError text)."""
+    events: queue.Queue = queue.Queue()
+    yield _sse("ack", {"status": "checking"})
+
+    def progress(stage: str, detail: dict) -> None:
+        events.put((stage, detail or {}))
+
+    with ThreadPoolExecutor(max_workers=1,
+                            thread_name_prefix="fundiloop-stream") as ex:
+        fut = ex.submit(orchestrator.check_now, body, progress)
+        while True:
+            try:
+                stage, detail = events.get(timeout=0.05)
+            except queue.Empty:
+                if fut.done():
+                    break
+                continue
+            if stage == "done":
+                continue  # bare stage tick: the done below carries the view
+            yield _sse(stage, detail)
+    try:
+        view = fut.result()
+    except (CameraError, MetaAPIError) as exc:
+        yield _sse("error", {"detail": str(exc)})
+    else:
+        yield _sse("done", view)
+
+
+@app.post("/api/session/rescan")
+def api_session_rescan():
+    """Forget the cached board detection so the next turn re-detects.
+
+    Use after swapping boards or parts on the bench: the next CHECK NOW
+    glances the current frame instead of trusting the old cache.
+    """
+    return orchestrator.rescan_boards()
+
+
+@app.post("/api/session/confirm")
+def api_session_confirm(body: dict):
+    """Advance a learning step on technician attestation.
+
+    Body: {"session_id": ..., "confirmed": bool}. Only valid while the
+    session has a pending confirmation (probe reported unverifiable).
+    """
+    session_id = str(body.get("session_id") or "")
+    try:
+        return orchestrator.confirm_learning_step(
+            session_id, bool(body.get("confirmed")))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/api/session/check-now/stream")
+def api_check_now_stream(req: CheckNowRequest | None = None):
+    """Same turn as /api/session/check-now, as server-sent events.
+
+    Nothing is faked: done carries the same verified view the blocking
+    endpoint returns, and error stops the step.
+    """
+    return StreamingResponse(
+        iter_check_now_events(req or CheckNowRequest()),
+        media_type="text/event-stream")
 
 
 @app.post("/api/voice/transcribe")
@@ -98,6 +210,213 @@ async def api_voice_transcribe(file: UploadFile = File(...)):
         return {"text": "", "error": str(exc)}
 
 
+@app.post("/api/vision/track-clip")
+async def api_vision_track_clip(file: UploadFile = File(...)):
+    """SAM 3.1 video tracking over one uploaded clip.
+
+    Same model and request as still segmentation, an input_video part
+    instead. Raised MetaAPIError surfaces as HTTP 502 so a failed track is
+    never replaced with an invented one.
+    """
+    clip = await file.read(MAX_CLIP_BYTES + 1)
+    if len(clip) > MAX_CLIP_BYTES:
+        raise HTTPException(status_code=400, detail="clip too large (12 MB max)")
+    mime = (file.content_type or DEFAULT_VIDEO_MIME).split(";")[0].strip()
+    if not mime.startswith("video/"):
+        raise HTTPException(status_code=400, detail="not a video clip (%s)" % mime)
+    try:
+        return live_guide.sam.analyze_clip(
+            clip, context={"clip_source": file.filename or "uploaded clip"}, mime=mime)
+    except MetaAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.websocket("/api/live/session")
+async def api_live_session(ws: WebSocket):
+    """The live guidance loop: the technician talks and shows the bench.
+
+    Meta has no single audio+video streaming model, so a live turn is
+    assembled from the parts Meta does stream: transcript (Muse Voice
+    Transcribe) + clip (SAM 3.1 video) -> Muse Spark guidance text, spoken by
+    the browser. The probe stays the only thing that may confirm a fix.
+
+    Client sends JSON:
+      {"type":"hello","mode":...,"step_text":...}   configure the loop
+      {"type":"turn","transcript":...,"clip":<b64>,"mime":...,"simulate_fault":...}
+      {"type":"ping"}
+    Server replies JSON:
+      {"type":"ready",...} / {"type":"guidance",...} / {"type":"error",...} /
+      {"type":"pong"}
+    """
+    await ws.accept()
+    mode, step_text = "GUIDED_ASSEMBLY", ""
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                await ws.send_json({"type": "error", "detail": "messages must be JSON"})
+                continue
+            kind = (msg.get("type") or "").lower()
+            if kind == "ping":
+                await ws.send_json({"type": "pong"})
+                continue
+            if kind == "hello":
+                mode = str(msg.get("mode") or mode)
+                step_text = str(msg.get("step_text") or "")
+                await ws.send_json({
+                    "type": "ready", "mode": mode,
+                    "mock": bool(live_guide.Muse.mock or live_guide.sam.mock),
+                })
+                continue
+            if kind != "turn":
+                await ws.send_json({"type": "error", "detail": "unknown type %r" % kind})
+                continue
+
+            clip = None
+            if msg.get("clip"):
+                try:
+                    clip = base64.b64decode(msg["clip"], validate=True)
+                except (ValueError, TypeError):
+                    await ws.send_json({"type": "error", "detail": "clip is not base64"})
+                    continue
+                if len(clip) > MAX_CLIP_BYTES:
+                    await ws.send_json({"type": "error", "detail": "clip too large (12 MB max)"})
+                    continue
+            try:
+                # guide() does blocking Meta calls: keep the loop responsive.
+                result = await asyncio.to_thread(
+                    live_guide.guide,
+                    clip=clip,
+                    transcript=str(msg.get("transcript") or ""),
+                    mode=str(msg.get("mode") or mode),
+                    step_text=str(msg.get("step_text") or step_text),
+                    simulate_fault=msg.get("simulate_fault") or None,
+                    clip_mime=str(msg.get("mime") or DEFAULT_VIDEO_MIME),
+                )
+            except MetaAPIError as exc:
+                await ws.send_json({"type": "error", "detail": str(exc)})
+                continue
+            await ws.send_json({"type": "guidance", **result})
+    except WebSocketDisconnect:
+        return
+
+
+@app.post("/api/vision/describe")
+def api_vision_describe():
+    try:
+        return orchestrator.describe_view()
+    except (CameraError, MetaAPIError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/discover/parts")
+def api_discover_parts(body: dict, include_scene: bool = True):
+    """Scene understanding for a saved frame. Always HTTP 200: on model
+    failure the uncertainties field explains, so callers fall back."""
+    frame_path = str(body.get("frame_path", "") or "")
+    try:
+        if include_scene:
+            return understand_scene(frame_path)
+        return detect_parts(frame_path)
+    except Exception as exc:  # understand_scene never raises; last resort
+        return {"visible_parts": [], "connections_observed": [],
+                "uncertainties": ["discovery unavailable: %s" % exc], "notes": ""}
+
+
+@app.post("/discover/projects")
+def api_discover_projects(body: dict):
+    """Validated generated build plans for visible parts. Always HTTP 200."""
+    try:
+        result = plan_projects(
+            list(body.get("visible_parts", []) or []),
+            body.get("user_project"),
+            body.get("constraints"),
+            list(body.get("connections_observed", []) or []),
+            list(body.get("uncertainties", []) or []),
+            board=body.get("board") or "esp32_devkit",
+        )
+    except Exception as exc:  # plan_projects never raises; last resort
+        return {"projects": [], "rejected_plans": [],
+                "hint": "planning unavailable: %s" % exc}
+    if not result.get("projects"):
+        first = (result.get("rejected_plans") or [{}])[0]
+        reasons = first.get("reasons", []) if isinstance(first, dict) else []
+        result["hint"] = ("No valid plans: %s" % "; ".join(reasons[:2])) if reasons \
+            else "The model returned no buildable projects."
+    return result
+
+
+@app.post("/diagnose")
+def api_diagnose(req: DiagnoseRequest):
+    """Start a learning session on a generated plan (mode="learning").
+
+    This live-server endpoint complements the legacy diagnostic one: any
+    mode other than "learning" is rejected here (use /api/session/start
+    for guided/diagnostic sessions).
+    """
+    if (req.mode or "").lower() != "learning":
+        raise HTTPException(status_code=400, detail=(
+            'only mode="learning" is supported here; '
+            "use POST /api/session/start for guided/diagnostic sessions"))
+    try:
+        return orchestrator.start_learning_session(
+            project_id=req.project_id or "project",
+            plan=list(req.plan or []),
+            visible_parts=list(req.visible_parts or []),
+            session_id=req.session_id or None,
+            project_title=req.project_title or req.project_id or "project",
+            board=req.board or "esp32_devkit")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/project/{session_id}/code")
+def api_project_code(session_id: str):
+    """Return the verified project's .ino (409 until fully verified)."""
+    session = orchestrator.sessions.get(session_id)
+    if session is None or not session.get("learning"):
+        raise HTTPException(status_code=404, detail="unknown learning session id")
+    if not session.get("code_ready"):
+        raise HTTPException(
+            status_code=409,
+            detail="project not fully verified: step %d of %d" % (
+                session.get("step_index", 0) + 1, len(session.get("plan", []))))
+    try:
+        code = generate_code(session, orchestrator.Muse)
+    except MetaAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"session_id": session_id, "code": code}
+
+
+@app.post("/discover/capture")
+def api_discover_capture():
+    """Capture one analysis still and return its frame_path for /discover/parts."""
+    try:
+        _frame, saved = orchestrator.camera.capture_analysis_frame("discover")
+    except CameraError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"frame_path": str(saved)}
+
+
+@app.post("/discover/upload")
+def api_discover_upload(file: bytes = File(...)):
+    """Save an uploaded equipment photo for /discover/parts (no camera needed).
+
+    Unlike /api/camera/snap this pins nothing: the photo feeds one
+    discovery pass so equipment can be identified before the overhead
+    camera is connected.
+    """
+    if len(file) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="image too large (6 MB max)")
+    try:
+        saved = orchestrator.camera.save_uploaded_frame(file, "discover-upload")
+    except CameraError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"frame_path": str(saved)}
+
+
 @app.get("/api/session/{session_id}/passport")
 def api_session_passport(session_id: str):
     data = orchestrator.get_passport(session_id)
@@ -106,19 +425,102 @@ def api_session_passport(session_id: str):
     return data
 
 
-@app.post("/api/config/demo")
-def api_config_demo(body: dict):
-    orchestrator.demo_mode = bool(body.get("enabled", True))
-    return {"demo_mode": orchestrator.demo_mode}
+@app.post("/api/config/camera")
+def api_config_camera(body: dict):
+    """Set the overhead camera URLs at runtime and persist them to .env."""
+    stream = str(body.get("stream_url", "") or "").strip()
+    capture = str(body.get("capture_url", "") or "").strip()
+    legacy = str(body.get("frame_url", "") or "").strip()
+    if legacy and not capture:
+        capture = legacy
+    orchestrator.camera.set_urls(stream_url=stream, capture_url=capture)
+    orchestrator.camera.clear_override()
+    orchestrator.settler.reset()
+    _persist_env_var("CAMERA_STREAM_URL", stream)
+    _persist_env_var("CAMERA_CAPTURE_URL", capture)
+    os.environ["CAMERA_STREAM_URL"] = stream
+    os.environ["CAMERA_CAPTURE_URL"] = capture
+    return {"camera_frame_url_set": bool(capture),
+            "camera_source": orchestrator.camera.describe_source()}
+
+
+def _persist_env_var(name: str, value: str) -> None:
+    """Rewrite one VAR= line in .env (append if missing), keep the rest."""
+    path = ROOT / ".env"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    except OSError:
+        return
+    out, found = [], False
+    for line in lines:
+        if line.startswith(name + "=") and not found:
+            out.append("%s=%s" % (name, value))
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append("%s=%s" % (name, value))
+    try:
+        path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+@app.post("/api/camera/snap")
+async def api_camera_snap(file: UploadFile | None = File(None)):
+    """Pin one frame for analysis: uploaded photo, else the overhead camera."""
+    if file is not None and file.filename:
+        data = await file.read(6 * 1024 * 1024 + 1)
+        if len(data) > 6 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="image too large (6 MB max)")
+        if not (data[:2] == b"\xff\xd8" or data[:8] == b"\x89PNG\r\n\x1a\n"):
+            raise HTTPException(status_code=400, detail="not a JPEG/PNG image")
+        source = "phone photo"
+    else:
+        try:
+            data = orchestrator.camera.grab_live()
+        except CameraError as exc:
+            raise HTTPException(status_code=502, detail="camera snap failed: %s" % exc)
+        source = "overhead camera"
+    orchestrator.camera.set_override(data)
+    orchestrator.settler.reset()
+    return {"ok": True, "bytes": len(data), "source": source}
+
+
+@app.delete("/api/camera/snap")
+def api_camera_snap_clear():
+    orchestrator.camera.clear_override()
+    orchestrator.settler.reset()
+    return {"ok": True}
 
 
 @app.get("/api/camera/latest")
 def api_camera_latest():
     from .camera_client import media_type_for_frame
 
-    frame, source = orchestrator.camera.fetch_latest()
+    try:
+        frame = orchestrator.camera.get_latest_preview_frame()
+    except CameraError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
     return Response(
         content=frame,
         media_type=media_type_for_frame(frame),
-        headers={"X-FundiLoop-Camera-Source": source},
+        headers={"X-FundiLoop-Camera-Source": orchestrator.camera.describe_source()},
     )
+
+
+@app.get("/api/frames/{name}")
+def api_saved_frame(name: str):
+    """Serve one saved analysis still so the UI can show the evidence.
+
+    Basename-only inside the camera debug dir: anything else is a 404.
+    """
+    debug_dir = orchestrator.camera.debug_dir
+    suffix = Path(name).suffix.lower()
+    if Path(name).name != name or suffix not in (".jpg", ".jpeg", ".png"):
+        raise HTTPException(status_code=404, detail="no such frame")
+    path = debug_dir / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no such frame")
+    media = "image/png" if suffix == ".png" else "image/jpeg"
+    return FileResponse(str(path), media_type=media)

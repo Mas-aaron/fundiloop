@@ -12,12 +12,13 @@
     <h1>FundiLoop</h1>
     <p class="sub">verifiable assembly + diagnostic agent</p>
   </div>
-  <span id="fallback-badge" hidden></span>
+  <span id="mode-badge" class="mock" title="LIVE only when the real camera and real Meta models are connected">MOCK</span>
 </header>
 
 <div class="mode-row" role="tablist" aria-label="Mode">
   <button id="mode-guided" class="mode active" type="button">Guided Assembly</button>
   <button id="mode-diag" class="mode" type="button">Diagnostic</button>
+  <button id="mode-learn" class="mode" type="button">Learning</button>
 </div>
 
 <figure class="cam">
@@ -29,18 +30,63 @@
 <div id="instruction" role="status">Loading session…</div>
 <div id="state-line" class="fine"></div>
 
+<div id="confirm-bar" class="panel" hidden>
+  <div id="confirm-q"></div>
+  <div class="btn-row" style="margin-top:8px">
+    <button id="confirm-yes" class="small" type="button">CONFIRM</button>
+    <button id="confirm-no" class="small" type="button">NOT YET</button>
+  </div>
+</div>
+
 <button id="check" class="big primary" type="button">CHECK NOW</button>
+<button id="cancel" class="big danger" type="button" hidden>CANCEL</button>
 <button id="talk" class="big secondary" type="button">PUSH TO TALK</button>
+<button id="live" class="big live" type="button">START LIVE GUIDE</button>
+<button id="snap" class="big snap" type="button">SNAP PHOTO</button>
+<input id="snap-file" type="file" accept="image/*" capture="environment" hidden>
 <div class="btn-row">
   <button id="replay" class="small" type="button">REPLAY</button>
+  <button id="describe" class="small" type="button">DESCRIBE</button>
   <button id="mute" class="small" type="button">MUTE</button>
-  <button id="demo" class="small" type="button">DEMO: ON</button>
 </div>
 <div id="talk-hint" class="fine"></div>
+<div id="live-hint" class="fine"></div>
+<div class="btn-row">
+  <button id="handoff-learn" class="small" type="button" hidden>START LEARNING</button>
+</div>
+
+<section id="learn-sec" hidden>
+  <h2>Learn a project</h2>
+  <button id="learn-equip" class="small" type="button">SHOW EQUIPMENT</button>
+  <button id="learn-upload" class="small" type="button">UPLOAD PHOTO</button>
+  <input id="learn-file" type="file" accept="image/*" hidden>
+  <ol id="learn-parts" class="panel list"></ol>
+  <label for="learn-project">Project you want (or say it with PUSH TO TALK):</label>
+  <input id="learn-project" type="text" placeholder="weather station" autocomplete="off">
+  <label for="learn-board">Board:</label>
+  <select id="learn-board">
+    <option value="esp32_devkit">ESP32 DevKit</option>
+    <option value="arduino_uno">Arduino Uno</option>
+  </select>
+  <div class="btn-row" style="margin-top:8px">
+    <button id="learn-suggest" class="small" type="button">SUGGEST PROJECTS</button>
+    <button id="cook-resume" class="small" type="button" hidden>OPEN COOK MODE</button>
+  </div>
+  <ol id="learn-cards" class="panel list"></ol>
+</section>
 
 <section>
   <h2>Verification</h2>
   <div id="verify" class="panel">No measurements yet. Press CHECK NOW.</div>
+</section>
+
+<section id="evidence-sec" hidden>
+  <h2>Evidence</h2>
+  <figure class="evidence-cam">
+    <img id="evidence-img" alt="the analyzed frame with vision regions">
+    <svg id="evidence-svg"></svg>
+  </figure>
+  <div id="evidence-cap" class="fine"></div>
 </section>
 
 <section>
@@ -53,8 +99,23 @@
   <div id="passport" class="panel"></div>
 </section>
 
+<section id="code-sec" hidden>
+  <h2>Verified firmware</h2>
+  <button id="send-code" class="small" type="button">SEND CODE</button>
+  <button id="copy-code" class="small" type="button">COPY</button>
+  <pre id="code-out" class="panel"></pre>
+</section>
+
 <details>
-  <summary>Advanced: code snippet + fault injection (mock testing)</summary>
+  <summary>Advanced: camera, code snippet, fault injection + rescan</summary>
+  <label for="cam-stream">Overhead camera MJPEG stream URL (live preview):</label>
+  <input id="cam-stream" type="text" placeholder="http://192.168.1.50:81/stream" autocomplete="off">
+  <label for="cam-capture">Overhead camera still URL (analysis frames):</label>
+  <input id="cam-capture" type="text" placeholder="http://192.168.1.50/capture" autocomplete="off">
+  <div class="btn-row" style="margin-top:8px">
+    <button id="save-cam" class="small" type="button">SAVE CAMERA</button>
+  </div>
+  <div id="cam-msg" class="fine"></div>
   <label for="code">Paste patient-board code to check pin usage:</label>
   <textarea id="code" placeholder="e.g. #define LED_PIN 4"></textarea>
   <label for="fault">Simulate fault:</label>
@@ -71,7 +132,43 @@
   <select id="voice">
     <option value="">Auto (best available)</option>
   </select>
+  <div class="btn-row" style="margin-top:10px">
+    <button id="clear-snap" class="small" type="button">CLEAR PHONE SNAP</button>
+    <button id="rescan" class="small" type="button">RE-SCAN EQUIPMENT</button>
+  </div>
 </details>
+
+<div id="cook" hidden>
+  <div class="cook-top">
+    <div>
+      <div id="cook-project" class="cook-project"></div>
+      <div id="cook-step" class="cook-step"></div>
+    </div>
+    <button id="cook-exit" class="small" type="button">EXIT</button>
+  </div>
+  <div class="cook-progress"><div id="cook-bar"></div></div>
+  <div id="cook-instruction" role="status"></div>
+  <ol id="cook-parts" class="cook-chips"></ol>
+  <figure class="cook-cam">
+    <img id="cook-preview" alt="overhead camera view of the circuit">
+    <svg id="cook-svg" preserveAspectRatio="none"></svg>
+  </figure>
+  <div id="cook-status" class="panel">No measurements yet.</div>
+  <div id="cook-heard" class="fine"></div>
+  <div class="btn-row cook-btns">
+    <button id="cook-talk" class="small" type="button">TALK</button>
+    <button id="cook-check" class="small" type="button">CHECK</button>
+    <button id="cook-confirm" class="small" type="button" hidden>CONFIRM</button>
+    <button id="cook-repeat" class="small" type="button">REPEAT</button>
+    <button id="cook-look" class="small" type="button">LOOK</button>
+  </div>
+  <label class="cook-handsfree"><input id="cook-handsfree" type="checkbox"> Hands-free (keep listening)</label>
+  <div id="cook-done" hidden>
+    <button id="cook-code" class="small" type="button">SEND CODE</button>
+    <button id="cook-copy" class="small" type="button">COPY</button>
+    <pre id="cook-code-out" class="panel"></pre>
+  </div>
+</div>
 
 <script src="/app.js"></script>
 </body>

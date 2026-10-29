@@ -4,3 +4,5 @@ __pycache__/
 frames/
 venv/
 .DS_Store
+backend/data/debug_frames/
+backend/data/logs/

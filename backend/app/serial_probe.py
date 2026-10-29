@@ -3,9 +3,10 @@
 Speaks the Prompt-1 command set (PING, I2C_SCAN, READ_SENSOR, SELFTEST)
 and parses the structured JSON lines from firmware/patient_board.
 
-Mock mode (MOCK_META=true, the default) returns realistic sample data so
-the whole loop runs with no hardware. With MOCK_META=false the probe uses
-the real serial port and falls back to mock only if the port fails.
+Mock mode (MOCK_META=true, the default) returns sample data so the loop
+runs with no hardware, and raises when MOCK_META=false. Real mode uses
+the serial port and reports failures honestly as error replies; it never
+substitutes fabricated readings.
 """
 from __future__ import annotations
 
@@ -13,15 +14,30 @@ import json
 import os
 import time
 
+from .adapters import mock_meta_enabled
 from .models import ProbeReading
 
 COMMANDS = ("PING", "I2C_SCAN", "READ_SENSOR", "SELFTEST")
 
 _DEFAULT_PORT = "COM3" if os.name == "nt" else "/dev/ttyUSB0"
 
+# Baud rates the probe adapts across: patient firmware speaks 115200, but
+# stock Arduino sketches (and vendor bootloaders) typically use 9600.
+KNOWN_BAUDS = (115200, 9600)
+
+TIMEOUT_ERROR = "timeout waiting for reply"
+
+
+def _env_timeout() -> float:
+    """Per-command serial timeout, tunable via SERIAL_TIMEOUT (default 4.0s)."""
+    try:
+        return max(0.2, float(os.environ.get("SERIAL_TIMEOUT", "4.0")))
+    except ValueError:
+        return 4.0
+
 
 def _mock_enabled() -> bool:
-    return os.environ.get("MOCK_META", "true").lower() in ("1", "true", "yes")
+    return mock_meta_enabled()
 
 
 class SerialProbe:
@@ -30,12 +46,12 @@ class SerialProbe:
         port: str | None = None,
         baud: int | None = None,
         mock: bool | None = None,
-        timeout: float = 4.0,
+        timeout: float | None = None,
     ) -> None:
         self.port = port or os.environ.get("SERIAL_PORT") or _DEFAULT_PORT
         self.baud = baud or int(os.environ.get("SERIAL_BAUD", "115200"))
         self.mock = _mock_enabled() if mock is None else mock
-        self.timeout = timeout
+        self.timeout = timeout if timeout is not None else _env_timeout()
         self.simulate_fault: str | None = None
         self._ser = None  # persistent handle, opened lazily
 
@@ -46,24 +62,44 @@ class SerialProbe:
         if command not in COMMANDS:
             return {"cmd": command, "error": "unknown command %r" % command}
         if self.mock:
+            if not mock_meta_enabled():
+                raise RuntimeError("mock serial probe called with MOCK_META=false")
             return self._mock_response(command)
         try:
             return self._real_send(command)
-        except Exception as exc:  # demo robustness: fall back to mock
-            reply = self._mock_response(command)
-            reply["mock_fallback"] = "%s: %s" % (self.port, exc)
-            return reply
+        except Exception as exc:
+            return {"cmd": command, "error": "%s: %s" % (self.port, exc)}
 
     def read_all(self, simulate_fault: str | None = None) -> ProbeReading:
-        """Run the full sense pass and aggregate one ProbeReading."""
+        """Run the full sense pass and aggregate one ProbeReading.
+
+        Real mode adapts to the equipment: when PING goes unanswered the
+        probe retries it once per alternate known baud and adopts the
+        first baud that answers (patient firmware at 115200, stock
+        Arduino sketches at 9600). When nothing answers anywhere, the
+        remaining commands short-circuit with instant honest errors
+        instead of burning a full timeout each.
+        """
         self.simulate_fault = simulate_fault
         ping = self.send("PING")
-        scan = self.send("I2C_SCAN")
-        sensor = self.send("READ_SENSOR")
-        selftest = self.send("SELFTEST")
+        if not self.mock and "error" in ping:
+            ping = self._adopt_live_baud(ping)
+        silent = not self.mock and "error" in ping
+        replies = [ping]
+        for command in ("I2C_SCAN", "READ_SENSOR", "SELFTEST"):
+            if silent:
+                replies.append({
+                    "cmd": command,
+                    "baud": self.baud,
+                    "error": "skipped: PING failed (%s)" % ping.get("error"),
+                    "short_circuited": True,
+                })
+            else:
+                replies.append(self.send(command))
+        scan, sensor, selftest = replies[1], replies[2], replies[3]
         connected = ping.get("status") == "OK" and "error" not in ping
         devices = list(scan.get("i2c_devices") or [])
-        mock = bool(ping.get("mock") or scan.get("mock") or "mock_fallback" in ping)
+        mock = bool(ping.get("mock") or scan.get("mock"))
         return ProbeReading(
             connected=connected,
             i2c_devices=devices,
@@ -84,16 +120,46 @@ class SerialProbe:
                 pass
             self._ser = None
 
+    def _adopt_live_baud(self, failed_ping: dict) -> dict:
+        """Retry PING at each alternate known baud; adopt the first live one.
+
+        Returns the working PING reply, or the original failure when no
+        baud answers. Retries use a short timeout so a dead board costs
+        one extra second per baud, not another full timeout each.
+        """
+        original_baud = self.baud
+        original_timeout = self.timeout
+        self.timeout = min(1.0, self.timeout)
+        try:
+            for baud in KNOWN_BAUDS:
+                if baud == original_baud:
+                    continue
+                self.close()
+                self.baud = baud
+                reply = self.send("PING")
+                if "error" not in reply:
+                    return reply
+        finally:
+            self.timeout = original_timeout
+        self.close()
+        self.baud = original_baud
+        return failed_ping
+
     # -- real serial ----------------------------------------------------
     def _real_send(self, command: str) -> dict:
         import serial  # pyserial; see requirements.txt
 
         if self._ser is None:
-            self._ser = serial.Serial(self.port, self.baud, timeout=1.0)
+            self._ser = serial.Serial(self.port, self.baud, timeout=1.0,
+                                      write_timeout=self.timeout)
             time.sleep(0.2)
             self._ser.reset_input_buffer()
-        self._ser.write((command + "\n").encode("ascii"))
-        self._ser.flush()
+        try:
+            self._ser.write((command + "\n").encode("ascii"))
+            self._ser.flush()
+        except Exception:
+            self.close()  # wedged handle: reopen fresh on the next command
+            raise
         lines: list[str] = []
         deadline = time.time() + self.timeout
         while time.time() < deadline:
@@ -107,8 +173,10 @@ class SerialProbe:
             reply = self._parse_line(command, text)
             if reply is not None:
                 reply["raw_lines"] = lines
+                reply["baud"] = self.baud
                 return reply
-        return {"cmd": command, "error": "timeout waiting for reply", "raw_lines": lines}
+        return {"cmd": command, "error": TIMEOUT_ERROR, "raw_lines": lines,
+                "baud": self.baud}
 
     @staticmethod
     def _parse_line(command: str, text: str) -> dict | None:

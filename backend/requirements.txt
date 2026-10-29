@@ -2,6 +2,8 @@ fastapi
 uvicorn[standard]
 pyserial
 openai
+websockets
+meta-sam-parser
 python-multipart
 pydantic
 pydub

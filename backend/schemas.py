@@ -36,5 +36,12 @@ class ProbeResult(BaseModel):
 
 class DiagnoseRequest(BaseModel):
     frame_path: str = ""
-    probe_result: ProbeResult
+    probe_result: ProbeResult = Field(default_factory=ProbeResult)
     conversation_history: list[dict] = []
+    mode: str = ""
+    project_id: str = ""
+    project_title: str = ""
+    plan: list = []
+    session_id: str = ""
+    visible_parts: list[str] = []
+    board: str = "esp32_devkit"

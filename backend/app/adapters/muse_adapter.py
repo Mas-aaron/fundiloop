@@ -9,15 +9,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 
-from . import MetaAPIError, api_base_url, api_key, api_timeout
+from . import (
+    MetaAPIError,
+    api_base_url,
+    api_key,
+    api_timeout,
+    log_model_call,
+    mock_meta_enabled,
+)
 from ..models import AgentDecision, AgentState, Mode, VerificationTest
 
 
 def _mock_enabled() -> bool:
-    if os.environ.get("MOCK_META", "true").lower() in ("1", "true", "yes"):
-        return True
-    return not os.environ.get("META_API_KEY")
+    return mock_meta_enabled()
 
 
 BME_ADDRS = ("0x76", "0x77")
@@ -25,14 +31,18 @@ OLED_ADDR = "0x3C"
 
 SYSTEM_PROMPT = """You are FundiLoop, a verifiable assembly and diagnostic agent for embedded hardware.
 The target circuit is an ESP32 DevKit with a BME280 sensor over I2C (0x76 or 0x77), an SSD1306 OLED over I2C (0x3C), and an LED on GPIO 2.
-A technician builds or repairs this circuit while you see SAM vision segments, serial probe measurements, and an optional code snippet.
+A technician builds or repairs this circuit while you see the overhead frame photo, SAM vision regions, serial probe measurements, and an optional code snippet.
+Look at the photo yourself and name only what you can actually see there; the bench may hold other equipment, and SAM regions are unlabeled boxes, not identifications. If the photo is too blurry or dark to identify parts, say so in your evidence instead of guessing.
 Return ONLY valid JSON matching this schema, no prose:
 {"mode": "GUIDED_ASSEMBLY|DIAGNOSTIC", "state": "INSTRUCTING|VERIFYING|FAULT_FOUND|VERIFIED_FIXED|COMPLETE",
  "fault_hypothesis": "SDA_SCL_SWAPPED|LOOSE_GND|CODE_PIN_MISMATCH|SENSOR_DISCONNECTED|LED_REVERSED|null",
  "confidence": 0.0-1.0, "evidence": [str], "next_instruction": str, "speak_to_tech": str,
  "verification_test": "RUN_I2C_SCAN|CHECK_OLED|BLINK_LED|READ_SENSOR|SELFTEST|PING|NONE"}
 Rules: never declare success yourself. The backend runs verification_test and the sensor reading decides.
-Guide exactly one step or one fix at a time. Keep speak_to_tech under 25 words, speakable."""
+Guide exactly one step or one fix at a time. Keep speak_to_tech under 25 words of plain spoken English (no ALL-CAPS words, no code, no parenthetical numbers).
+Ground every claim in the supplied SAM segments and probe readings, never in the expected circuit.
+If the camera shows a different board than the target circuit (for example an Arduino), name it
+and tell the user the Learning tab guides any board. If the bench is empty, say so and wait for parts."""
 
 
 class MetaClaudeAdapter:
@@ -41,52 +51,181 @@ class MetaClaudeAdapter:
     def __init__(self, model: str | None = None, mock: bool | None = None) -> None:
         self.model = model or os.environ.get("MUSE_MODEL", "muse-spark-1.3")
         self.mock = _mock_enabled() if mock is None else mock
+        self._client = None  # persistent OpenAI client (lazy, thread-safe)
+        self._client_lock = threading.Lock()
+
+    def _api_client(self):
+        """One shared client per adapter: keeps the TLS session warm.
+
+        Base URL, key, and timeout are read on first use; a backend restart
+        picks up changed values. The client is safe for concurrent calls.
+        """
+        if self._client is None:
+            from openai import OpenAI
+
+            with self._client_lock:
+                if self._client is None:
+                    self._client = OpenAI(base_url=api_base_url(), api_key=api_key(),
+                                          timeout=api_timeout())
+        return self._client
 
     def decide(self, context: dict) -> AgentDecision:
         """Return the next AgentDecision for the sensed context."""
         if self.mock:
+            if not mock_meta_enabled():
+                raise MetaAPIError("mock Muse adapter called with MOCK_META=false")
             return self._mock_decide(context)
         return self._real_decide(context)
+
+    def complete_text(self, system: str, user: str,
+                      image_b64: str | None = None,
+                      video_b64: str | None = None,
+                      video_mime: str = "video/mp4") -> str:
+        """Free-form Muse Spark completion for discovery/live (raw text out).
+
+        A still goes in as image_url; a clip as a video_url part (Muse Spark
+        reads frames and any embedded audio). Callers own JSON parsing and
+        retry policy. Mock mode returns "{}".
+        """
+        if self.mock:
+            if not mock_meta_enabled():
+                raise MetaAPIError("mock Muse adapter called with MOCK_META=false")
+            return "{}"
+        return self._real_complete(system, user, image_b64, video_b64, video_mime)
+
+    def _real_complete(self, system: str, user: str,
+                       image_b64: str | None = None,
+                       video_b64: str | None = None,
+                       video_mime: str = "video/mp4") -> str:
+        import time
+
+        if not api_key():
+            raise MetaAPIError("META_API_KEY is not set")
+        if video_b64 or image_b64:
+            user_content: object = [{"type": "text", "text": user}]
+            if video_b64:
+                user_content.append({
+                    "type": "video_url",
+                    "video_url": {"url": "data:%s;base64,%s" % (video_mime, video_b64)},
+                })
+            if image_b64:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,%s" % image_b64},
+                })
+        else:
+            user_content = user
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user_content}]
+        started = time.monotonic()
+        try:
+            client = self._api_client()
+            try:
+                raw_resp = client.chat.completions.with_raw_response.create(
+                    model=self.model, messages=messages,
+                    response_format={"type": "json_object"})
+            except Exception:
+                raw_resp = client.chat.completions.with_raw_response.create(
+                    model=self.model, messages=messages)
+            status = getattr(raw_resp, "status_code", "?")
+            headers = getattr(raw_resp, "headers", {}) or {}
+            request_id = (
+                headers.get("x-request-id") or headers.get("request-id")
+                or headers.get("x-requestid") or ""
+            )
+            resp = raw_resp.parse()
+        except Exception as exc:
+            latency_ms = (time.monotonic() - started) * 1000
+            log_model_call(self.model, latency_ms, "error", "",
+                           raw_summary="", ok=False, error=str(exc))
+            raise MetaAPIError("Muse request failed: %s" % exc) from exc
+        latency_ms = (time.monotonic() - started) * 1000
+        text = (resp.choices[0].message.content or "").strip()
+        if not request_id:
+            request_id = getattr(resp, "id", "") or ""
+        if not text:
+            log_model_call(self.model, latency_ms, status, "", request_id,
+                           raw_summary="", ok=False, error="empty completion")
+            raise MetaAPIError("Muse returned an empty completion")
+        log_model_call(self.model, latency_ms, status, "", request_id,
+                       raw_summary=text)
+        return text
 
     def _real_decide(self, context: dict) -> AgentDecision:
         """Call Muse Spark (legacy backend/muse_client.py pattern).
 
-        Forces structured JSON, validates into AgentDecision, retries once
-        on invalid output, then raises MetaAPIError for a safe fallback.
+        Sends the frame photo + SAM regions + serial probe readings +
+        circuit state, forces structured JSON, validates into AgentDecision,
+        retries once on invalid output, then raises MetaAPIError with the
+        real error. Every call is logged to model_calls.jsonl.
         """
-        from openai import OpenAI
+        import time
 
         if not api_key():
             raise MetaAPIError("META_API_KEY is not set")
+        frame_file = str(context.get("frame_file") or "")
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         for turn in context.get("history") or []:
             if isinstance(turn, dict) and "role" in turn and "content" in turn:
                 messages.append({"role": turn["role"], "content": str(turn["content"])})
-        messages.append({"role": "user", "content": json.dumps(self._context_payload(context))})
+        state_text = json.dumps(self._context_payload(context))
+        image_b64 = context.get("frame_jpeg_b64") or ""
+        if image_b64:
+            user_content: object = [
+                {"type": "text", "text": state_text},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/jpeg;base64,%s" % image_b64}},
+            ]
+        else:
+            user_content = state_text
+        messages.append({"role": "user", "content": user_content})
         last_err: Exception | None = None
+        last_raw = ""
         for _ in range(2):  # initial try + one retry on invalid JSON
+            started = time.monotonic()
             try:
-                client = OpenAI(base_url=api_base_url(), api_key=api_key(),
-                                timeout=api_timeout())
+                client = self._api_client()
                 try:
-                    resp = client.chat.completions.create(
+                    raw_resp = client.chat.completions.with_raw_response.create(
                         model=self.model, messages=messages,
                         response_format={"type": "json_object"})
                 except Exception:
-                    resp = client.chat.completions.create(model=self.model, messages=messages)
+                    raw_resp = client.chat.completions.with_raw_response.create(
+                        model=self.model, messages=messages)
+                status = getattr(raw_resp, "status_code", "?")
+                headers = getattr(raw_resp, "headers", {}) or {}
+                request_id = (
+                    headers.get("x-request-id") or headers.get("request-id")
+                    or headers.get("x-requestid") or ""
+                )
+                resp = raw_resp.parse()
             except Exception as exc:
+                latency_ms = (time.monotonic() - started) * 1000
+                log_model_call(self.model, latency_ms, "error", frame_file,
+                               raw_summary="", ok=False, error=str(exc))
                 raise MetaAPIError("Muse request failed: %s" % exc) from exc
-            raw = (resp.choices[0].message.content or "").strip()
-            if raw.startswith("```"):  # strip code fences if the model adds them
-                raw = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", raw)
+            latency_ms = (time.monotonic() - started) * 1000
+            last_raw = (resp.choices[0].message.content or "").strip()
+            if not request_id:
+                request_id = getattr(resp, "id", "") or ""
+            if last_raw.startswith("```"):  # strip code fences if the model adds them
+                last_raw = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", last_raw)
             try:
-                return AgentDecision.model_validate_json(raw)
+                decision = AgentDecision.model_validate_json(last_raw)
             except Exception as exc:
                 last_err = exc
+                log_model_call(self.model, latency_ms, status, frame_file, request_id,
+                               raw_summary=last_raw, ok=False,
+                               error="invalid AgentDecision JSON: %s" % exc)
                 messages.append({"role": "user", "content":
                                  "Your last reply was not valid JSON matching the schema. "
                                  "Reply with ONLY the JSON object."})
-        raise MetaAPIError("Muse returned invalid JSON twice: %s" % last_err)
+                continue
+            log_model_call(self.model, latency_ms, status, frame_file, request_id,
+                           raw_summary=last_raw)
+            return decision
+        raise MetaAPIError("Muse returned invalid JSON twice: %s\nRAW:\n%.300s"
+                           % (last_err, last_raw))
 
     @staticmethod
     def _context_payload(ctx: dict) -> dict:
@@ -97,6 +236,11 @@ class MetaClaudeAdapter:
         sam = ctx.get("sam") or {}
         code = str(ctx.get("code_snippet") or "")
         mode = ctx.get("mode", Mode.GUIDED_ASSEMBLY)
+        sam_dets = [
+            {"label": d.get("label"), "box": d.get("box"),
+             "confidence": d.get("confidence")}
+            for d in (sam.get("detections", []) or []) if isinstance(d, dict)
+        ]
         return {
             "mode": mode.value if isinstance(mode, Mode) else str(mode),
             "step": step.model_dump() if hasattr(step, "model_dump") else step,
@@ -109,12 +253,13 @@ class MetaClaudeAdapter:
                 "i2c_expected": getattr(graph, "i2c_expected", {}),
             },
             "probe": probe.model_dump(exclude={"raw"}) if hasattr(probe, "model_dump") else probe,
-            "sam": {"detections": sam.get("detections", []),
+            "sam": {"detections": sam_dets,
                     "wire_count": sam.get("wire_count"),
                     "wires_ok": sam.get("wires_ok"), "notes": sam.get("notes", "")},
             "ranked_faults": ctx.get("ranked"),
             "failed_verification": ctx.get("verification"),
             "code_snippet": code[:2000],
+            "frame_file": str(ctx.get("frame_file") or ""),
         }
 
     # -- mock reasoning -------------------------------------------------
@@ -154,6 +299,7 @@ class MetaClaudeAdapter:
             evidence = extra + evidence
         if measured:
             evidence = [measured] + evidence
+        evidence = evidence + [self._vision_summary(ctx.get("sam") or {})]
         if fault is not None:
             return AgentDecision(
                 mode=Mode.GUIDED_ASSEMBLY,
@@ -170,7 +316,7 @@ class MetaClaudeAdapter:
             state=AgentState.INSTRUCTING,
             fault_hypothesis=None,
             confidence=0.9,
-            evidence=["probe: %d I2C device(s) [%s]" % (len(devices), ", ".join(devices) or "none")],
+            evidence=["probe: %d I2C device(s) [%s]" % (len(devices), ", ".join(devices) or "none")] + evidence,
             next_instruction=step.instruction_student,
             speak_to_tech=step.instruction_student,
             verification_test=test,
@@ -221,6 +367,16 @@ class MetaClaudeAdapter:
             ]
         return None, []
 
+    @staticmethod
+    def _vision_summary(sam: dict) -> str:
+        """One-line citation of what the camera segmentation reported."""
+        labels = [d.get("label", "?") for d in (sam.get("detections") or [])]
+        notes = sam.get("notes", "")
+        text = "vision sees: " + (", ".join(labels) if labels else "nothing usable")
+        if sam.get("wires_ok") is False or "NOT visible" in notes or "dark" in notes:
+            text += " — " + notes
+        return text
+
     def _fault_from_failed_test(self, ver: dict, code: str) -> tuple:
         """Map a failed verification test to a fault when no rule fired."""
         test = ver.get("test", "")
@@ -248,7 +404,7 @@ class MetaClaudeAdapter:
     def _fix_hint(fault: str) -> str:
         return {
             "SDA_SCL_SWAPPED": "The I2C bus is silent. Swap the SDA and SCL wires at the module, then press Check Now.",
-            "LOOSE_GND": "Power or ground looks loose. Reseat the black GND wire on both ends, then press Check Now.",
+            "LOOSE_GND": "Power or ground looks loose. Reseat the GND wire on both ends, then press Check Now.",
             "CODE_PIN_MISMATCH": "Your code drives a different pin than the wired LED. Change the code to GPIO 2, re-flash, then press Check Now.",
             "SENSOR_DISCONNECTED": "The BME280 is missing from the bus. Reseat its four wires, then press Check Now.",
             "LED_REVERSED": "The LED is backwards. Flip it so the long leg faces GPIO 2 through the resistor, then press Check Now.",

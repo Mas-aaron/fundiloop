@@ -12,21 +12,23 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+os.environ["MOCK_META"] = "true"  # this rehearsal is mock-only by definition
+
 from backend.app.adapters.muse_adapter import MetaClaudeAdapter  # noqa: E402
 from backend.app.adapters.sam_adapter import MetaSAMAdapter  # noqa: E402
 from backend.app.adapters.voice_adapter import MetaVoiceAdapter  # noqa: E402
 from backend.app.agent_orchestrator import AgentOrchestrator  # noqa: E402
-from backend.app.camera_client import CameraClient  # noqa: E402
 from backend.app.change_detector import MotionSettler  # noqa: E402
 from backend.app.circuit_graph import load_circuit_graph  # noqa: E402
 from backend.app.models import CheckNowRequest, Mode  # noqa: E402
 from backend.app.serial_probe import SerialProbe  # noqa: E402
+from backend.tests.helpers import make_camera  # noqa: E402
 
 
 def make_orchestrator(tmp):
     return AgentOrchestrator(
         graph=load_circuit_graph(),
-        camera=CameraClient(mock=True),
+        camera=make_camera(tmp),
         settler=MotionSettler(settle_seconds=1.0),
         probe=SerialProbe(mock=True),
         sam=MetaSAMAdapter(mock=True),
