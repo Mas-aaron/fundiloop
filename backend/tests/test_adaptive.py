@@ -250,5 +250,146 @@ class ConfirmFlowTest(unittest.TestCase):
         self.assertTrue(oled_unknown["needs_confirmation"])
 
 
+class ToggleHandle(SilentHandle):
+    """Answers PING only while the class flag is set."""
+
+    alive = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self._out = []
+
+    def write(self, data):
+        super().write(data)
+        cmd = bytes(data).decode("ascii", "replace").strip()
+        if ToggleHandle.alive and cmd == "PING":
+            self._out.append(b'{"cmd": "PING", "status": "OK"}\n')
+        return len(data)
+
+    def readline(self):
+        if self._out:
+            return self._out.pop(0)
+        return b""
+
+
+class PortAwareHandle(SilentHandle):
+    """Answers PING only on COM5 at 9600 baud."""
+
+    def __init__(self, port=None, baud=115200, **kwargs):
+        super().__init__()
+        self._port = port
+        self._baud = baud
+        self._out = []
+
+    def write(self, data):
+        super().write(data)
+        cmd = bytes(data).decode("ascii", "replace").strip()
+        if (self._port, self._baud) == ("COM5", 9600) and cmd == "PING":
+            self._out.append(b'{"cmd": "PING", "status": "OK"}\n')
+        return len(data)
+
+    def readline(self):
+        if self._out:
+            return self._out.pop(0)
+        return b""
+
+
+def install_port_list_stub(tc, devices):
+    fake_mod = SimpleNamespace(list_ports=SimpleNamespace(
+        comports=lambda: [
+            SimpleNamespace(device=d, description="USB Serial", hwid="USB")
+            for d in devices
+        ]))
+    patcher = mock.patch.dict(sys.modules, {"serial.tools": fake_mod})
+    patcher.start()
+    tc.addCleanup(patcher.stop)
+
+
+class SerialSetupTest(unittest.TestCase):
+    def test_configure_switches_port_and_baud(self):
+        probe = SerialProbe(port="COM3", baud=115200, mock=True)
+        out = probe.configure(port="COM5", baud="9600")
+        self.assertEqual((probe.port, probe.baud), ("COM5", 9600))
+        self.assertEqual(out["port"], "COM5")
+        out = probe.configure(port="COM7", baud="bogus")
+        self.assertEqual((probe.port, probe.baud), ("COM7", 9600))
+
+    def test_send_tracks_and_clears_last_error(self):
+        install_serial_stub(self, ToggleHandle)
+        probe = SerialProbe(port="COM9", baud=115200, mock=False, timeout=0.2)
+        ToggleHandle.alive = False
+        self.addCleanup(setattr, ToggleHandle, "alive", False)
+        reply = probe.send("PING")
+        self.assertIn("error", reply)
+        self.assertIn("PING", probe.last_error)
+        ToggleHandle.alive = True
+        reply = probe.send("PING")
+        self.assertNotIn("error", reply)
+        self.assertEqual(probe.last_error, "")
+
+    def test_list_serial_ports(self):
+        from backend.app.serial_probe import list_serial_ports
+
+        install_port_list_stub(self, ["COM5"])
+        self.assertEqual(list_serial_ports(),
+                         [{"port": "COM5", "description": "USB Serial",
+                           "hwid": "USB"}])
+
+    def test_list_serial_ports_empty_when_unavailable(self):
+        from backend.app.serial_probe import list_serial_ports
+
+        patcher = mock.patch.dict(sys.modules, {"serial.tools": SimpleNamespace()})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.assertEqual(list_serial_ports(), [])
+
+    def test_autodetect_adopts_live_port(self):
+        install_serial_stub(self, PortAwareHandle)
+        install_port_list_stub(self, ["COM3", "COM5"])
+        probe = SerialProbe(port="COM3", baud=115200, mock=False, timeout=2.0)
+        found = probe.autodetect(timeout=0.2)
+        self.assertEqual(found, {"port": "COM5", "baud": 9600})
+        self.assertEqual((probe.port, probe.baud), ("COM5", 9600))
+        self.assertEqual(probe.timeout, 2.0)
+
+    def test_autodetect_none_restores_original(self):
+        install_serial_stub(self, SilentHandle)
+        install_port_list_stub(self, ["COM3"])
+        probe = SerialProbe(port="COM9", baud=115200, mock=False, timeout=2.0)
+        self.assertIsNone(probe.autodetect(timeout=0.2))
+        self.assertEqual((probe.port, probe.baud), ("COM9", 115200))
+        self.assertEqual(probe.timeout, 2.0)
+        self.assertEqual(probe._ser, None)
+
+    def test_config_serial_endpoint_applies_to_both_probes(self):
+        import backend.app.main as main_mod
+
+        orc = SimpleNamespace(probe=SerialProbe(port="COM3", mock=True))
+        live = SimpleNamespace(probe=SerialProbe(port="COM3", mock=True))
+        persisted = {}
+        with mock.patch.object(main_mod, "orchestrator", orc), mock.patch.object(
+                main_mod, "live_guide", live), mock.patch.object(
+                main_mod, "_persist_env_var",
+                lambda n, v: persisted.update({n: v})), mock.patch.dict(os.environ, {}):
+            out = main_mod.api_config_serial({"port": "COM5", "baud": "9600"})
+            self.assertEqual(os.environ["SERIAL_PORT"], "COM5")
+            self.assertEqual(os.environ["SERIAL_BAUD"], "9600")
+        self.assertEqual(out["serial_live"]["port"], "COM5")
+        self.assertEqual(live.probe.port, "COM5")
+        self.assertEqual(live.probe.baud, 9600)
+        self.assertEqual(persisted, {"SERIAL_PORT": "COM5", "SERIAL_BAUD": "9600"})
+
+    def test_serial_ports_endpoint_shape(self):
+        import backend.app.main as main_mod
+
+        orc = SimpleNamespace(probe=SerialProbe(port="COM3", mock=True))
+        with mock.patch.object(main_mod, "orchestrator", orc), mock.patch.object(
+                main_mod, "list_serial_ports",
+                return_value=[{"port": "COM5", "description": "USB", "hwid": ""}]):
+            out = main_mod.api_serial_ports()
+        self.assertEqual(out["ports"][0]["port"], "COM5")
+        self.assertEqual(out["current"]["port"], "COM3")
+
+
 if __name__ == "__main__":
     unittest.main()

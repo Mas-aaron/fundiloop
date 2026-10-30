@@ -121,39 +121,49 @@ def build_hint(step: dict, verification: dict, Muse) -> str:
     return hint.strip('" ') if hint else fallback
 
 
-def generate_code(session: dict, Muse) -> str:
-    """Generate the verified project's .ino (called only when DONE)."""
+def generate_code(session: dict, Muse, draft: bool = False) -> str:
+    """Generate the project's .ino (final when DONE, draft on request)."""
     if getattr(Muse, "mock", False):
-        return _mock_firmware(session)
-    from .adapters import MetaAPIError
+        code = _mock_firmware(session, draft=draft)
+    else:
+        from .adapters import MetaAPIError
 
-    text = Muse.complete_text(
-        "You write Arduino firmware. Return only code.",
-        learning_code_prompt(
-            session.get("project_title", session.get("project_id", "project")),
-            session.get("plan", []), session.get("visible_parts", []),
-            session.get("verified", {}), session.get("pin_map", {})))
-    code = text.strip()
-    if code.startswith("```"):
-        import re
+        text = Muse.complete_text(
+            "You write Arduino firmware. Return only code.",
+            learning_code_prompt(
+                session.get("project_title", session.get("project_id", "project")),
+                session.get("plan", []), session.get("visible_parts", []),
+                session.get("verified", {}), session.get("pin_map", {}),
+                draft=draft))
+        code = text.strip()
+        if code.startswith("```"):
+            import re
 
-        code = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", code).strip()
-    if not code:
-        raise MetaAPIError("Muse returned empty firmware")
+            code = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", code).strip()
+        if not code:
+            raise MetaAPIError("Muse returned empty firmware")
+    if draft:
+        steps_done = len((session.get("verified") or {}).get("steps", []))
+        steps_total = len(session.get("plan", []))
+        code = ("// DRAFT — hardware not fully verified (%d of %d steps). "
+                "Pins/addresses below come from the plan and profile "
+                "defaults; verify each step, then fetch the final code.\n"
+                % (steps_done, steps_total)) + code
     return code
 
 
-def _mock_firmware(session: dict) -> str:
-    """Deterministic mock .ino using the session's verified pins/addresses."""
+def _mock_firmware(session: dict, draft: bool = False) -> str:
+    """Deterministic mock .ino using the session's pins/addresses."""
     pin_map = session.get("pin_map", {}) or {}
     sda, scl, led = pin_map.get("sda", 21), pin_map.get("scl", 22), pin_map.get("led_gpio", 2)
     verified = session.get("verified", {}) or {}
     addrs = ", ".join(verified.get("i2c", [])) or "none seen"
     title = session.get("project_title", session.get("project_id", "project"))
     board = pin_map.get("label", pin_map.get("board", "?"))
+    provenance = ("plan/profile values, hardware unverified"
+                  if draft else "pins/address from verified sensor evidence")
     lines = [
-        "// %s for %s (mock firmware; pins/address from verified sensor evidence)"
-        % (title, board),
+        "// %s for %s (mock firmware; %s)" % (title, board, provenance),
         "// I2C seen on bus: %s" % addrs,
         "#include <Arduino.h>",
         "#include <Wire.h>",

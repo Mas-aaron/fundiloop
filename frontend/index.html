@@ -27,6 +27,7 @@
 </figure>
 <div id="cam-src" class="fine"></div>
 
+<div id="learn-chapter" class="chapter-title" hidden></div>
 <div id="instruction" role="status">Loading session…</div>
 <div id="state-line" class="fine"></div>
 
@@ -100,7 +101,8 @@
 </section>
 
 <section id="code-sec" hidden>
-  <h2>Verified firmware</h2>
+  <h2>Project firmware</h2>
+  <div id="code-kind" class="fine"></div>
   <button id="send-code" class="small" type="button">SEND CODE</button>
   <button id="copy-code" class="small" type="button">COPY</button>
   <pre id="code-out" class="panel"></pre>
@@ -116,6 +118,19 @@
     <button id="save-cam" class="small" type="button">SAVE CAMERA</button>
   </div>
   <div id="cam-msg" class="fine"></div>
+  <label for="serial-port">Patient board serial port:</label>
+  <div class="btn-row" style="margin-top:4px">
+    <select id="serial-port" style="flex:2"></select>
+    <select id="serial-baud" style="flex:1">
+      <option value="115200">115200</option>
+      <option value="9600">9600</option>
+    </select>
+  </div>
+  <div class="btn-row" style="margin-top:8px">
+    <button id="save-serial" class="small" type="button">SAVE SERIAL</button>
+    <button id="serial-detect" class="small" type="button">AUTO-DETECT</button>
+  </div>
+  <div id="serial-msg" class="fine"></div>
   <label for="code">Paste patient-board code to check pin usage:</label>
   <textarea id="code" placeholder="e.g. #define LED_PIN 4"></textarea>
   <label for="fault">Simulate fault:</label>
@@ -128,10 +143,14 @@
     <option>LED_REVERSED</option>
   </select>
   <div class="fine">Fault injection only affects mock probe data. Clear it and press CHECK NOW to verify the fix.</div>
-  <label for="voice">Spoken voice:</label>
+  <label for="voice">Browser fallback voice (Meta Voice TTS speaks first):</label>
   <select id="voice">
     <option value="">Auto (best available)</option>
   </select>
+  <div class="btn-row" style="margin-top:8px">
+    <button id="test-voice" class="small" type="button">TEST VOICE</button>
+  </div>
+  <div id="voice-status" class="fine"></div>
   <div class="btn-row" style="margin-top:10px">
     <button id="clear-snap" class="small" type="button">CLEAR PHONE SNAP</button>
     <button id="rescan" class="small" type="button">RE-SCAN EQUIPMENT</button>
@@ -147,6 +166,7 @@
     <button id="cook-exit" class="small" type="button">EXIT</button>
   </div>
   <div class="cook-progress"><div id="cook-bar"></div></div>
+  <div id="cook-chapter" class="chapter-title" hidden></div>
   <div id="cook-instruction" role="status"></div>
   <ol id="cook-parts" class="cook-chips"></ol>
   <figure class="cook-cam">

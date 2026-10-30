@@ -36,6 +36,21 @@ def _env_timeout() -> float:
         return 4.0
 
 
+def list_serial_ports() -> list[dict]:
+    """Enumerate candidate serial ports (empty when pyserial is missing)."""
+    try:
+        from serial.tools import list_ports
+    except Exception:
+        return []
+    try:
+        found = list_ports.comports()
+    except Exception:
+        return []
+    return [{"port": p.device,
+             "description": (p.description or "")[:80],
+             "hwid": (p.hwid or "")[:80]} for p in found]
+
+
 def _mock_enabled() -> bool:
     return mock_meta_enabled()
 
@@ -53,7 +68,50 @@ class SerialProbe:
         self.mock = _mock_enabled() if mock is None else mock
         self.timeout = timeout if timeout is not None else _env_timeout()
         self.simulate_fault: str | None = None
+        self.last_error: str = ""
         self._ser = None  # persistent handle, opened lazily
+
+    def configure(self, port: str | None = None, baud=None) -> dict:
+        """Point the probe at a new port/baud at runtime (reconnects lazily)."""
+        self.close()
+        if port:
+            self.port = str(port)
+        if baud:
+            try:
+                self.baud = int(baud)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pass
+        self.last_error = ""
+        return self.serial_status()
+
+    def serial_status(self) -> dict:
+        return {"port": self.port, "baud": self.baud, "mock": self.mock,
+                "last_error": self.last_error}
+
+    def autodetect(self, timeout: float = 0.8) -> dict | None:
+        """Find a port+baud answering the patient PING (explicit user action).
+
+        Probes each listed port at the current baud first, then each known
+        baud, with a short timeout, and adopts the first live one. Returns
+        {"port", "baud"} or None (original settings restored).
+        """
+        if self.mock:
+            return None
+        original_port, original_baud, original_timeout = (
+            self.port, self.baud, self.timeout)
+        self.timeout = min(timeout, self.timeout)
+        try:
+            for info in list_serial_ports():
+                for baud in dict.fromkeys([original_baud, *KNOWN_BAUDS]):
+                    self.close()
+                    self.port, self.baud = info["port"], baud
+                    if "error" not in self.send("PING"):
+                        return {"port": self.port, "baud": self.baud}
+        finally:
+            self.timeout = original_timeout
+        self.close()
+        self.port, self.baud = original_port, original_baud
+        return None
 
     # -- public API ----------------------------------------------------
     def send(self, command: str) -> dict:
@@ -66,9 +124,14 @@ class SerialProbe:
                 raise RuntimeError("mock serial probe called with MOCK_META=false")
             return self._mock_response(command)
         try:
-            return self._real_send(command)
+            reply = self._real_send(command)
         except Exception as exc:
-            return {"cmd": command, "error": "%s: %s" % (self.port, exc)}
+            reply = {"cmd": command, "error": "%s: %s" % (self.port, exc)}
+        if "error" in reply:
+            self.last_error = "%s: %s" % (command, reply["error"])
+        elif command == "PING":
+            self.last_error = ""
+        return reply
 
     def read_all(self, simulate_fault: str | None = None) -> ProbeReading:
         """Run the full sense pass and aggregate one ProbeReading.

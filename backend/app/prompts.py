@@ -101,6 +101,54 @@ def plan_system_prompt(available_tests: dict, visible_parts: list[str],
     return "\n".join(lines)
 
 
+def fundi_chapters_system(board: str | None = None) -> str:
+    """System prompt: Fundi wraps each plan step in a lesson chapter."""
+    return (
+        "You are Fundi, a high-energy maker host talking a friend through "
+        "a hands-on electronics build. The student builds on: %s. "
+        "You get a validated build plan: one step per chapter, each with a "
+        "number n, a task instruction, and the sensor test that verifies it. "
+        "For EVERY step, in order, write one lesson chapter. Return ONLY "
+        "valid JSON, no prose:\n"
+        '{"chapters": [{n, title, teach, task, verify, celebration}]}\n'
+        "Rules:\n"
+        "- n and verify MUST echo the plan step exactly: same number, same "
+        "test name. Never renumber, merge, split, or reorder steps.\n"
+        "- title: under 8 words, names what this chapter is about. It shows "
+        "on screen and is never spoken, so make it a fun label.\n"
+        "- teach: under 50 words, spoken aloud. Sound like a great video "
+        "lesson, not a manual: talk TO the student (you), contractions, "
+        "one vivid detail, zero filler. Plain spoken English, no ALL-CAPS "
+        "words, no code, no parenthetical numbers; say ground for GND and "
+        "three v three for 3V3.\n"
+        "- task: under 30 words, spoken right after teach. The physical "
+        "thing to do now, rephrased from the plan instruction. Never add "
+        "wiring the plan does not name.\n"
+        "- celebration: under 12 words of pure host energy for when the "
+        "sensor verifies this chapter. Vary it every chapter: Boom, Spot "
+        "on, Nailed it, Let's go. No claims about what was built, only "
+        "cheer.\n"
+        "- You never declare success: the sensor test decides. You narrate, "
+        "it verifies."
+        % describe_board(board)
+    )
+
+
+def fundi_chapters_user(plan: list, project_title: str) -> str:
+    """Ask Fundi for one chapter per plan step."""
+    steps = [
+        {"n": s.get("n"), "instruction": s.get("instruction", ""),
+         "verify": s.get("verify", ""),
+         "depends_on_parts": s.get("depends_on_parts", [])}
+        for s in (plan or []) if isinstance(s, dict)
+    ]
+    return (
+        "Project: %s.\nPlan steps: %s\n"
+        "Write one chapter per step in the required JSON format."
+        % (project_title or "project", json.dumps(steps))
+    )
+
+
 def learning_hint_prompt(step: dict, verification: dict) -> str:
     """Ask Muse for one targeted fix hint grounded in sensor evidence."""
     return (
@@ -114,23 +162,37 @@ def learning_hint_prompt(step: dict, verification: dict) -> str:
 
 
 def learning_code_prompt(project_title: str, plan: list, visible_parts: list,
-                         verified: dict, pin_map: dict) -> str:
-    """Ask Muse for the verified project's .ino firmware."""
+                         verified: dict, pin_map: dict,
+                         draft: bool = False) -> str:
+    """Ask Muse for the project's .ino firmware (final or draft)."""
+    if draft:
+        head = ("Generate the complete Arduino (.ino) firmware for this "
+                "electronics build. The hardware is NOT fully verified yet: "
+                "follow the plan and board profile below, and use measured "
+                "evidence only where present. Return ONLY code, no prose or "
+                "fences.\n")
+        constraint = ("Pin numbers MUST come from the board pin map below; "
+                      "I2C addresses from measured evidence where present, "
+                      "else the interface defaults in the plan.")
+    else:
+        head = ("Generate the complete Arduino (.ino) firmware for this "
+                "VERIFIED electronics build. Return ONLY code, no prose or "
+                "fences.\n")
+        constraint = ("Every pin number and address in the code MUST come "
+                      "from the verified evidence above, never from memory.")
     return (
-        "Generate the complete Arduino (.ino) firmware for this VERIFIED "
-        "electronics build. Return ONLY code, no prose or fences.\n"
+        head +
         "project: %s\ntarget board: %s (%s logic)\nplan: %s\n"
-        "visible parts: %s\nverified sensor evidence: %s\n"
+        "visible parts: %s\nmeasured sensor evidence: %s\n"
         "board pin map (USE THESE EXACT NUMBERS): SDA=%s SCL=%s LED=%s. "
-        "I2C addresses confirmed on the bus: %s. "
-        "Every pin number and address in the code MUST come from the verified "
-        "evidence above, never from memory."
+        "I2C addresses seen on the bus: %s. "
+        "%s"
         % (project_title, pin_map.get("label", pin_map.get("board", "?")),
            pin_map.get("voltage", "?"), json.dumps(plan)[:3000],
            ", ".join(visible_parts), json.dumps(verified)[:2000],
            pin_map.get("sda"), pin_map.get("scl"),
            pin_map.get("led_gpio"),
-           ", ".join(verified.get("i2c", [])) or "none")
+           ", ".join(verified.get("i2c", [])) or "none", constraint)
     )
 
 
@@ -167,6 +229,7 @@ LIVE_SYSTEM = (
     "them out loud, one action at a time, like an expert standing beside them. "
     "Speak in short, plain sentences (under 30 words) because your reply is "
     "read aloud; use conversational words, no ALL-CAPS shouting. "
+    "Never output JSON, menus, or code — just the spoken reply. "
     "Name only what the clip and the probe readings actually show; "
     "if the view is unclear, ask them to move the camera or hold still. Never "
     "claim a connection is correct or a fault is fixed -- what you can see is "

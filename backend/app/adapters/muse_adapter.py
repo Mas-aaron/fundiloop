@@ -93,14 +93,91 @@ class MetaClaudeAdapter:
             return "{}"
         return self._real_complete(system, user, image_b64, video_b64, video_mime)
 
-    def _real_complete(self, system: str, user: str,
-                       image_b64: str | None = None,
-                       video_b64: str | None = None,
-                       video_mime: str = "video/mp4") -> str:
+    def complete_text_stream(self, system: str, user: str,
+                             image_b64: str | None = None,
+                             video_b64: str | None = None,
+                             video_mime: str = "video/mp4"):
+        """Yield free-form answer tokens as they arrive (prose, no JSON mode).
+
+        Nothing depends on streaming existing: when the stream cannot even
+        start, the full completion is yielded once instead. A failure after
+        the first token raises MetaAPIError — the caller keeps the partial
+        text already yielded. Mock mode yields "{}" once.
+        """
         import time
 
+        if self.mock:
+            if not mock_meta_enabled():
+                raise MetaAPIError("mock Muse adapter called with MOCK_META=false")
+            yield "{}"
+            return
         if not api_key():
             raise MetaAPIError("META_API_KEY is not set")
+        messages = self._complete_messages(system, user, image_b64,
+                                           video_b64, video_mime)
+        started = time.monotonic()
+        parts: list[str] = []
+        try:
+            client = self._api_client()
+            stream = client.chat.completions.create(
+                model=self.model, messages=messages, stream=True)
+            try:
+                for event in stream:
+                    text = self._chunk_text(event)
+                    if text:
+                        parts.append(text)
+                        yield text
+            finally:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+        except MetaAPIError:
+            raise
+        except Exception as exc:
+            if parts:
+                latency_ms = (time.monotonic() - started) * 1000
+                log_model_call(self.model, latency_ms, "error", "",
+                               raw_summary="".join(parts), ok=False,
+                               error="stream failed: %s" % exc)
+                raise MetaAPIError("Muse stream failed: %s" % exc) from exc
+            yield self._real_complete(system, user, image_b64, video_b64,
+                                      video_mime, json_mode=False)
+            return
+        latency_ms = (time.monotonic() - started) * 1000
+        log_model_call(self.model, latency_ms, "stream", "",
+                       raw_summary="".join(parts))
+
+    def chat_text(self, system: str, messages: list[dict],
+                  json_mode: bool = True) -> str:
+        """Free-form chat over a full message history (raw text out).
+
+        Tier 1 thin seam: one function that sends a conversation and gets a
+        reply. Callers own the history and any JSON parsing. Mock mode "{}".
+        """
+        if self.mock:
+            if not mock_meta_enabled():
+                raise MetaAPIError("mock Muse adapter called with MOCK_META=false")
+            return "{}"
+        return self._real_chat([{"role": "system", "content": system},
+                                *list(messages or [])], json_mode)
+
+    @staticmethod
+    def _chunk_text(event) -> str:
+        """Content delta of one chat chunk ("" for role-only chunks)."""
+        choices = getattr(event, "choices", None) or []
+        if not choices:
+            return ""
+        content = getattr(getattr(choices[0], "delta", None), "content", None)
+        return content if isinstance(content, str) else ""
+
+    @staticmethod
+    def _complete_messages(system: str, user: str,
+                           image_b64: str | None, video_b64: str | None,
+                           video_mime: str) -> list:
+        """System + user messages for a free-form completion."""
         if video_b64 or image_b64:
             user_content: object = [{"type": "text", "text": user}]
             if video_b64:
@@ -115,16 +192,36 @@ class MetaClaudeAdapter:
                 })
         else:
             user_content = user
-        messages = [{"role": "system", "content": system},
-                    {"role": "user", "content": user_content}]
+        return [{"role": "system", "content": system},
+                {"role": "user", "content": user_content}]
+
+    def _real_complete(self, system: str, user: str,
+                       image_b64: str | None = None,
+                       video_b64: str | None = None,
+                       video_mime: str = "video/mp4",
+                       json_mode: bool = True) -> str:
+        return self._real_chat(self._complete_messages(system, user, image_b64,
+                                                       video_b64, video_mime),
+                               json_mode)
+
+    def _real_chat(self, messages: list, json_mode: bool = True) -> str:
+        """POST one chat message list; parse, log, and return the text."""
+        import time
+
+        if not api_key():
+            raise MetaAPIError("META_API_KEY is not set")
         started = time.monotonic()
         try:
             client = self._api_client()
-            try:
-                raw_resp = client.chat.completions.with_raw_response.create(
-                    model=self.model, messages=messages,
-                    response_format={"type": "json_object"})
-            except Exception:
+            if json_mode:
+                try:
+                    raw_resp = client.chat.completions.with_raw_response.create(
+                        model=self.model, messages=messages,
+                        response_format={"type": "json_object"})
+                except Exception:
+                    raw_resp = client.chat.completions.with_raw_response.create(
+                        model=self.model, messages=messages)
+            else:
                 raw_resp = client.chat.completions.with_raw_response.create(
                     model=self.model, messages=messages)
             status = getattr(raw_resp, "status_code", "?")

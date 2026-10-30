@@ -13,9 +13,10 @@ MOCK mode (default) returns a sample transcript. Real mode
 or opens the realtime WebSocket. Model name from VOICE_MODEL; endpoint from
 META_ASR_URL / META_ASR_REALTIME_URL, defaulting to META_API_BASE_URL.
 
-Speech output is always the browser's speechSynthesis (frontend speaks the
-speak_to_tech text), so speak() never calls an API in any mode -- no Meta
-model on the API generates speech audio.
+Speech output is Meta Voice TTS via POST /api/voice/speak (see
+backend/app/tts.py), with default browser speechSynthesis as the
+per-utterance fallback. speak() just echoes the text for orchestrator
+views; the frontend owns actual audio playback.
 """
 from __future__ import annotations
 
@@ -75,8 +76,8 @@ class MetaVoiceAdapter:
                                    sample_rate=sample_rate)
 
     def speak(self, text: str) -> dict:
-        """Speech output is the browser's speechSynthesis; just echo text."""
-        return {"text": text, "audio_base64": None, "engine": "browser-tts", "mock": self.mock}
+        """Echo text for orchestrator views; audio plays via /api/voice/speak."""
+        return {"text": text, "audio_base64": None, "engine": "meta-tts", "mock": self.mock}
 
     def transcribe(self, audio: bytes, filename: str = "talk.webm") -> dict:
         """Transcribe push-to-talk audio, return {"text": ...}."""
@@ -110,7 +111,11 @@ class MetaVoiceAdapter:
             with urllib.request.urlopen(req, timeout=api_timeout()) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
-            raise MetaAPIError("voice transcribe failed: %s" % exc) from exc
+            hint = ""
+            if getattr(exc, "code", None) == 404:
+                hint = (" (HTTP 404: unknown model or path — VOICE_MODEL=%r, "
+                        "want %r)" % (self.model, DEFAULT_VOICE_MODEL))
+            raise MetaAPIError("voice transcribe failed: %s%s" % (exc, hint)) from exc
         if isinstance(payload, dict):
             # The API returns "transcript"; "text" is honored for older callers.
             text = payload.get("transcript") or payload.get("text") or ""

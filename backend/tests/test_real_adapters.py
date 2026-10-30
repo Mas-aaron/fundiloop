@@ -416,6 +416,19 @@ class RealAdapterTests(unittest.TestCase):
                 with self.assertRaises(MetaAPIError):
                     MetaVoiceAdapter(mock=False).transcribe(b"RIFF...", "talk.wav")
 
+    def test_voice_transcribe_404_names_voice_model(self):
+        import urllib.error
+
+        err = urllib.error.HTTPError(
+            "https://api.meta.ai/v1/asr/transcribe", 404, "Not Found", {}, None)
+        fake, _ = fake_urlopen_factory(b"", error=err)
+        with mock.patch.dict(os.environ, {"META_API_KEY": "k"}):
+            with mock.patch("urllib.request.urlopen", fake):
+                with self.assertRaises(MetaAPIError) as ctx:
+                    MetaVoiceAdapter(mock=False).transcribe(b"RIFF...", "talk.wav")
+        self.assertIn("404", str(ctx.exception))
+        self.assertIn("VOICE_MODEL", str(ctx.exception))
+
     def test_voice_route_registered(self):
         from backend.app.main import app
 

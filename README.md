@@ -30,7 +30,7 @@ Target circuit (the only one the MVP supports): ESP32 DevKit + BME280 (I2C
 ```mermaid
 flowchart LR
     Tech([Technician]) -->|CHECK NOW / PTT audio| UI[Mobile web UI]
-    UI -->|speaks every instruction| TTS[(browser speechSynthesis)]
+    UI -->|speaks every instruction| TTS[(Meta Voice TTS + browser fallback)]
     UI -->|REST + audio upload| API[FastAPI backend]
     API --> ORCH[Agent orchestrator]
     ORCH --> CAM[ESP32-CAM overhead frame]
@@ -63,8 +63,12 @@ passing sensor result advances a step or ends a session.
   JSON). Advisory only — sensors decide pass/fail.
 - **Voice Transcribe** (`MetaVoiceAdapter`): transcribes push-to-talk
   uploads from `POST /api/voice/transcribe`. Transcripts containing
-  "done", "fixed", or "moved it" auto-trigger a loop turn. Speech *output*
-  is the browser's `speechSynthesis`, with a replay button.
+  "done", "fixed", or "moved it" auto-trigger a loop turn.
+- **Voice TTS** (`backend/app/tts.py` + frontend `VoiceEngine`): every
+  utterance tries `POST /api/voice/speak` (Meta Voice TTS, warm female
+  voice) first and falls back to default browser `speechSynthesis` for
+  that utterance only on failure, retried fresh next turn. Speech never
+  hard-stops on a TTS failure; a replay button re-speaks the last line.
 
 ## Supported faults
 
@@ -94,7 +98,10 @@ that; you are the safety interlock.
 3. For real hardware, set in `.env`: `CAMERA_STREAM_URL` (e.g.
    `http://192.168.1.50:81/stream`), `CAMERA_CAPTURE_URL` (e.g.
    `http://192.168.1.50/capture`), `SERIAL_PORT` (e.g. `COM3`),
-   `MOCK_META=false`, plus `META_API_KEY` for real Meta calls.
+   `MOCK_META=false`, plus `META_API_KEY` for real Meta calls. The
+   Advanced tab also lists serial ports at runtime: pick one + SAVE
+   SERIAL, or press AUTO-DETECT to adopt the first port answering
+   the patient PING.
 
 Patient board: flash `firmware/patient_board/patient_board.ino` with the
 Arduino ESP32 core + Adafruit BME280 / SSD1306 / GFX libraries. The
@@ -214,11 +221,12 @@ validated and executed by the backend against the real verification module:
 3. Start a plan with `POST /diagnose` (`mode: "learning"`), then loop
    CHECK NOW: the current step's sensor test runs, and the step advances
    only when the sensor confirms. Failures stay put with a targeted hint.
-4. Code ships last and arrives on its own: when the final step passes,
-   the UI fetches `POST /project/{session_id}/code` automatically (409
-   until then) and shows the `.ino` with the pin numbers and addresses
-   the sensors actually confirmed (SDA/SCL/LED, I2C devices). SEND CODE
-   stays as a manual retry, plus a COPY button.
+4. Code is teach-first: SEND CODE is available from the first step and
+   returns a DRAFT `.ino` (bannered, plan/profile values) until every
+   step passes; when the final step passes, the UI fetches
+   `POST /project/{session_id}/code` automatically and shows the final
+   `.ino` with the pin numbers and addresses the sensors actually
+   confirmed (SDA/SCL/LED, I2C devices), plus a COPY button.
 5. Plain sketches welcome: when the probe reports a GPIO/OLED step as
    *unverifiable* (no patient protocol on the board — not failed), the
    turn asks instead of failing, and CONFIRM advances it with a
@@ -303,6 +311,9 @@ MUSE_MODEL=muse-spark-1.3
 SAM_MODEL=sam-3.1
 VOICE_MODEL=meta-voice-1
 # META_ASR_URL=                            # override only; default is base + /asr/transcribe
+TTS_MODEL=muse-voice-tts-1.0
+META_TTS_VOICE=warm-female
+# META_TTS_URL=                            # override only; default is base + /tts/synthesize
 ```
 
 Call shapes mirror the legacy clients (`backend/muse_client.py`,
@@ -318,8 +329,14 @@ data or a canned instruction. Every model call is logged to
 `backend/data/logs/model_calls.jsonl`, and every analysis still is saved to
 `backend/data/debug_frames/`.
 
-Voice: speech output is always the browser's `speechSynthesis`. Speech
-input prefers the browser's speech recognition; where unavailable and live
-voice is configured, push-to-talk records and uploads to
-`POST /api/voice/transcribe` for Muse Voice Transcribe (WAV conversion via
-pydub/ffmpeg when available, raw upload otherwise).
+Voice: speech output tries Meta Voice TTS first (`POST /api/voice/speak`,
+warm female voice from `META_TTS_VOICE`) and falls back to default
+browser `speechSynthesis` for that utterance only on failure. Both paths
+speak the same normalized spoken form (`GND->GND` is said as "ground to
+ground", never spelled). NOTE: the public Meta Model API documents
+Transcribe but no TTS model today, so real-mode TTS 502s until Meta
+ships it — the fallback keeps every utterance audible meanwhile.
+Speech input uses the browser's own speech recognition where available
+and falls back to recording + upload to `POST /api/voice/transcribe`
+for Muse Voice Transcribe (WAV conversion via pydub/ffmpeg when
+available, raw upload otherwise).

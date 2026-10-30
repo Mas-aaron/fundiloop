@@ -30,6 +30,7 @@ from .camera_client import CameraClient
 from .change_detector import MotionSettler
 from .circuit_graph import CircuitGraph, load_circuit_graph
 from .fault_ranker import RANK_THRESHOLD, rank_faults
+from .fundi import chapter_for, plan_chapters, speak_passed, speak_start
 from .models import (
     AgentState,
     AssemblyStep,
@@ -288,10 +289,15 @@ class AgentOrchestrator:
         }
         self.sessions[sid] = self.session
         self.current_id = sid
-        first = steps[0].get("instruction", "")
-        speak = "Starting %s. Step 1: %s" % (self.session["project_title"], first)
-        return self._learning_view(state="INSTRUCTING", instruction=first,
-                                   speak=speak, verification=None)
+        chapters = plan_chapters(self.session["plan"], self.Muse,
+                                 self.session["project_title"], key)
+        self.session["chapters"] = chapters
+        first = chapter_for(chapters, 0) or {}
+        speak = speak_start(first, self.session["project_title"])
+        return self._learning_view(
+            state="INSTRUCTING", instruction=speak, speak=speak,
+            verification=None,
+            fundi={"event": "CHAPTER_START", "chapter": first})
 
     def _learning_turn(self, req, progress=None) -> dict:
         """One sensor-gated learning step. The sensor alone advances."""
@@ -322,7 +328,9 @@ class AgentOrchestrator:
                 state="DONE",
                 instruction="Project verified. Your project code is below.",
                 speak="Project verified. Your project code is shown below.",
-                verification=self.session.get("last_verification")))
+                verification=self.session.get("last_verification"),
+                fundi={"event": "LESSON_DONE", "chapter": None,
+                       "chapters_total": len(plan)}))
         step = plan[idx]
         probe_t0 = time.monotonic()
         probe = self.probe.read_all(simulate_fault=req.simulate_fault)
@@ -350,25 +358,44 @@ class AgentOrchestrator:
                               "test": verification["test"],
                               "passed": verification["passed"],
                               "measured": verification["measured"]})
+        chapters = self.session.get("chapters") or []
+        current_ch = chapter_for(chapters, self.session["step_index"]) or {}
         if verification["passed"]:
             idx += 1
             self.session["step_index"] = idx
             if idx >= len(plan):
                 self.session["completed_at"] = _now()
                 self.session["code_ready"] = True
-                speak = ("Project verified: all %d steps passed sensor checks. "
+                speak = ("Boom, you finished it! Project verified: all "
+                         "%d steps passed sensor checks. "
                          "Your project code is shown below." % len(plan))
                 self.voice.speak(speak)
+                if progress is not None:
+                    progress("CHAPTER_PASSED", {"chapter": current_ch,
+                                                "celebration": speak})
                 return done(self._learning_view(
                     state="DONE",
                     instruction="Project verified. Your project code is below.",
-                    speak=speak, verification=verification))
-            nxt = plan[idx]
-            text = "Verified: %s. Next step %s: %s" % (
-                verification["measured"], nxt.get("n", idx + 1), nxt.get("instruction", ""))
+                    speak=speak, verification=verification,
+                    fundi={"event": "LESSON_DONE", "chapter": None,
+                           "chapters_total": len(plan)}))
+            praise = ["Nice work.", "Boom.", "Spot on.", "Well done.",
+                        "Nailed it.", "Great.", "Let's go."][
+                            self.session["turns"] % 7]
+            next_ch = chapter_for(chapters, idx)
+            text = speak_passed(current_ch, verification["measured"], next_ch,
+                                self.session["project_title"], praise)
             self.voice.speak(text)
-            return done(self._learning_view(state="INSTRUCTING", instruction=text,
-                                            speak=text, verification=verification))
+            if progress is not None:
+                progress("CHAPTER_PASSED", {
+                    "chapter": current_ch, "next_chapter": next_ch,
+                    "celebration": str(current_ch.get("celebration") or praise)})
+            return done(self._learning_view(
+                state="INSTRUCTING", instruction=text, speak=text,
+                verification=verification,
+                fundi={"event": "CHAPTER_PASSED", "chapter": current_ch,
+                       "next_chapter": next_ch,
+                       "celebration": str(current_ch.get("celebration") or praise)}))
         if verification.get("needs_confirmation"):
             return done(self._offer_confirmation(step, verification))
         r_t0 = time.monotonic()
@@ -376,8 +403,13 @@ class AgentOrchestrator:
         timings["reason_ms"] = (time.monotonic() - r_t0) * 1000
         speak = "%s. %s" % (verification["measured"], hint)
         self.voice.speak(speak)
-        return done(self._learning_view(state="VERIFYING", instruction=speak,
-                                        speak=speak, verification=verification))
+        if progress is not None:
+            progress("CHAPTER_HINT", {"chapter": current_ch, "hint": hint})
+        return done(self._learning_view(
+            state="VERIFYING", instruction=speak, speak=speak,
+            verification=verification,
+            fundi={"event": "CHAPTER_HINT", "chapter": current_ch,
+                   "hint": hint}))
 
     def _offer_confirmation(self, step: dict, verification: dict) -> dict:
         """Ask the technician to confirm what the probe cannot assess.
@@ -396,10 +428,13 @@ class AgentOrchestrator:
         }
         self.session["confirm_pending"] = pending
         self.voice.speak(pending["question"])
-        return self._learning_view(state="VERIFYING",
-                                   instruction=pending["question"],
-                                   speak=pending["question"],
-                                   verification=verification)
+        current_ch = chapter_for(self.session.get("chapters") or [],
+                                 self.session["step_index"]) or {}
+        return self._learning_view(
+            state="VERIFYING", instruction=pending["question"],
+            speak=pending["question"], verification=verification,
+            fundi={"event": "CHAPTER_HINT", "chapter": current_ch,
+                   "hint": pending["question"]})
 
     def confirm_learning_step(self, session_id: str, confirmed: bool) -> dict:
         """Advance a learning step on technician attestation.
@@ -418,13 +453,17 @@ class AgentOrchestrator:
         if not pending or idx >= len(s["plan"]):
             raise ValueError("no confirmation pending")
         step = s["plan"][idx]
+        chapters = s.get("chapters") or []
+        current_ch = chapter_for(chapters, idx) or {}
         if not confirmed:
             s["confirm_pending"] = None
             speak = "OK, not confirmed. Fix it up and press CHECK NOW."
             self.voice.speak(speak)
-            return self._learning_view(state="VERIFYING", instruction=speak,
-                                       speak=speak,
-                                       verification=s.get("last_verification"))
+            return self._learning_view(
+                state="VERIFYING", instruction=speak, speak=speak,
+                verification=s.get("last_verification"),
+                fundi={"event": "CHAPTER_HINT", "chapter": current_ch,
+                       "hint": speak})
         s["confirm_pending"] = None
         verification = dict(s.get("last_verification") or {})
         verification["technician_confirmed"] = True
@@ -441,20 +480,31 @@ class AgentOrchestrator:
         if idx >= len(s["plan"]):
             s["completed_at"] = _now()
             s["code_ready"] = True
-            speak = ("Project verified: all %d steps passed (%d confirmed "
+            speak = ("Boom, you finished it! Project verified: all "
+                     "%d steps passed (%d confirmed "
                      "by you). Your project code is shown below."
                      % (len(s["plan"]), self._confirmed_count(s)))
             self.voice.speak(speak)
             return self._learning_view(
                 state="DONE",
                 instruction="Project verified. Your project code is below.",
-                speak=speak, verification=verification)
-        nxt = s["plan"][idx]
-        text = "Confirmed. Next step %s: %s" % (
-            nxt.get("n", idx + 1), nxt.get("instruction", ""))
+                speak=speak, verification=verification,
+                fundi={"event": "LESSON_DONE", "chapter": None,
+                       "chapters_total": len(s["plan"])})
+        next_ch = chapter_for(chapters, idx)
+        text = "Confirmed. Next: %s" % speak_start(
+            next_ch or {}, s.get("project_title", ""))
+        if next_ch is not None and not str(next_ch.get("teach") or "").strip():
+            text = "Confirmed. Next step %s: %s" % (
+                next_ch.get("n", idx + 1),
+                str(next_ch.get("task") or "").strip())
         self.voice.speak(text)
-        return self._learning_view(state="INSTRUCTING", instruction=text,
-                                   speak=text, verification=verification)
+        return self._learning_view(
+            state="INSTRUCTING", instruction=text, speak=text,
+            verification=verification,
+            fundi={"event": "CHAPTER_PASSED", "chapter": current_ch,
+                   "next_chapter": next_ch,
+                   "celebration": str(current_ch.get("celebration") or "Confirmed.")})
 
     @staticmethod
     def _confirmed_count(s: dict) -> int:
@@ -487,7 +537,8 @@ class AgentOrchestrator:
             pass  # logging must never break the loop
 
     def _learning_view(self, state: str, instruction: str, speak: str,
-                       verification: dict | None) -> dict:
+                       verification: dict | None,
+                       fundi: dict | None = None) -> dict:
         s = self.session
         assert s is not None
         idx = s["step_index"]
@@ -514,6 +565,8 @@ class AgentOrchestrator:
         }
         if s.get("confirm_pending"):
             view["confirm_pending"] = dict(s["confirm_pending"])
+        if fundi is not None:
+            view["fundi"] = fundi
         return view
 
     def _learning_status_view(self) -> dict:
@@ -523,12 +576,17 @@ class AgentOrchestrator:
         done = idx >= len(s["plan"])
         if done:
             text = "Project verified."
+            fundi = {"event": "LESSON_DONE", "chapter": None,
+                     "chapters_total": len(s["plan"])}
         else:
             step = s["plan"][idx]
             text = "Step %s: %s" % (step.get("n", idx + 1), step.get("instruction", ""))
+            fundi = {"event": "CHAPTER_START",
+                     "chapter": chapter_for(s.get("chapters") or [], idx)}
         return self._learning_view(state="DONE" if done else "INSTRUCTING",
                                    instruction=text, speak=text,
-                                   verification=s.get("last_verification"))
+                                   verification=s.get("last_verification"),
+                                   fundi=fundi)
 
     # -- board handoff: any board gets guided, on the right mode --------
     def _detect_board_cached(self, frame: bytes) -> dict:

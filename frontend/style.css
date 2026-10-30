@@ -96,6 +96,12 @@ figure.cam {
 }
 #instruction.fault { border-left-color: var(--amber); }
 #instruction.done { border-left-color: var(--teal); }
+.chapter-title { font-size: 15px; font-weight: 800; letter-spacing: 0.4px; color: var(--teal); margin: 8px 2px 2px; }
+@keyframes cheer-flash {
+  0%, 100% { box-shadow: none; }
+  25%, 75% { box-shadow: 0 0 0 3px var(--teal); }
+}
+#instruction.cheer, #cook-instruction.cheer { animation: cheer-flash 0.7s ease-in-out 2; border-radius: 10px; }
 #state-line { margin-bottom: 2px; }
 .big {
   display: block;

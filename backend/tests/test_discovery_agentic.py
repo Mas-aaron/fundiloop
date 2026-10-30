@@ -125,6 +125,39 @@ class LearningLoopTest(unittest.TestCase):
         self.assertIn("#define SCL_PIN 22", out["code"])
         self.assertIn("0x76", out["code"])
 
+    def test_draft_code_available_before_done(self):
+        self.orc.start_learning_session(
+            "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
+            session_id="learn-draft", project_title="Weather station")
+        with mock.patch.object(app_main, "orchestrator", self.orc):
+            out = app_main.api_project_code("learn-draft", {"draft": True})
+        self.assertFalse(out["verified"])
+        self.assertEqual(
+            (out["steps_passed"], out["steps_total"]), (0, 2))
+        self.assertIn("// DRAFT", out["code"])
+        self.assertIn("0 of 2 steps", out["code"])
+        self.assertIn("#define LED_PIN", out["code"])
+
+    def test_draft_counts_verified_steps(self):
+        self.orc.start_learning_session(
+            "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
+            session_id="learn-draft2", project_title="Weather station")
+        self.orc.check_now(CheckNowRequest())
+        with mock.patch.object(app_main, "orchestrator", self.orc):
+            out = app_main.api_project_code("learn-draft2", {"draft": True})
+        self.assertFalse(out["verified"])
+        self.assertEqual(
+            (out["steps_passed"], out["steps_total"]), (1, 2))
+        self.assertIn("1 of 2 steps", out["code"])
+
+    def test_draft_prompt_marks_unverified_build(self):
+        from backend.app.prompts import learning_code_prompt
+
+        text = learning_code_prompt("t", [], [], {}, {}, draft=True)
+        self.assertIn("NOT fully verified", text)
+        final = learning_code_prompt("t", [], [], {}, {})
+        self.assertIn("VERIFIED", final)
+
     def test_check_now_past_done_stays_done(self):
         self.orc.start_learning_session(
             "blink", [step(1, "CHECK_GPIO", depends=["led"],

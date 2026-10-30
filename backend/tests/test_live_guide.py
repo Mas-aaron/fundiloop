@@ -105,6 +105,29 @@ class LiveGuideTest(unittest.TestCase):
         with self.assertRaises(MetaAPIError):
             guide.guide(transcript="hi")
 
+    def test_json_coach_reply_falls_back_to_audible_reask(self):
+        from backend.app.live import COACH_FALLBACK
+
+        menu = '{"menu": [{"label": "Go to cart", "target": "cart"}]}'
+        guide = make_guide(self, StubSAM(TRACKS), StubBrain([menu]),
+                           StubVoice())
+        out = guide.guide(transcript="hi")
+        self.assertEqual(out["speak"], COACH_FALLBACK)
+
+    def test_json_coach_reply_with_speak_field_is_rescued(self):
+        guide = make_guide(self, StubSAM(TRACKS),
+                           StubBrain(['{"speak": "Seat the sensor."}']),
+                           StubVoice())
+        out = guide.guide(transcript="hi")
+        self.assertEqual(out["speak"], "Seat the sensor.")
+
+    def test_plain_coach_reply_passes_through(self):
+        from backend.app.live import clean_coach_text
+
+        self.assertEqual(clean_coach_text("  Check the wiring.  "),
+                         "Check the wiring.")
+        self.assertEqual(clean_coach_text(""), "")
+
 
 if __name__ == "__main__":
     unittest.main()

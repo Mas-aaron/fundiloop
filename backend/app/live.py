@@ -1,13 +1,13 @@
 """Live guidance: the technician talks and shows the bench; the agent guides.
 
 This is FundiLoop's Gemini-Live-shaped loop, assembled from the parts Meta
-actually streams -- Meta has no audio-out model and no streaming video
-endpoint, so each half is a different Meta model:
+actually streams -- Meta has no streaming video endpoint, so each half is
+a different Meta model:
 
   hearing   Muse Voice Transcribe realtime ASR  (voice_adapter.RealtimeVoiceStream)
   seeing    SAM 3.1 video tracking              (sam_adapter.analyze_clip)
   reading   Muse Spark video understanding      (muse_adapter.complete_text)
-  speaking  the browser's speechSynthesis       (voice_adapter.speak)
+  speaking  Meta Voice TTS + browser fallback   (tts.py, frontend VoiceEngine)
 
 guide() runs one live turn: probe (ground truth) -> SAM tracks -> Muse
 guidance text -> speak(). Exactly as in the check-now loop, only the probe
@@ -16,6 +16,7 @@ may confirm anything; SAM and Muse stay advisory.
 from __future__ import annotations
 
 import base64
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 from .adapters.muse_adapter import MetaClaudeAdapter
@@ -27,6 +28,34 @@ from .serial_probe import SerialProbe
 
 MOCK_GUIDANCE = ("Live guidance is offline: start the backend with MOCK_META=false "
                  "and a Meta API key for spoken coaching.")
+
+COACH_FALLBACK = ("I didn't catch that clearly. Say check, look, "
+                  "or send code.")
+
+
+def clean_coach_text(text: str) -> str:
+    """Keep coach replies speakable: never raw JSON on screen or speaker.
+
+    A model that answers with a JSON blob (menus, tool calls) gets one
+    rescue attempt — a human field is extracted when present — otherwise
+    the turn falls back to an audible re-ask instead of reading braces.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if text[0] not in "{[":
+        return text
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return text
+    if isinstance(data, dict):
+        for key in ("speak", "answer", "text", "message", "content",
+                    "reply", "guidance"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return COACH_FALLBACK
 
 
 class LiveGuide:
@@ -67,6 +96,7 @@ class LiveGuide:
                 LIVE_SYSTEM, prompt,
                 video_b64=base64.b64encode(clip).decode("ascii") if clip else None,
                 video_mime=clip_mime).strip()
+        text = clean_coach_text(text)
         if not text:
             text = ("I could not see or hear that clearly. Hold the board still "
                     "and tell me what you are doing.")

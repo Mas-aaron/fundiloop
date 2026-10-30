@@ -27,6 +27,7 @@ import threading
 import time
 from pathlib import Path
 
+from ..frames import PreparedFrame, prepare_frame, rescale_detections
 from . import MetaAPIError, api_base_url, api_key, api_timeout, log_model_call, mock_meta_enabled
 
 
@@ -155,7 +156,8 @@ class MetaSAMAdapter:
                 "(pip install meta-sam-parser): SAM output cannot be decoded") from None
         if not api_key():
             raise MetaAPIError("META_API_KEY is not set")
-        b64 = base64.b64encode(frame).decode("ascii")
+        prep = prepare_frame(frame)
+        b64 = base64.b64encode(prep.payload).decode("ascii")
         started = time.monotonic()
         try:
             per_concept = self._segment_concepts(b64, concepts, parser_mod)
@@ -167,7 +169,7 @@ class MetaSAMAdapter:
                            raw_summary="", ok=False, error=str(exc))
             raise MetaAPIError("SAM request failed: %s" % exc) from exc
         total_ms = (time.monotonic() - started) * 1000
-        return self._combine(per_concept, frame_file, total_ms, parser_mod)
+        return self._combine(per_concept, frame_file, total_ms, parser_mod, prep)
 
     def _segment_concepts(self, b64: str, concepts: list[tuple[str, str]],
                           parser_mod) -> list[dict]:
@@ -341,8 +343,13 @@ class MetaSAMAdapter:
         }
 
     def _combine(self, per_concept: list[dict], frame_file: str,
-                 total_ms: float, parser_mod) -> dict:
-        """Map parser records to detections; log one entry per concept call."""
+                 total_ms: float, parser_mod,
+                 prep: PreparedFrame | None = None) -> dict:
+        """Map parser records to detections; log one entry per concept call.
+
+        Boxes arrive in shipped-pixel coordinates; rescale_detections maps
+        them back to source pixels so callers keep the source-pixel invariant.
+        """
         detections: list[dict] = []
         counts: list[str] = []
         mask_total = 0
@@ -379,6 +386,7 @@ class MetaSAMAdapter:
                            item["response_id"],
                            raw_summary="%s: %d boxes, %d masks" % (
                                item["concept"], len(boxes), len(masks)))
+        detections = rescale_detections(detections, prep)
         wire_count = sum(1 for d in detections if d["label"] == "jumper wire")
         return {
             "model": self.model,
@@ -390,9 +398,12 @@ class MetaSAMAdapter:
             "wires_ok": None,
             "oled_lit": None,
             "notes": ("SAM 3.1: %d regions from %d prompt(s) in %.0fms "
-                      "(%s; %d masks); frame %s" % (
+                      "(%s; %d masks)%s; frame %s" % (
                           len(detections), len(per_concept), total_ms,
                           "; ".join(counts), mask_total,
+                          ("; shipped %dx%d from %dx%d" % (
+                              prep.dst_w, prep.dst_h, prep.src_w, prep.src_h)
+                           if prep is not None and prep.resized else ""),
                           frame_file or "unresolved")),
             "frame_file": frame_file,
             "latency_ms": round(total_ms, 1),

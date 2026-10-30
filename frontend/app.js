@@ -10,36 +10,57 @@ let muted = false;
 try { muted = localStorage.getItem("fundiloop-muted") === "1"; } catch (e) { /* private mode */ }
 let cameraConfigured = false;
 
-// Speech: pick the best English voice (defaults are often robotic), speak
-// sentence-by-sentence so phones don't cut long instructions off.
+// Speech: all output goes through VoiceEngine. Meta Voice TTS (server,
+// warm female voice) is primary everywhere; default browser
+// speechSynthesis is the per-utterance fallback when the server path
+// fails, retried fresh next turn. Clauses stream sentence-by-sentence
+// so phones don't cut off.
 let voiceChoice = "";
 try { voiceChoice = localStorage.getItem("fundiloop-voice") || ""; } catch (e) { /* private mode */ }
 
-function pickVoice() {
-  const vs = speechSynthesis.getVoices().filter((v) => v.lang && v.lang.toLowerCase().startsWith("en"));
-  if (!vs.length) return null;
+// Fallback voice: any English browser voice qualifies — an explicit pick
+// is always honored (even a robotic one), Auto takes the first English
+// voice, and no English voice means the default voice (null).
+function pickFallbackVoice(voices) {
+  const vs = (voices || []).filter((v) => v && v.lang && String(v.lang).toLowerCase().startsWith("en"));
   if (voiceChoice) {
     const named = vs.find((v) => v.name === voiceChoice);
     if (named) return named;
   }
-  const prefs = [/google us english/i, /google uk english/i,
-    /online/i, /premium/i, /enhanced/i, /natural/i, /neural/i,
-    /samantha/i, /zira/i, /david/i, /aria/i, /jenny/i, /guy/i, /google/i];
-  for (const p of prefs) {
-    const hit = vs.find((v) => p.test(v.name));
-    if (hit) return hit;
-  }
-  return vs.find((v) => v.default) || vs[0];
+  if (!vs.length) return null;
+  return vs[0];
+}
+
+function browserVoices() {
+  try {
+    if (!("speechSynthesis" in window)) return [];
+    return speechSynthesis.getVoices().filter((v) => v.lang && v.lang.toLowerCase().startsWith("en"));
+  } catch (e) { return []; }
 }
 
 function populateVoices() {
   const sel = $("voice");
   if (!sel || !("speechSynthesis" in window)) return;
-  const vs = speechSynthesis.getVoices().filter((v) => v.lang && v.lang.toLowerCase().startsWith("en"));
+  const vs = browserVoices();
   sel.innerHTML = '<option value="">Auto (best available)</option>' +
     vs.map((v) => '<option value="' + esc(v.name) + '"' +
       (v.name === voiceChoice ? " selected" : "") + ">" +
       esc(v.name) + "</option>").join("");
+  refreshVoiceStatus();
+}
+
+// Setup check: shows which browser voice backs Meta TTS right now, so a
+// bad inventory is caught in Advanced, not mid-lesson.
+function refreshVoiceStatus() {
+  const el = $("voice-status");
+  if (!el) return;
+  if (!("speechSynthesis" in window)) {
+    el.textContent = "Meta Voice TTS primary; no browser speechSynthesis for fallback on this device.";
+    return;
+  }
+  const v = pickFallbackVoice(speechSynthesis.getVoices());
+  el.textContent = v ? "Meta Voice TTS primary; browser fallback: " + v.name
+    : "Meta Voice TTS primary; no English browser voice for fallback (default voice will try).";
 }
 
 // speakable:normalizer:start
@@ -59,6 +80,9 @@ function speakable(text) {
     "WIFI": "wye fye", "WiFi": "wye fye",
   };
   let s = String(text || "");
+  s = s.replace(/<->/g, " to ");
+  s = s.replace(/<-|←/g, " from ");
+  s = s.replace(/->|=>|→/g, " to ");
   s = s.replace(/```[a-zA-Z]*|```/g, " ");
   s = s.replace(/[`*#]/g, "");
   s = s.replace(/\b0[xX]([0-9A-Fa-f]+)\b/g,
@@ -84,17 +108,61 @@ function speakable(text) {
 }
 // speakable:normalizer:end
 
-function speak(text, onend) {
-  const done = () => { if (onend) { try { onend(); } catch (e) { console.log("speak onend failed", e); } } };
-  if (!text || muted) { done(); return; }
+let speakSeq = 0; // newest speak() call wins; older queues stay silent
+let clauseStreamSeq = 0; // live clause stream id; streams older than this are dead
+let serverAudio = null; // current Meta TTS Audio element (speak path)
+let serverAudioUrl = ""; // its object URL (revoked on stop/end)
+let serverQueue = []; // queued Meta TTS clause clips: {id, url, text}
+let serverPlaying = false; // a queued clause is sounding now
+let streamServerOk = true; // this stream still tries Meta first
+let streamFetchTail = Promise.resolve(); // clause fetches stay in order
+let streamFetchPending = 0; // fetches in flight (streamEnd waits)
+
+function revokeAudioUrl(url) {
+  try { if (url) URL.revokeObjectURL(url); } catch (e) { /* already revoked */ }
+}
+
+function stopServerAudio() {
+  if (serverAudio) {
+    try { serverAudio.pause(); } catch (e) { /* already stopped */ }
+    serverAudio = null;
+  }
+  if (serverAudioUrl) { revokeAudioUrl(serverAudioUrl); serverAudioUrl = ""; }
+}
+
+function clearServerQueue() {
+  serverQueue.forEach((item) => revokeAudioUrl(item.url));
+  serverQueue = [];
+  serverPlaying = false;
+}
+
+// One Meta TTS fetch: object URL on playable audio, null on any failure
+// (the caller falls back to browser speech for that utterance only).
+async function fetchServerSpeech(text) {
   try {
-    if (!("speechSynthesis" in window)) { done(); return; }
+    const r = await fetch("/api/voice/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!r.ok) return null;
+    const blob = await r.blob();
+    if (!blob || !blob.size) return null;
+    return URL.createObjectURL(blob);
+  } catch (e) { return null; }
+}
+
+function speakBrowserNow(say, done) {
+  // Default browser speech: any fallback voice, never refused.
+  const finish = () => { if (done) { try { done(); } catch (e) { console.log("speak onend failed", e); } } };
+  try {
+    if (!("speechSynthesis" in window)) { finish(); return; }
     speechSynthesis.cancel();
     if (speechSynthesis.paused) speechSynthesis.resume();
-    const voice = pickVoice();
+    const voice = pickFallbackVoice(speechSynthesis.getVoices());
     // Sentence chunks: some mobile browsers stall on single long utterances.
     // Decimals are protected so "0.55" is never split mid-number.
-    const safe = speakable(text).replace(/(\d)\.(\d)/g, "$1<DOT>$2");
+    const safe = String(say).replace(/(\d)\.(\d)/g, "$1<DOT>$2");
     const parts = (safe.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [safe])
       .map((p) => p.replace(/<DOT>/g, "."));
     parts.forEach((p, i) => {
@@ -103,11 +171,226 @@ function speak(text, onend) {
       u.rate = 0.98;
       u.pitch = 1.0;
       if (voice) u.voice = voice;
-      if (i === parts.length - 1) u.onend = done;
+      if (i === parts.length - 1) u.onend = finish;
       speechSynthesis.speak(u);
     });
-  } catch (e) { console.log("speech failed", e); done(); }
+  } catch (e) { console.log("speech failed", e); finish(); }
 }
+
+function speakBrowserClause(say) {
+  // One streamed clause appended to the browser queue (no cancel).
+  try {
+    if (!("speechSynthesis" in window)) return;
+    const voice = pickFallbackVoice(speechSynthesis.getVoices());
+    const u = new SpeechSynthesisUtterance(say);
+    u.lang = "en-US";
+    u.rate = 0.98;
+    u.pitch = 1.0;
+    if (voice) u.voice = voice;
+    speechSynthesis.speak(u);
+  } catch (e) { console.log("speech failed", e); }
+}
+
+function pumpServerQueue(id) {
+  if (serverPlaying) return;
+  const item = serverQueue.shift();
+  if (!item) return;
+  if (item.id !== clauseStreamSeq || item.id !== id) {
+    revokeAudioUrl(item.url); // superseded stream stays silent
+    pumpServerQueue(id);
+    return;
+  }
+  serverPlaying = true;
+  let el;
+  try {
+    el = new Audio(item.url);
+  } catch (e) {
+    revokeAudioUrl(item.url);
+    serverPlaying = false;
+    speakBrowserClause(item.text);
+    pumpServerQueue(id);
+    return;
+  }
+  el.onended = () => {
+    revokeAudioUrl(item.url);
+    serverPlaying = false;
+    pumpServerQueue(id);
+  };
+  el.onerror = () => {
+    revokeAudioUrl(item.url);
+    serverPlaying = false;
+    speakBrowserClause(item.text); // broken clip still sounds
+    pumpServerQueue(id);
+  };
+  try {
+    const play = el.play();
+    if (play && play.catch) play.catch(() => {
+      revokeAudioUrl(item.url);
+      serverPlaying = false;
+      speakBrowserClause(item.text);
+      pumpServerQueue(id);
+    });
+  } catch (e) {
+    revokeAudioUrl(item.url);
+    serverPlaying = false;
+    speakBrowserClause(item.text);
+    pumpServerQueue(id);
+  }
+}
+
+const VoiceEngine = {
+  // Single choke point for all spoken output. Meta Voice TTS audio is
+  // primary; any server failure falls back to default browser speech
+  // for that utterance only, retried fresh next turn. speak() stays a
+  // thin wrapper so existing call sites are unchanged.
+  speak(text, onend) {
+    const done = () => { if (onend) { try { onend(); } catch (e) { console.log("speak onend failed", e); } } };
+    clauseStreamSeq++; // a full speak takes over: any live stream goes silent
+    stopServerAudio();
+    clearServerQueue();
+    if (!text || muted) { done(); return; }
+    const mySpeech = ++speakSeq;
+    // One tick of delay lets a previous cancel() settle so rapid speaks
+    // never overlap into noise; a superseded speech drops silently.
+    setTimeout(() => {
+      if (mySpeech !== speakSeq) return;
+      const say = speakable(text);
+      fetchServerSpeech(say).then((url) => {
+        if (mySpeech !== speakSeq) { revokeAudioUrl(url); return; }
+        if (!url) { speakBrowserNow(say, done); return; }
+        let el;
+        try {
+          el = new Audio(url);
+        } catch (e) {
+          revokeAudioUrl(url);
+          speakBrowserNow(say, done);
+          return;
+        }
+        serverAudio = el;
+        serverAudioUrl = url;
+        el.onended = () => {
+          if (mySpeech !== speakSeq) return;
+          stopServerAudio();
+          done();
+        };
+        el.onerror = () => {
+          if (mySpeech !== speakSeq) return;
+          stopServerAudio();
+          speakBrowserNow(say, done);
+        };
+        try {
+          const play = el.play();
+          if (play && play.catch) play.catch(() => {
+            if (mySpeech !== speakSeq) return;
+            stopServerAudio();
+            speakBrowserNow(say, done);
+          });
+        } catch (e) {
+          stopServerAudio();
+          speakBrowserNow(say, done);
+        }
+      });
+    }, 60);
+  },
+  // Clause streaming: speak answer tokens as they arrive without chopping.
+  // streamStart cancels any older speech and owns the queue; streamClause
+  // appends one clause (Meta audio queued in order, browser fallback per
+  // clause once the server fails); streamEnd waits for the queue to drain.
+  streamStart() {
+    const id = ++clauseStreamSeq;
+    speakSeq++; // an in-flight speak() drops; this stream owns speech now
+    stopServerAudio();
+    clearServerQueue();
+    streamServerOk = true;
+    streamFetchTail = Promise.resolve();
+    streamFetchPending = 0;
+    try {
+      if (!("speechSynthesis" in window)) return id;
+      speechSynthesis.cancel();
+      if (speechSynthesis.paused) speechSynthesis.resume();
+    } catch (e) { /* no speech */ }
+    return id;
+  },
+  streamClause(id, clause) {
+    if (id !== clauseStreamSeq) return; // superseded stream stays silent
+    const say = speakable(clause);
+    if (!say || muted) return;
+    if (!streamServerOk) { speakBrowserClause(say); return; }
+    streamFetchPending++;
+    streamFetchTail = streamFetchTail.then(() =>
+      fetchServerSpeech(say).then((url) => {
+        streamFetchPending--;
+        if (id !== clauseStreamSeq) { revokeAudioUrl(url); return; }
+        if (url) {
+          serverQueue.push({ id: id, url: url, text: say });
+          pumpServerQueue(id);
+        } else {
+          streamServerOk = false; // rest of this stream speaks locally
+          speakBrowserClause(say);
+        }
+      }).catch(() => {
+        streamFetchPending--;
+        if (id !== clauseStreamSeq) return;
+        streamServerOk = false;
+        speakBrowserClause(say);
+      })
+    );
+  },
+  streamEnd(id, onend) {
+    const done = () => { if (onend) { try { onend(); } catch (e) { console.log("speak onend failed", e); } } };
+    if (id !== clauseStreamSeq) return;
+    const t0 = Date.now();
+    const wait = () => {
+      if (id !== clauseStreamSeq) return;
+      let busySp = streamFetchPending > 0 || serverQueue.length > 0 || serverPlaying;
+      try {
+        busySp = busySp || (("speechSynthesis" in window) &&
+          (speechSynthesis.speaking || speechSynthesis.pending));
+      } catch (e) { /* no speech */ }
+      if (!busySp || Date.now() - t0 > 30000) { done(); return; }
+      setTimeout(wait, 250);
+    };
+    setTimeout(wait, 500); // let the queue start before judging it idle
+  },
+  // Interrupt everything: a new turn or a listen tap owns speech now.
+  stop() {
+    speakSeq++;
+    clauseStreamSeq++;
+    streamServerOk = true;
+    stopServerAudio();
+    clearServerQueue();
+    try { if ("speechSynthesis" in window) speechSynthesis.cancel(); } catch (e) { /* no speech */ }
+  },
+};
+
+function speak(text, onend) { VoiceEngine.speak(text, onend); }
+
+// clausestream:splitter:start
+const MIN_CLAUSE_LEN = 24; // start speaking once a clause passes this length
+// Split streamed answer text at punctuation boundaries (. , ? ! newline)
+// so clauses sound as they land. Decimals stay intact. Returns the clauses
+// ready to speak plus the still-incomplete remainder.
+function cutClauses(pending, flush) {
+  const clauses = [];
+  let rest = pending;
+  for (;;) {
+    let cut = -1;
+    for (let i = 0; i < rest.length; i++) {
+      const c = rest[i];
+      if (c === "." && i > 0 && i + 1 < rest.length &&
+        /\d/.test(rest[i - 1]) && /\d/.test(rest[i + 1])) continue;
+      if (c === "." || c === "," || c === "?" || c === "!" || c === "\n") { cut = i; break; }
+    }
+    if (cut < 0) break;
+    if (!flush && rest.length < MIN_CLAUSE_LEN) break;
+    const head = rest.slice(0, cut + 1).trim();
+    rest = rest.slice(cut + 1);
+    if (head) clauses.push(head);
+  }
+  if (flush && rest.trim()) { clauses.push(rest.trim()); rest = ""; }
+  return { clauses, rest };
+}
+// clausestream:splitter:end
 
 function refreshCamera() {
   const url = "/api/camera/latest?t=" + Date.now();
@@ -281,7 +564,9 @@ async function checkNowStream(payload, onStage) {
         refreshBadge();
         return true;
       }
-      onStage(name);
+      let detail = {};
+      try { detail = data ? JSON.parse(data) : {}; } catch (e) { /* stage only */ }
+      onStage(name, detail);
     }
     if (done) return false; // stream died mid-turn: caller falls back
   }
@@ -299,7 +584,7 @@ async function checkNow(transcript) {
     $("instruction").textContent = stage + " " + Math.round((Date.now() - t0) / 1000) + "s";
   };
   $("instruction").textContent = "Checking…";
-  speak("Checking."); // instant ack, cut off when the verdict speech starts
+  speak(transcript ? "Got it. Checking." : "Checking."); // ack the technician, then the verdict replaces it
   const tick = setInterval(paint, 1000);
   try {
     const fault = $("fault").value || null;
@@ -309,15 +594,20 @@ async function checkNow(transcript) {
       transcript: transcript || "",
     };
     try {
-      const onStage = (name) => {
+      const onStage = (name, detail) => {
         if (CHECK_STAGES[name]) { stage = CHECK_STAGES[name]; paint(); }
+        else if (name === "CHAPTER_PASSED" || name === "CHAPTER_HINT") {
+          paintFundi({ event: name, chapter: (detail && detail.chapter) || null,
+            next_chapter: (detail && detail.next_chapter) || null,
+            celebration: (detail && detail.celebration) || "" });
+        }
       };
       if (await checkNowStream(payload, onStage)) return;
     } catch (e) {
       if (checkAbort && checkAbort.signal.aborted) {
         pendingCheck = "";
         $("instruction").textContent = "Cancelled.";
-        try { speechSynthesis.cancel(); } catch (x) { /* no speech */ }
+        VoiceEngine.stop();
         return;
       }
       console.log("stream turn failed, falling back", e);
@@ -388,6 +678,7 @@ function drawEvidence(frameFile, detections, mock) {
 
 function render(v) {
   paintConfirm(v);
+  paintFundi(null); // guided/diagnostic turns carry no lesson chapter
   const box = $("instruction");
   box.textContent = v.instruction || "(no instruction)";
   lastInstruction = v.instruction || "";
@@ -542,8 +833,36 @@ function renderLearnCards(projects) {
   }).join("");
 }
 
+// Lesson chapter banner: the banner always names the chapter to work on
+// (START/HINT: current; PASSED: the next one; DONE: the payoff line).
+// Visual only — speech comes from the done view, never from live events.
+function paintFundi(fundi) {
+  const cook = cookMode;
+  const banner = $(cook ? "cook-chapter" : "learn-chapter");
+  const box = $(cook ? "cook-instruction" : "instruction");
+  if (!fundi || !fundi.event) { banner.hidden = true; return; }
+  const ev = fundi.event;
+  const show = (ev === "CHAPTER_PASSED" ? fundi.next_chapter : fundi.chapter) || null;
+  if (ev === "LESSON_DONE") {
+    banner.textContent = "Lesson complete — your project code is below.";
+  } else if (show && show.title) {
+    banner.textContent = show.title;
+  } else {
+    banner.hidden = true;
+    return;
+  }
+  banner.hidden = false;
+  if (ev === "CHAPTER_PASSED" || ev === "LESSON_DONE") {
+    box.classList.remove("cheer");
+    void box.offsetWidth; // restart the flash animation
+    box.classList.add("cheer");
+    setTimeout(() => box.classList.remove("cheer"), 1500);
+  }
+}
+
 function renderLearning(v) {
   paintConfirm(v);
+  paintFundi(v.fundi);
   if (v.id) learnSid = v.id;
   const box = $("instruction");
   box.textContent = v.instruction || "(no instruction)";
@@ -565,7 +884,7 @@ function renderLearning(v) {
   const p = v.probe || {};
   if (p.i2c_devices) html += "\nI2C: [" + esc((p.i2c_devices || []).join(", ") || "none") + "]";
   $("verify").innerHTML = html;
-  $("code-sec").hidden = v.state !== "DONE";
+  $("code-sec").hidden = false; // drafts available anytime, final at DONE
   $("cook-resume").hidden = !learnSid;
   drawEvidence(); // learning turns are probe-only: no analyzed frame
   if (v.state !== "DONE") {
@@ -723,7 +1042,9 @@ async function suggestProjects() {
     }
     const titles = learnProjects.map((p) => p.title).join("; ");
     $("instruction").textContent = "Tap a project to start: " + titles;
-    speak("I found " + learnProjects.length + " projects: " + titles + ". Tap one to start.");
+    speak("I found " + learnProjects.length + " projects: " + titles +
+      ". Say its name or number, or tap one to start.",
+      () => listenForProjectChoice());
   };
   try {
     if (planCache.key === key && planCache.projects) {
@@ -765,8 +1086,66 @@ async function startLearning(project) {
     });
     const v = await r.json();
     if (!r.ok) { showError((v && v.detail) || "could not start project"); return; }
+    const parts = learnParts.length ? learnParts.join(", ") : "your parts";
+    v.speak = "We'll build " + (project.title || "this project") + ". You need: " + parts +
+      ". " + (v.speak || v.instruction || "");
     enterCookMode(v);
   } catch (e) { showError(e.message); } finally { busy = false; }
+}
+
+// choice:matcher:start
+function matchProjectChoice(text, projects) {
+  const t = String(text || "").toLowerCase();
+  if (!t.trim() || !projects || !projects.length) return null;
+  const escRe = (w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const has = (w) => new RegExp("\\b" + escRe(w) + "\\b").test(t);
+  const nums = [["first", "one", "1", "1st"], ["second", "two", "2", "2nd"],
+                ["third", "three", "3", "3rd"]];
+  // Specific ordinals first: "the second one" holds bare "one" too.
+  for (const i of [1, 2, 0]) {
+    if (i >= Math.min(nums.length, projects.length)) continue;
+    if (nums[i].some(has)) return projects[i];
+  }
+  for (const p of projects) {
+    const title = String((p && p.title) || "").toLowerCase().trim();
+    if (!title) continue;
+    if (has(title)) return p;
+    const words = title.split(/\s+/).filter((w) => w.length > 3);
+    if (words.length && words.every(has)) return p;
+  }
+  return null;
+}
+// choice:matcher:end
+
+let suggestListening = false; // one-shot project pick after SUGGEST
+
+function listenForProjectChoice() {
+  if (suggestListening || !learnProjects.length || busy) return;
+  suggestListening = true;
+  const started = startBrowserRecognition({
+    btn: $("talk"), activeText: "LISTENING…", idleText: "PUSH TO TALK",
+    hintEl: $("talk-hint"), hintListening: "Say the name or number…",
+    onText: (text) => {
+      if (!suggestListening) return;
+      suggestListening = false;
+      if (!text) return; // cards stay tappable
+      const pick = matchProjectChoice(text, learnProjects);
+      if (pick && !busy) {
+        startLearning(pick);
+      } else if (pick) {
+        $("talk-hint").textContent = "I'm busy — tap a card to start.";
+      } else {
+        $("talk-hint").textContent = 'heard: "' + text + '" — tap a card to start.';
+        speak("Tap a card to start.");
+      }
+    },
+    onEmpty: () => {
+      suggestListening = false;
+      $("talk-hint").textContent = "Tap a card to start.";
+    },
+    onFallback: () => { suggestListening = false; }, // cards stay tappable
+  });
+  if (!started) suggestListening = false;
 }
 
 $("learn-equip").onclick = () => showEquipment();
@@ -790,7 +1169,11 @@ async function fetchCode(auto) {
   if (busy || !learnSid) return;
   busy = true;
   try {
-    const r = await fetch("/project/" + encodeURIComponent(learnSid) + "/code", { method: "POST" });
+    const r = await fetch("/project/" + encodeURIComponent(learnSid) + "/code", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ draft: true }),
+    });
     const v = await r.json();
     if (!r.ok) {
       const msg = (v && v.detail) || "code not ready";
@@ -802,7 +1185,11 @@ async function fetchCode(auto) {
     }
     $("code-out").textContent = v.code || "";
     codeFetchedSid = learnSid;
-    if (!auto) speak("Code ready.");
+    const progress = (v.steps_passed || 0) + " of " + (v.steps_total || 0) + " steps verified";
+    $("code-kind").textContent = v.verified ? "verified final" : "draft (" + progress + ")";
+    if (auto) return;
+    speak(v.verified ? "Code ready." :
+      "Here's your draft code, " + progress + ". Keep building to verify the rest.");
   } catch (e) {
     if (auto) {
       $("talk-hint").textContent = e.message + " — press SEND CODE to retry.";
@@ -837,10 +1224,91 @@ async function transcribeUpload(blob) {
   return (await fetch("/api/voice/transcribe", { method: "POST", body: fd })).json();
 }
 
-function pttToggle(btn) {
-  // Recording stays available mid-turn (transcribe is independent of the
-  // sense loop); a trigger heard while busy queues instead of doubling.
-  if (pttRecording) { try { pttRec.stop(); } catch (e) { /* onstop resets */ } return; }
+// Browser-native speech recognition first: instant, on-device, no server
+// round trip. Returns true when it takes over; silence reports heard-nothing
+// through onEmpty (no server cost), other failures hand off to onFallback
+// (the recorder+upload path). First handler to fire wins.
+let voiceListening = false; // a browser recognition turn is active
+let activeRec = null; // the live recognizer, so a tap can stop it
+let voiceCancelFallback = false; // manual stop: reset UI, stay quiet
+
+function startBrowserRecognition(opts) {
+  const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Ctor) return false;
+  let rec;
+  try {
+    rec = new Ctor();
+  } catch (e) { return false; }
+  opts.btn.classList.add("rec");
+  opts.btn.textContent = opts.activeText;
+  opts.hintEl.textContent = opts.hintListening;
+  voiceListening = true;
+  activeRec = rec;
+  let done = false;
+  const finish = (fn, isFallback) => {
+    if (done) return;
+    done = true;
+    const mine = (activeRec === rec);
+    if (mine) {
+      voiceListening = false;
+      activeRec = null;
+      opts.btn.classList.remove("rec");
+      opts.btn.textContent = opts.idleText;
+    }
+    try { rec.abort(); } catch (e) { /* already ended */ }
+    if (isFallback && voiceCancelFallback) {
+      voiceCancelFallback = false;
+      return;
+    }
+    voiceCancelFallback = false;
+    fn();
+  };
+  rec.lang = "en-US";
+  rec.interimResults = false;
+  rec.maxAlternatives = 1;
+  rec.onresult = (e) => {
+    const text = (((e.results || [])[0] || [])[0] || {}).transcript || "";
+    finish(() => opts.onText(text.trim()), false);
+  };
+  rec.onerror = (e) => {
+    if ((e.error || "") === "no-speech" && opts.onEmpty) {
+      finish(opts.onEmpty, false);
+    } else {
+      finish(opts.onFallback, true);
+    }
+  };
+  rec.onend = () => finish(opts.onFallback, true);
+  try {
+    rec.start();
+  } catch (e) {
+    finish(opts.onFallback, true);
+  }
+  return true;
+}
+
+function handlePttTranscript(text, tag, error) {
+  if (text) lastTranscript = text;
+  if (!text) {
+    $("talk-hint").textContent = "Transcription empty" + (error ? ": " + error : "") + " — use CHECK NOW.";
+    return;
+  }
+  if (mode === "LEARNING") {
+    $("learn-project").value = text;
+    $("talk-hint").textContent = 'heard: "' + text + '"' + tag + " → suggesting…";
+    suggestProjects();
+    return;
+  }
+  const hit = TRIGGER_WORDS.some((w) => text.toLowerCase().includes(w));
+  if (hit && busy) {
+    pendingCheck = text;
+    $("talk-hint").textContent = 'heard: "' + text + '"' + tag + " → queued, will check when ready.";
+  } else {
+    $("talk-hint").textContent = 'heard: "' + text + '"' + tag + (hit ? " → checking…" : " — say done / fixed / moved it, or CHECK NOW.");
+    if (hit) checkNow(text);
+  }
+}
+
+function startPttRecorder(btn) {
   if (!("MediaRecorder" in window) || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
     $("talk-hint").textContent = "Audio capture unavailable — use CHECK NOW.";
     return;
@@ -858,26 +1326,8 @@ function pttToggle(btn) {
       try {
         const t = await transcribeUpload(new Blob(pttChunks, { type: "audio/webm" }));
         const text = (t.text || "").trim();
-        if (text) lastTranscript = text;
         const tag = t.note ? " (" + t.note + ")" : "";
-        if (!text) {
-          $("talk-hint").textContent = "Transcription empty" + (t.error ? ": " + t.error : "") + " — use CHECK NOW.";
-          return;
-        }
-        if (mode === "LEARNING") {
-          $("learn-project").value = text;
-          $("talk-hint").textContent = 'heard: "' + text + '"' + tag + " → suggesting…";
-          suggestProjects();
-          return;
-        }
-        const hit = TRIGGER_WORDS.some((w) => text.toLowerCase().includes(w));
-        if (hit && busy) {
-          pendingCheck = text;
-          $("talk-hint").textContent = 'heard: "' + text + '"' + tag + " → queued, will check when ready.";
-        } else {
-          $("talk-hint").textContent = 'heard: "' + text + '"' + tag + (hit ? " → checking…" : " — say done / fixed / moved it, or CHECK NOW.");
-          if (hit) checkNow(text);
-        }
+        handlePttTranscript(text, tag, t.error || "");
       } catch (e) { $("talk-hint").textContent = "Transcription failed — use CHECK NOW."; }
     };
     pttRec.start();
@@ -885,6 +1335,30 @@ function pttToggle(btn) {
     btn.classList.add("rec");
     btn.textContent = "LISTENING — TAP TO STOP";
   }).catch(() => { $("talk-hint").textContent = "Microphone blocked — use CHECK NOW."; });
+}
+
+function pttToggle(btn) {
+  // Recording stays available mid-turn (transcribe is independent of the
+  // sense loop); a trigger heard while busy queues instead of doubling.
+  if (suggestListening) {
+    // Bail out of project selection into a normal talk turn.
+    suggestListening = false;
+    if (activeRec) { voiceCancelFallback = true; try { activeRec.stop(); } catch (e) {} }
+  } else if (activeRec) {
+    voiceCancelFallback = true;
+    try { activeRec.stop(); } catch (e) { /* already stopped */ }
+    return;
+  }
+  if (pttRecording) { try { pttRec.stop(); } catch (e) { /* onstop resets */ } return; }
+  VoiceEngine.stop(); // never capture while speaking; the tap owns speech now
+  if (startBrowserRecognition({
+    btn: btn, activeText: "LISTENING…", idleText: "PUSH TO TALK",
+    hintEl: $("talk-hint"), hintListening: "Listening… (browser voice)",
+    onText: (text) => handlePttTranscript(text, " (browser voice)", ""),
+    onEmpty: () => handlePttTranscript("", "", ""),
+    onFallback: () => startPttRecorder(btn),
+  })) return;
+  startPttRecorder(btn);
 }
 $("talk").onclick = () => pttToggle($("talk"));
 
@@ -1025,14 +1499,28 @@ let cookMode = false, cookWs = null, cookView = null;
 let cookRec = null, cookChunks = [], cookRecording = false, cookTurnResolve = null;
 const COOK_LISTEN_MS = 6000;
 
+let cookSilentStreak = 0; // consecutive heard-nothings; caps the loop
+
+function pumpHandsfree(tries) {
+  // Hands-free continuation with retries: a busy moment or a dropped
+  // speech-end event must not kill "keep listening" silently.
+  if (!cookMode || muted || !$("cook-handsfree").checked) return;
+  if (busy || cookRecording || voiceListening) {
+    if ((tries || 0) > 0) setTimeout(() => pumpHandsfree(tries - 1), 1500);
+    return;
+  }
+  cookListen();
+}
+
 function cookSpeak(text) {
   speak(text, () => {
-    if (cookMode && !muted && !busy && $("cook-handsfree").checked) cookListen();
+    if (cookMode && !muted && $("cook-handsfree").checked) pumpHandsfree(3);
   });
 }
 
 function renderCook(v) {
   paintConfirm(v);
+  paintFundi(v.fundi);
   cookView = v;
   if (v.id) learnSid = v.id;
   lastInstruction = v.instruction || "";
@@ -1114,14 +1602,89 @@ function cookAsk(transcript) {
   });
 }
 
-function cookListen() {
-  const btn = $("cook-talk");
-  if (cookRecording) { try { cookRec.stop(); } catch (e) { /* already stopped */ } return; }
-  if (!cookMode || busy) return;
-  if (!("MediaRecorder" in window) || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
-    $("cook-heard").textContent = "Audio capture unavailable — use CHECK.";
+// Streamed coach answer: tokens paint live, clauses speak as they land.
+// Returns {speak} on done, {type:"error",detail} on model error, or null
+// when streaming itself is unavailable (caller falls back to cookAsk).
+async function cookAskStream(text) {
+  let r;
+  try {
+    r = await fetch("/api/answer/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: text, step_text: lastInstruction, mode: "LEARNING" }),
+    });
+  } catch (e) { return null; }
+  if (!r.ok || !r.body || !r.body.getReader) return null;
+  const id = VoiceEngine.streamStart();
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "", pending = "", full = "", gotText = false;
+  const paint = () => { $("cook-heard").textContent = 'coach: "' + full + '"'; };
+  const emit = (flush) => {
+    const cut = cutClauses(pending, flush);
+    pending = cut.rest;
+    for (const c of cut.clauses) VoiceEngine.streamClause(id, c);
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) buf += decoder.decode(value, { stream: true });
+      let cut;
+      let finished = null;
+      while ((cut = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        let name = "", data = "";
+        for (const line of frame.split("\n")) {
+          if (line.indexOf("event:") === 0) name = line.slice(6).trim();
+          else if (line.indexOf("data:") === 0) data = line.slice(5).trim();
+        }
+        if (name === "token") {
+          const t = (JSON.parse(data) || {}).text || "";
+          if (t) { gotText = true; full += t; pending += t; paint(); emit(false); }
+        } else if (name === "done") {
+          finished = { speak: (JSON.parse(data) || {}).text || full };
+        } else if (name === "error") {
+          const detail = (JSON.parse(data) || {}).detail || "answer failed";
+          finished = gotText ? { speak: full } : { type: "error", detail };
+        }
+        if (finished) break;
+      }
+      if (finished) { emit(true); return finishStream(id, finished); }
+      if (done) break;
+    }
+  } catch (e) { /* transport died mid-stream: partial stands, else fall back */ }
+  try { reader.cancel(); } catch (e) { /* already closed */ }
+  if (!gotText) return null;
+  emit(true);
+  return finishStream(id, { speak: full });
+}
+
+function finishStream(id, res) {
+  // Hands-free resumes after the streamed clauses finish sounding.
+  return new Promise((resolve) => {
+    VoiceEngine.streamEnd(id, () => {
+      if (cookMode && !muted && $("cook-handsfree").checked) pumpHandsfree(3);
+      resolve(Object.assign({}, res, { streamed: true }));
+    });
+  });
+}
+
+async function handleCookTranscript(text, error) {
+  if (!cookMode) return;
+  if (!text) {
+    $("cook-heard").textContent = "Heard nothing" + (error ? ": " + error : "") + ".";
+    cookSilentStreak += 1;
+    if (cookSilentStreak < 3) pumpHandsfree(1); // brief silence keeps listening
     return;
   }
+  cookSilentStreak = 0;
+  lastTranscript = text;
+  $("cook-heard").textContent = 'heard: "' + text + '"';
+  await cookCommand(text);
+}
+
+function startCookRecorder(btn) {
   navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
     if (!cookMode) { stream.getTracks().forEach((t) => t.stop()); return; }
     cookChunks = [];
@@ -1138,13 +1701,7 @@ function cookListen() {
         const t = await transcribeUpload(new Blob(cookChunks, { type: "audio/webm" }));
         const text = (t.text || "").trim();
         if (!cookMode) return;
-        if (!text) {
-          $("cook-heard").textContent = "Heard nothing" + (t.error ? ": " + t.error : "") + ".";
-          return;
-        }
-        lastTranscript = text;
-        $("cook-heard").textContent = 'heard: "' + text + '"';
-        await cookCommand(text);
+        handleCookTranscript(text, t.error || "");
       } catch (e) { $("cook-heard").textContent = "Transcription failed."; }
     };
     cookRec.start();
@@ -1154,6 +1711,30 @@ function cookListen() {
     $("cook-heard").textContent = "Listening…";
     setTimeout(() => { if (cookRecording && cookRec) { try { cookRec.stop(); } catch (e) {} } }, COOK_LISTEN_MS);
   }).catch(() => { $("cook-heard").textContent = "Microphone blocked."; });
+}
+
+function cookListen() {
+  const btn = $("cook-talk");
+  if (activeRec) {
+    voiceCancelFallback = true;
+    try { activeRec.stop(); } catch (e) { /* already stopped */ }
+    return;
+  }
+  if (cookRecording) { try { cookRec.stop(); } catch (e) { /* already stopped */ } return; }
+  if (!cookMode || busy) return;
+  VoiceEngine.stop(); // never capture while speaking; the tap owns speech now
+  if (startBrowserRecognition({
+    btn: btn, activeText: "LISTENING…", idleText: "TALK",
+    hintEl: $("cook-heard"), hintListening: "Listening… (browser voice)",
+    onText: (text) => handleCookTranscript(text, ""),
+    onEmpty: () => handleCookTranscript("", ""),
+    onFallback: () => startCookRecorder(btn),
+  })) return;
+  if (!("MediaRecorder" in window) || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+    $("cook-heard").textContent = "Audio capture unavailable — use CHECK.";
+    return;
+  }
+  startCookRecorder(btn);
 }
 
 async function cookCommand(text) {
@@ -1166,15 +1747,16 @@ async function cookCommand(text) {
   if (/(check|next|verify|done|test)/.test(t)) { cookCheck(); return; }
   if (/(look|describe|what do you see|show)/.test(t)) { cookLook(); return; }
   if (/(exit|quit|close|stop cooking)/.test(t)) { exitCookMode(); return; }
-  const res = await cookAsk(text);
+  const res = (await cookAskStream(text)) || await cookAsk(text);
   if (!cookMode) return;
   if (res.type === "error") {
     $("cook-heard").textContent = "Coach: " + (res.detail || "unavailable");
+    cookSpeak("Sorry, the coach is unavailable right now.");
     return;
   }
   $("cook-heard").textContent = 'coach: "' + (res.speak || "") + '"';
   if (res.speak) lastSpeak = res.speak;
-  cookSpeak(res.speak || "");
+  if (!res.streamed) cookSpeak(res.speak || ""); // streamed speech already sounded
 }
 
 function cookCheck() {
@@ -1209,7 +1791,11 @@ async function cookSendCode(auto) {
   if (!cookMode || busy || !learnSid) return;
   busy = true;
   try {
-    const r = await fetch("/project/" + encodeURIComponent(learnSid) + "/code", { method: "POST" });
+    const r = await fetch("/project/" + encodeURIComponent(learnSid) + "/code", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ draft: true }),
+    });
     const v = await r.json();
     if (!r.ok) {
       $("cook-heard").textContent = ((v && v.detail) || "code not ready") + " — SEND CODE retries.";
@@ -1218,7 +1804,11 @@ async function cookSendCode(auto) {
     }
     $("cook-code-out").textContent = v.code || "";
     codeFetchedSid = learnSid;
-    if (!auto) cookSpeak("Code ready. It is shown on screen.");
+    const progress = (v.steps_passed || 0) + " of " + (v.steps_total || 0) + " steps verified";
+    $("cook-heard").textContent = v.verified ? "Final code below." : "Draft code below (" + progress + ").";
+    if (auto) return;
+    cookSpeak(v.verified ? "Code ready. It is shown on screen." :
+      "Here's your draft code, " + progress + " so far.");
   } catch (e) {
     $("cook-heard").textContent = e.message + " — SEND CODE retries.";
     cookSpeak("Code fetch failed. Press Send Code to retry.");
@@ -1246,7 +1836,7 @@ function exitCookMode() {
   cookClose();
   if (cookRecording && cookRec) { try { cookRec.stop(); } catch (e) { /* already stopped */ } }
   cookRecording = false;
-  try { speechSynthesis.cancel(); } catch (e) { /* no TTS */ }
+  VoiceEngine.stop();
   $("cook-talk").classList.remove("rec");
   $("cook-talk").textContent = "TALK";
   $("cook").hidden = true;
@@ -1362,6 +1952,80 @@ $("clear-snap").onclick = async () => {
   $("cam-src").textContent = "Phone snap cleared.";
 };
 
+function paintSerialMsg(cur) {
+  const err = (cur && cur.last_error) || "";
+  $("serial-msg").textContent =
+    "serial: " + ((cur && cur.port) || "?") + " @ " + ((cur && cur.baud) || "?") +
+    (cur && cur.mock ? " (mock)" : "") +
+    (err ? " — last error: " + err : " — no errors yet");
+}
+
+async function refreshSerialPorts() {
+  try {
+    const r = await fetch("/api/serial/ports");
+    const v = await r.json();
+    const sel = $("serial-port");
+    sel.innerHTML = "";
+    const ports = (v.ports || []).map((p) => p.port);
+    const cur = (v.current || {}).port || "";
+    if (cur && ports.indexOf(cur) < 0) ports.unshift(cur);
+    if (!ports.length) ports.push(cur || "COM3");
+    ports.forEach((p) => {
+      const o = document.createElement("option");
+      o.value = p;
+      o.textContent = p;
+      if (p === cur) o.selected = true;
+      sel.appendChild(o);
+    });
+    const baud = String((v.current || {}).baud || "115200");
+    const bsel = $("serial-baud");
+    if (baud !== "115200" && baud !== "9600") {
+      const o = document.createElement("option");
+      o.value = baud;
+      o.textContent = baud;
+      bsel.appendChild(o);
+    }
+    bsel.value = baud;
+    paintSerialMsg(v.current || {});
+  } catch (e) { $("serial-msg").textContent = "Serial list unavailable."; }
+}
+
+$("save-serial").onclick = async () => {
+  $("serial-msg").textContent = "Saving…";
+  try {
+    const r = await fetch("/api/config/serial", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ port: $("serial-port").value, baud: $("serial-baud").value }),
+    });
+    const v = await r.json();
+    paintSerialMsg(v.serial_live || {});
+  } catch (e) { $("serial-msg").textContent = "Save failed: " + e.message; }
+};
+
+$("serial-detect").onclick = async () => {
+  if (busy) return;
+  busy = true;
+  const t0 = Date.now();
+  $("serial-msg").textContent = "Probing ports…";
+  const tick = setInterval(() => {
+    $("serial-msg").textContent = "Probing ports… " + Math.round((Date.now() - t0) / 1000) + "s";
+  }, 1000);
+  try {
+    const r = await fetch("/api/serial/autodetect", { method: "POST" });
+    const v = await r.json();
+    if (v.found) {
+      await refreshSerialPorts();
+      $("serial-msg").textContent = "Found board on " + v.serial_live.port + " @ " + v.serial_live.baud + ".";
+      speak("Found your board.");
+    } else {
+      paintSerialMsg(v.serial_live || {});
+      $("serial-msg").textContent += " No patient board answered — check the USB cable, drivers, and that the board is plugged in.";
+    }
+  } catch (e) { $("serial-msg").textContent = "Auto-detect failed: " + e.message; }
+  finally { clearInterval(tick); busy = false; }
+};
+
 $("replay").onclick = () => speak(lastSpeak);
 $("describe").onclick = async () => {
   if (busy) return;
@@ -1391,7 +2055,7 @@ function updateMuteBtn() {
 $("mute").onclick = () => {
   muted = !muted;
   try { localStorage.setItem("fundiloop-muted", muted ? "1" : "0"); } catch (e) { /* private mode */ }
-  if (muted) { try { speechSynthesis.cancel(); } catch (e) { /* no speech */ } }
+  if (muted) VoiceEngine.stop();
   updateMuteBtn();
 };
 updateMuteBtn();
@@ -1405,7 +2069,13 @@ $("preview").onerror = () => {
 $("voice").onchange = () => {
   voiceChoice = $("voice").value || "";
   try { localStorage.setItem("fundiloop-voice", voiceChoice); } catch (e) { /* private mode */ }
+  refreshVoiceStatus();
   speak(lastSpeak || "Voice updated. This is how I will sound.");
+};
+$("test-voice").onclick = () => {
+  refreshVoiceStatus();
+  // Full path: Meta Voice TTS first, browser fallback on failure.
+  speak("Fundi voice check. Wire ground to ground, then press check.");
 };
 if ("speechSynthesis" in window) {
   populateVoices();
@@ -1433,5 +2103,6 @@ fetch("/api/status").then((r) => r.json()).then((v) => {
   render(v);
 }).catch((e) => { showError("backend unreachable: " + e.message); });
 refreshCamera();
+refreshSerialPorts();
 setInterval(refreshCamera, 3000);
 setInterval(refreshBadge, 5000);

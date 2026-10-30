@@ -5,9 +5,14 @@ Serves the mobile web UI at / and the session API:
   POST /api/session/start    start a guided/diagnostic session
   POST /api/session/check-now run one Sense->Reason->Instruct->Verify turn
   POST /api/session/check-now/stream same turn as server-sent events
+  POST /api/answer/stream       free-form spoken answer as SSE tokens
   GET  /api/camera/latest    latest overhead frame (JPEG/PNG)
   GET  /api/frames/{name}     one saved analysis still (evidence)
   POST /api/voice/transcribe transcribe push-to-talk audio upload
+  POST /api/voice/speak       speak text via Meta Voice TTS (browser fallback on failure)
+  GET  /api/serial/ports      list serial ports + live probe status
+  POST /api/config/serial     point the probes at a port/baud
+  POST /api/serial/autodetect adopt the first port answering PING
   WS   /api/live/session     live loop: audio in, clips in, guidance out
   POST /api/vision/track-clip SAM 3.1 video tracking over one clip
   GET  /api/session/{id}/passport full verifiable log for a session
@@ -16,7 +21,7 @@ Serves the mobile web UI at / and the session API:
   POST /discover/capture      capture a still for /discover/parts
   POST /discover/upload       save an equipment photo for /discover/parts
   POST /diagnose              start a learning session (mode="learning")
-  POST /project/{id}/code     verified firmware (409 until DONE)
+  POST /project/{id}/code     firmware (final when DONE, draft on request)
 
 Run from the repo root:
   uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
@@ -41,12 +46,14 @@ load_dotenv(ROOT / ".env")
 
 from .adapters import MetaAPIError, mock_meta_enabled  # noqa: E402
 from .adapters.sam_adapter import DEFAULT_VIDEO_MIME  # noqa: E402
-from .agent_orchestrator import AgentOrchestrator  # noqa: E402
+from .agent_orchestrator import AgentOrchestrator, _probe_summary  # noqa: E402
 from .camera_client import CameraError  # noqa: E402
 from .discovery import detect_parts, plan_projects, understand_scene  # noqa: E402
 from .learning import generate_code  # noqa: E402
-from .live import LiveGuide  # noqa: E402
+from .live import LiveGuide, clean_coach_text  # noqa: E402
 from .models import CheckNowRequest, StartSessionRequest  # noqa: E402
+from .prompts import LIVE_SYSTEM, live_guidance_prompt  # noqa: E402
+from .serial_probe import list_serial_ports  # noqa: E402
 from backend.schemas import DiagnoseRequest  # noqa: E402
 
 FRONTEND = ROOT / "frontend"
@@ -102,10 +109,14 @@ def api_status():
         "camera_frame_url": orchestrator.camera.capture_url,
         "camera_source": orchestrator.camera.describe_source(),
         "serial_port": os.environ.get("SERIAL_PORT") or "(default)",
+        "serial_live": orchestrator.probe.serial_status(),
         "muse_model": os.environ.get("MUSE_MODEL", "muse-spark-1.3"),
         "sam_model": os.environ.get("SAM_MODEL", "sam-3.1"),
         "voice_model": os.environ.get("VOICE_MODEL", "muse-voice-transcribe-1.0"),
         "voice_live": not orchestrator.voice.mock,
+        "tts_mode": "mock" if mock_meta_enabled() else "real",
+        "tts_model": os.environ.get("TTS_MODEL", "muse-voice-tts-1.0"),
+        "tts_voice": os.environ.get("META_TTS_VOICE", "warm-female"),
     }
     return view
 
@@ -190,6 +201,62 @@ def api_session_confirm(body: dict):
         raise HTTPException(status_code=409, detail=str(exc))
 
 
+def iter_answer_events(question: str, step_text: str = "",
+                       mode: str = "GUIDED_ASSEMBLY"):
+    """Yield SSE frames for one free-form spoken answer (cook-mode ask path).
+
+    Same grounding as a clipless live turn: probe measurements + transcript
+    + step. Tokens stream live, done carries the cleaned full text, error
+    stops with the real detail. A JSON-looking reply is drained silently
+    and emitted once cleaned so braces are never spoken.
+    """
+    yield _sse("ack", {"status": "answering"})
+    try:
+        probe = live_guide.probe.read_all(None)
+    except Exception as exc:
+        yield _sse("error", {"detail": "probe read failed: %s" % exc})
+        return
+    prompt = live_guidance_prompt(question, _probe_summary(probe), None,
+                                  mode, step_text)
+    buf: list[str] = []
+    head = ""
+    decided = False
+    looks_json = False
+    try:
+        for chunk in live_guide.Muse.complete_text_stream(LIVE_SYSTEM, prompt):
+            buf.append(chunk)
+            if not decided:
+                head += chunk
+                stripped = head.lstrip()
+                if not stripped:
+                    continue  # leading whitespace: hold until prose decides
+                decided = True
+                looks_json = stripped[0] in "{["
+                if looks_json:
+                    continue  # drain silently; cleaned text emits once below
+                yield _sse("token", {"text": head})
+                continue
+            if not looks_json:
+                yield _sse("token", {"text": chunk})
+    except MetaAPIError as exc:
+        yield _sse("error", {"detail": str(exc)})
+        return
+    full = clean_coach_text("".join(buf))
+    if looks_json and full:
+        yield _sse("token", {"text": full})
+    yield _sse("done", {"text": full})
+
+
+@app.post("/api/answer/stream")
+def api_answer_stream(body: dict):
+    """Free-form spoken answer as SSE tokens (ack -> token* -> done/error)."""
+    return StreamingResponse(
+        iter_answer_events(str(body.get("question") or ""),
+                           str(body.get("step_text") or ""),
+                           str(body.get("mode") or "GUIDED_ASSEMBLY")),
+        media_type="text/event-stream")
+
+
 @app.post("/api/session/check-now/stream")
 def api_check_now_stream(req: CheckNowRequest | None = None):
     """Same turn as /api/session/check-now, as server-sent events.
@@ -208,6 +275,26 @@ async def api_voice_transcribe(file: UploadFile = File(...)):
         return orchestrator.transcribe(await file.read(), file.filename or "talk.webm")
     except MetaAPIError as exc:
         return {"text": "", "error": str(exc)}
+
+
+@app.post("/api/voice/speak")
+def api_voice_speak(body: dict):
+    """Speak text via Meta Voice TTS (400: empty, 502: API failure).
+
+    The frontend tries this first for every utterance and falls back to
+    default browser speechSynthesis for that utterance only on failure.
+    """
+    from .adapters import MetaAPIError
+    from .tts import get_provider
+
+    text = str((body or {}).get("text") or "")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="voice speak called with empty text")
+    try:
+        audio = get_provider().synthesize(text, (body or {}).get("voice"))
+    except MetaAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return Response(content=audio, media_type="audio/wav")
 
 
 @app.post("/api/vision/track-clip")
@@ -237,8 +324,9 @@ async def api_live_session(ws: WebSocket):
 
     Meta has no single audio+video streaming model, so a live turn is
     assembled from the parts Meta does stream: transcript (Muse Voice
-    Transcribe) + clip (SAM 3.1 video) -> Muse Spark guidance text, spoken by
-    the browser. The probe stays the only thing that may confirm a fix.
+    Transcribe) + clip (SAM 3.1 video) -> Muse Spark guidance text, spoken
+    via Meta Voice TTS (browser fallback). The probe stays the only thing
+    that may confirm a fix.
 
     Client sends JSON:
       {"type":"hello","mode":...,"step_text":...}   configure the loop
@@ -373,21 +461,28 @@ def api_diagnose(req: DiagnoseRequest):
 
 
 @app.post("/project/{session_id}/code")
-def api_project_code(session_id: str):
-    """Return the verified project's .ino (409 until fully verified)."""
+def api_project_code(session_id: str, body: dict | None = None):
+    """Return the project's .ino: final when verified, draft on request.
+
+    Body {"draft": true} returns work-in-progress firmware any time (the
+    teach-first path); without it, 409 until every step is verified.
+    """
     session = orchestrator.sessions.get(session_id)
     if session is None or not session.get("learning"):
         raise HTTPException(status_code=404, detail="unknown learning session id")
-    if not session.get("code_ready"):
+    verified = bool(session.get("code_ready"))
+    if not verified and not bool((body or {}).get("draft")):
         raise HTTPException(
             status_code=409,
             detail="project not fully verified: step %d of %d" % (
                 session.get("step_index", 0) + 1, len(session.get("plan", []))))
     try:
-        code = generate_code(session, orchestrator.Muse)
+        code = generate_code(session, orchestrator.Muse, draft=not verified)
     except MetaAPIError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
-    return {"session_id": session_id, "code": code}
+    steps = (session.get("verified") or {}).get("steps", [])
+    return {"session_id": session_id, "code": code, "verified": verified,
+            "steps_passed": len(steps), "steps_total": len(session.get("plan", []))}
 
 
 @app.post("/discover/capture")
@@ -442,6 +537,43 @@ def api_config_camera(body: dict):
     os.environ["CAMERA_CAPTURE_URL"] = capture
     return {"camera_frame_url_set": bool(capture),
             "camera_source": orchestrator.camera.describe_source()}
+
+
+@app.get("/api/serial/ports")
+def api_serial_ports():
+    """List candidate serial ports plus the probe's live port/baud/error."""
+    return {"ports": list_serial_ports(),
+            "current": orchestrator.probe.serial_status()}
+
+
+@app.post("/api/config/serial")
+def api_config_serial(body: dict):
+    """Point the probes at a port/baud at runtime and persist to .env."""
+    port = str(body.get("port", "") or "").strip()
+    baud = str(body.get("baud", "") or "").strip()
+    status = orchestrator.probe.configure(port=port or None, baud=baud or None)
+    live_guide.probe.configure(port=status["port"], baud=status["baud"])
+    _persist_env_var("SERIAL_PORT", status["port"])
+    _persist_env_var("SERIAL_BAUD", str(status["baud"]))
+    os.environ["SERIAL_PORT"] = status["port"]
+    os.environ["SERIAL_BAUD"] = str(status["baud"])
+    return {"serial_live": status}
+
+
+@app.post("/api/serial/autodetect")
+def api_serial_autodetect():
+    """Probe each listed port for a patient PING and adopt the first live one."""
+    found = orchestrator.probe.autodetect()
+    if found is None:
+        return {"found": False,
+                "serial_live": orchestrator.probe.serial_status()}
+    live_guide.probe.configure(port=found["port"], baud=found["baud"])
+    _persist_env_var("SERIAL_PORT", found["port"])
+    _persist_env_var("SERIAL_BAUD", str(found["baud"]))
+    os.environ["SERIAL_PORT"] = found["port"]
+    os.environ["SERIAL_BAUD"] = str(found["baud"])
+    return {"found": True,
+            "serial_live": orchestrator.probe.serial_status()}
 
 
 def _persist_env_var(name: str, value: str) -> None:
