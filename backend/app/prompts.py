@@ -91,8 +91,10 @@ def plan_system_prompt(available_tests: dict, visible_parts: list[str],
     if user_project:
         lines += [
             "The user asked to build: %s." % user_project,
-            "Plan that project. If parts are missing, list them in missing_parts "
-            "and include at least one alternative project that uses only visible parts.",
+            "The FIRST project MUST be that requested build — plan it, do "
+            "not substitute a different one. If parts are missing, list them "
+            "in missing_parts and include at least one alternative project "
+            "that uses only visible parts.",
         ]
     else:
         lines.append("Suggest up to 3 projects buildable with the visible parts.")
@@ -158,6 +160,21 @@ def learning_hint_prompt(step: dict, verification: dict) -> str:
         "step: %s\ninstruction: %s\ntest: %s\nmeasured: %s"
         % (step.get("n", "?"), step.get("instruction", ""),
            verification.get("test", "?"), verification.get("measured", ""))
+    )
+
+
+def learning_step_code_prompt(step: dict, pin_map: dict) -> str:
+    """Ask Muse for one step's Arduino sketch (unknown verify types)."""
+    return (
+        "Write the complete Arduino (.ino) sketch for this single build "
+        "step. Return ONLY code, no prose or fences.\n"
+        "step: %s\ninstruction: %s\nverify: %s\n"
+        "Target board: %s (%s logic); USE THESE EXACT PINS: SDA=%s SCL=%s LED=%s."
+        % (step.get("n", "?"), step.get("instruction", ""),
+           step.get("verify", "?"),
+           pin_map.get("label", pin_map.get("board", "?")),
+           pin_map.get("voltage", "?"), pin_map.get("sda"),
+           pin_map.get("scl"), pin_map.get("led_gpio"))
     )
 
 
@@ -297,12 +314,18 @@ def parse_board_glance(raw: str) -> dict:
     return out
 
 
-def plan_retry_suffix(reasons: list[str]) -> str:
+def plan_retry_suffix(reasons: list[str], user_project=None) -> str:
     """Constraint restatement appended when a plan is rejected."""
-    return (
+    text = (
         "Your previous plan was REJECTED by the backend validator:\n"
         + "\n".join("- %s" % r for r in reasons)
         + "\nFix every reason above and return the full corrected JSON again. "
         "Every step's verify must be a real test name and every "
         "depends_on_parts entry must be visible or listed in missing_parts."
     )
+    if user_project and str(user_project).strip():
+        text += (" Keep planning the user's requested build (%s): fix the "
+                 "reasons without swapping to a different project. If a "
+                 "requested part is not visible, list it in missing_parts "
+                 "and add an alternative." % str(user_project).strip())
+    return text

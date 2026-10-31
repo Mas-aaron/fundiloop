@@ -3,190 +3,332 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FundiLoop</title>
+<title>FundiLoop | AI Assistant</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <header class="topbar">
-  <div>
-    <h1>FundiLoop</h1>
-    <p class="sub">verifiable assembly + diagnostic agent</p>
+  <h1 class="logo">FundiLoop</h1>
+  <div class="topbar-right">
+    <span id="mode-badge" class="mock" title="LIVE only when the real camera and real Meta models are connected">MOCK</span>
+    <button id="settings-btn" class="icon-btn" type="button" aria-label="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
   </div>
-  <span id="mode-badge" class="mock" title="LIVE only when the real camera and real Meta models are connected">MOCK</span>
 </header>
 
-<div class="mode-row" role="tablist" aria-label="Mode">
-  <button id="mode-guided" class="mode active" type="button">Guided Assembly</button>
-  <button id="mode-diag" class="mode" type="button">Diagnostic</button>
-  <button id="mode-learn" class="mode" type="button">Learning</button>
-</div>
-
-<figure class="cam">
-  <img id="preview" alt="overhead camera view of the circuit">
-  <div id="cam-overlay" hidden></div>
-</figure>
-<div id="cam-src" class="fine"></div>
-
-<div id="learn-chapter" class="chapter-title" hidden></div>
-<div id="instruction" role="status">Loading session…</div>
-<div id="state-line" class="fine"></div>
-
-<div id="confirm-bar" class="panel" hidden>
-  <div id="confirm-q"></div>
-  <div class="btn-row" style="margin-top:8px">
-    <button id="confirm-yes" class="small" type="button">CONFIRM</button>
-    <button id="confirm-no" class="small" type="button">NOT YET</button>
+<main>
+  <div class="mode-row" role="tablist" aria-label="Mode">
+    <button id="mode-guided" class="mode active" type="button">Guided</button>
+    <button id="mode-diag" class="mode" type="button">Diagnostic</button>
+    <button id="mode-learn" class="mode" type="button">Learning</button>
   </div>
-</div>
 
-<button id="check" class="big primary" type="button">CHECK NOW</button>
-<button id="cancel" class="big danger" type="button" hidden>CANCEL</button>
-<button id="talk" class="big secondary" type="button">PUSH TO TALK</button>
-<button id="live" class="big live" type="button">START LIVE GUIDE</button>
-<button id="snap" class="big snap" type="button">SNAP PHOTO</button>
-<input id="snap-file" type="file" accept="image/*" capture="environment" hidden>
-<div class="btn-row">
-  <button id="replay" class="small" type="button">REPLAY</button>
-  <button id="describe" class="small" type="button">DESCRIBE</button>
-  <button id="mute" class="small" type="button">MUTE</button>
-</div>
-<div id="talk-hint" class="fine"></div>
-<div id="live-hint" class="fine"></div>
-<div class="btn-row">
-  <button id="handoff-learn" class="small" type="button" hidden>START LEARNING</button>
-</div>
-
-<section id="learn-sec" hidden>
-  <h2>Learn a project</h2>
-  <button id="learn-equip" class="small" type="button">SHOW EQUIPMENT</button>
-  <button id="learn-upload" class="small" type="button">UPLOAD PHOTO</button>
-  <input id="learn-file" type="file" accept="image/*" hidden>
-  <ol id="learn-parts" class="panel list"></ol>
-  <label for="learn-project">Project you want (or say it with PUSH TO TALK):</label>
-  <input id="learn-project" type="text" placeholder="weather station" autocomplete="off">
-  <label for="learn-board">Board:</label>
-  <select id="learn-board">
-    <option value="esp32_devkit">ESP32 DevKit</option>
-    <option value="arduino_uno">Arduino Uno</option>
-  </select>
-  <div class="btn-row" style="margin-top:8px">
-    <button id="learn-suggest" class="small" type="button">SUGGEST PROJECTS</button>
-    <button id="cook-resume" class="small" type="button" hidden>OPEN COOK MODE</button>
+  <div class="orb-container">
+    <div class="orb-glow"></div>
+    <div class="orb-ring"></div>
+    <div class="orb-ring-2"></div>
+    <div class="orb-ring-3"></div>
+    <div id="orb" class="orb" aria-hidden="true"></div>
   </div>
-  <ol id="learn-cards" class="panel list"></ol>
-</section>
 
-<section>
-  <h2>Verification</h2>
-  <div id="verify" class="panel">No measurements yet. Press CHECK NOW.</div>
-</section>
+  <div id="learn-chapter" class="chapter-title" hidden></div>
+  <div id="instruction" role="status">Hi! I'm ready to help you with your circuit.</div>
+  
+  <div id="state-line" class="fine"></div>
 
-<section id="evidence-sec" hidden>
-  <h2>Evidence</h2>
-  <figure class="evidence-cam">
-    <img id="evidence-img" alt="the analyzed frame with vision regions">
-    <svg id="evidence-svg"></svg>
-  </figure>
-  <div id="evidence-cap" class="fine"></div>
-</section>
-
-<section>
-  <h2>Steps</h2>
-  <ol id="checklist" class="panel list"></ol>
-</section>
-
-<section id="passport-sec" hidden>
-  <h2>Passport</h2>
-  <div id="passport" class="panel"></div>
-</section>
-
-<section id="code-sec" hidden>
-  <h2>Project firmware</h2>
-  <div id="code-kind" class="fine"></div>
-  <button id="send-code" class="small" type="button">SEND CODE</button>
-  <button id="copy-code" class="small" type="button">COPY</button>
-  <pre id="code-out" class="panel"></pre>
-</section>
-
-<details>
-  <summary>Advanced: camera, code snippet, fault injection + rescan</summary>
-  <label for="cam-stream">Overhead camera MJPEG stream URL (live preview):</label>
-  <input id="cam-stream" type="text" placeholder="http://192.168.1.50:81/stream" autocomplete="off">
-  <label for="cam-capture">Overhead camera still URL (analysis frames):</label>
-  <input id="cam-capture" type="text" placeholder="http://192.168.1.50/capture" autocomplete="off">
-  <div class="btn-row" style="margin-top:8px">
-    <button id="save-cam" class="small" type="button">SAVE CAMERA</button>
+  <div id="confirm-bar" class="panel" hidden>
+    <div id="confirm-q"></div>
+    <div class="btn-row" style="margin-top:8px">
+      <button id="confirm-yes" class="small" type="button">CONFIRM</button>
+      <button id="confirm-no" class="small" type="button">NOT YET</button>
+    </div>
   </div>
-  <div id="cam-msg" class="fine"></div>
-  <label for="serial-port">Patient board serial port:</label>
-  <div class="btn-row" style="margin-top:4px">
-    <select id="serial-port" style="flex:2"></select>
-    <select id="serial-baud" style="flex:1">
-      <option value="115200">115200</option>
-      <option value="9600">9600</option>
+
+  <div class="mic-container">
+    <button id="talk" class="mic" type="button">
+      <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+    </button>
+    <p class="mic-hint">Tap to speak</p>
+  </div>
+
+  <div class="cam-container">
+    <figure class="cam">
+      <img id="preview" alt="overhead camera view of the circuit">
+      <div id="cam-overlay" hidden></div>
+    </figure>
+    <div id="cam-src" class="fine"></div>
+  </div>
+
+  <div class="btn-grid">
+    <button id="live" class="big live" type="button">Live Guide</button>
+    <button id="snap" class="big snap" type="button">Snap Photo</button>
+  </div>
+  <input id="snap-file" type="file" accept="image/*" capture="environment" hidden>
+  
+  <div id="talk-hint" class="fine"></div>
+  <div id="live-hint" class="fine"></div>
+
+  <div class="btn-row" style="margin-bottom: 1rem; justify-content: center;">
+    <button id="handoff-learn" class="small" type="button" hidden>START LEARNING</button>
+  </div>
+
+  <section id="learn-sec" class="panel" hidden>
+    <h2>Learn a project</h2>
+    <div class="btn-row" style="margin-bottom: 1rem;">
+      <button id="learn-equip" class="small" type="button">EQUIPMENT</button>
+      <button id="learn-upload" class="small" type="button">UPLOAD</button>
+    </div>
+    <input id="learn-file" type="file" accept="image/*" hidden>
+    <ol id="learn-parts" class="list"></ol>
+    
+    <label>Project Name</label>
+    <input id="learn-project" type="text" placeholder="e.g. Weather Station">
+    
+    <label>Board</label>
+    <select id="learn-board">
+      <option value="esp32_devkit">ESP32 DevKit</option>
+      <option value="arduino_uno">Arduino Uno</option>
     </select>
+    
+    <div class="btn-row" style="margin-top: 1rem;">
+      <button id="learn-suggest" class="small">SUGGEST</button>
+      <button id="cook-resume" class="small" hidden>RESUME</button>
+    </div>
+    <ol id="learn-cards" class="list" style="margin-top: 1rem;"></ol>
+  </section>
+
+  <div class="panel">
+    <h2>Verification</h2>
+    <div id="verify">No measurements yet. Press CHECK NOW to begin.</div>
   </div>
-  <div class="btn-row" style="margin-top:8px">
-    <button id="save-serial" class="small" type="button">SAVE SERIAL</button>
-    <button id="serial-detect" class="small" type="button">AUTO-DETECT</button>
+
+  <div class="panel">
+    <h2>Steps</h2>
+    <ol id="checklist" class="list"></ol>
   </div>
-  <div id="serial-msg" class="fine"></div>
-  <label for="code">Paste patient-board code to check pin usage:</label>
-  <textarea id="code" placeholder="e.g. #define LED_PIN 4"></textarea>
-  <label for="fault">Simulate fault:</label>
-  <select id="fault">
-    <option value="">none (healthy circuit)</option>
-    <option>SDA_SCL_SWAPPED</option>
-    <option>LOOSE_GND</option>
-    <option>CODE_PIN_MISMATCH</option>
-    <option>SENSOR_DISCONNECTED</option>
-    <option>LED_REVERSED</option>
-  </select>
-  <div class="fine">Fault injection only affects mock probe data. Clear it and press CHECK NOW to verify the fix.</div>
-  <label for="voice">Browser fallback voice (Meta Voice TTS speaks first):</label>
-  <select id="voice">
-    <option value="">Auto (best available)</option>
-  </select>
-  <div class="btn-row" style="margin-top:8px">
-    <button id="test-voice" class="small" type="button">TEST VOICE</button>
+
+  <div class="btn-row typed-row">
+    <input id="guide-ask-input" type="text" placeholder="Ask me something..." autocomplete="off">
+    <button id="guide-ask-send" class="small" type="button">Send</button>
   </div>
-  <div id="voice-status" class="fine"></div>
-  <div class="btn-row" style="margin-top:10px">
-    <button id="clear-snap" class="small" type="button">CLEAR PHONE SNAP</button>
-    <button id="rescan" class="small" type="button">RE-SCAN EQUIPMENT</button>
+
+  <div class="btn-row" style="margin-top: 1rem; justify-content: center;">
+    <button id="replay" class="small" type="button">Replay</button>
+    <button id="describe" class="small" type="button">Describe</button>
+    <button id="mute" class="small" type="button">Mute</button>
   </div>
-</details>
+
+  <!-- Hidden sections that are toggled via JS -->
+  <section id="evidence-sec" class="panel" hidden>
+    <h2>Evidence</h2>
+    <figure class="evidence-cam">
+      <img id="evidence-img" alt="the analyzed frame with vision regions">
+      <svg id="evidence-svg"></svg>
+    </figure>
+    <div id="evidence-cap" class="fine"></div>
+  </section>
+
+  <section id="passport-sec" class="panel" hidden>
+    <h2>Passport</h2>
+    <div id="passport"></div>
+  </section>
+
+  <section id="code-sec" class="panel" hidden>
+    <h2>Project Firmware</h2>
+    <div id="code-kind" class="fine"></div>
+    <div class="btn-row" style="margin-bottom: 1rem;">
+      <button id="send-code" class="small" type="button">Send to Board</button>
+      <button id="send-step-code" class="small" type="button">Step Code</button>
+      <button id="copy-code" class="small" type="button">Copy</button>
+    </div>
+    <pre id="code-out"></pre>
+    <div id="schematic-panel">
+      <h3>Wiring schematic</h3>
+      <div id="schematic-svg"></div>
+      <div id="schematic-wires" class="fine"></div>
+      <div class="btn-row" style="margin-top: 0.5rem;">
+        <button id="schematic-download" class="small" type="button">Download SVG</button>
+        <button id="schematic-speak" class="small" type="button">Speak wires</button>
+      </div>
+      <div class="btn-row" style="margin-top: 0.5rem;">
+        <select id="flash-port"></select>
+        <button id="flash-esp32" class="small" type="button">FLASH ESP32</button>
+      </div>
+      <div id="flash-status" class="fine"></div>
+    </div>
+  </section>
+
+</main>
+
+<div class="controls-footer">
+  <button id="check" type="button">CHECK NOW</button>
+  <button id="cancel" class="big danger" type="button" hidden>CANCEL</button>
+</div>
+
+<div id="settings-modal" hidden>
+  <div class="modal-card" role="dialog" aria-label="Settings">
+    <h2>Settings</h2>
+    <label>Overhead Camera URL</label>
+    <input id="cam-stream" type="text" placeholder="Stream URL">
+    <input id="cam-capture" type="text" placeholder="Capture URL">
+    <button id="save-cam" class="small">Save Camera</button>
+    <div id="cam-msg" class="fine"></div>
+    
+    <label>Serial Port</label>
+    <div class="btn-row">
+      <select id="serial-port"></select>
+      <select id="serial-baud">
+        <option value="115200">115200</option>
+        <option value="9600">9600</option>
+      </select>
+    </div>
+    <div class="btn-row" style="margin-top: 0.5rem;">
+      <button id="save-serial" class="small">Save Serial</button>
+      <button id="serial-detect" class="small">Auto Detect</button>
+      <button id="show-sketch" class="small" type="button">GET BOARD SKETCH</button>
+    </div>
+    <div id="serial-msg" class="fine"></div>
+    <div id="sketch-panel" hidden>
+      <div class="fine" style="margin-bottom: 0.5rem;">COPY it, paste into Arduino IDE, Upload to your board, close Serial Monitor, then press CHECK NOW.</div>
+      <div class="btn-row" style="margin-bottom: 0.5rem;">
+        <button id="copy-sketch" class="small" type="button">COPY SKETCH</button>
+      </div>
+      <pre id="sketch-code"></pre>
+    </div>
+    
+    <label>Code Analysis</label>
+    <textarea id="code" placeholder="Paste code here..."></textarea>
+    
+    <label>Simulate Fault</label>
+    <select id="fault">
+      <option value="">None</option>
+      <option>SDA_SCL_SWAPPED</option>
+      <option>LOOSE_GND</option>
+      <option>CODE_PIN_MISMATCH</option>
+      <option>SENSOR_DISCONNECTED</option>
+      <option>LED_REVERSED</option>
+    </select>
+
+    <label>Voice</label>
+    <select id="voice">
+      <option value="">Auto</option>
+    </select>
+    <button id="test-voice" class="small">Test Voice</button>
+    <div id="voice-status" class="fine"></div>
+
+    <div class="btn-row" style="margin-top: 1rem;">
+      <button id="clear-snap" class="small">Clear Snap</button>
+      <button id="rescan" class="small">Rescan</button>
+    </div>
+
+    <div class="btn-row" style="margin-top: 1.5rem;">
+      <button id="settings-close" class="small">Close</button>
+    </div>
+  </div>
+</div>
 
 <div id="cook" hidden>
-  <div class="cook-top">
-    <div>
-      <div id="cook-project" class="cook-project"></div>
-      <div id="cook-step" class="cook-step"></div>
+  <div class="cook-container">
+    <div class="cook-top">
+      <div>
+        <div id="cook-project" class="cook-project"></div>
+        <div id="cook-step" class="cook-step"></div>
+      </div>
+      <div class="orb-container-small">
+        <div class="orb-ring" style="opacity: 0.05;"></div>
+        <div id="cook-orb" class="orb orb-small" aria-hidden="true"></div>
+      </div>
+      <div class="btn-row">
+        <button id="cook-stop" class="small" type="button">STOP</button>
+        <button id="cook-exit" class="small" type="button">EXIT</button>
+      </div>
     </div>
-    <button id="cook-exit" class="small" type="button">EXIT</button>
-  </div>
-  <div class="cook-progress"><div id="cook-bar"></div></div>
-  <div id="cook-chapter" class="chapter-title" hidden></div>
-  <div id="cook-instruction" role="status"></div>
-  <ol id="cook-parts" class="cook-chips"></ol>
-  <figure class="cook-cam">
-    <img id="cook-preview" alt="overhead camera view of the circuit">
-    <svg id="cook-svg" preserveAspectRatio="none"></svg>
-  </figure>
-  <div id="cook-status" class="panel">No measurements yet.</div>
-  <div id="cook-heard" class="fine"></div>
-  <div class="btn-row cook-btns">
-    <button id="cook-talk" class="small" type="button">TALK</button>
-    <button id="cook-check" class="small" type="button">CHECK</button>
-    <button id="cook-confirm" class="small" type="button" hidden>CONFIRM</button>
-    <button id="cook-repeat" class="small" type="button">REPEAT</button>
-    <button id="cook-look" class="small" type="button">LOOK</button>
-  </div>
-  <label class="cook-handsfree"><input id="cook-handsfree" type="checkbox"> Hands-free (keep listening)</label>
-  <div id="cook-done" hidden>
-    <button id="cook-code" class="small" type="button">SEND CODE</button>
-    <button id="cook-copy" class="small" type="button">COPY</button>
-    <pre id="cook-code-out" class="panel"></pre>
+    
+    <div class="cook-progress"><div id="cook-bar"></div></div>
+    
+    <div class="cook-split">
+      <div class="cook-talk">
+        <div id="cook-chapter" class="chapter-title" hidden></div>
+        <div id="cook-instruction" role="status" class="panel"></div>
+        <div id="cook-heard" class="fine"></div>
+
+        <div id="cook-nudge" class="panel" hidden>
+          <span id="cook-nudge-text"></span>
+          <button id="cook-nudge-x" class="small" type="button">DISMISS</button>
+        </div>
+
+        <div id="cook-coach-confirm" class="panel" hidden>
+          <div id="cook-coach-confirm-text"></div>
+          <div class="btn-row" style="margin-top:8px">
+            <button id="cook-coach-yes" class="small" type="button">CONFIRM</button>
+            <button id="cook-coach-no" class="small" type="button">DENY</button>
+          </div>
+        </div>
+
+        <div id="cook-killed" class="panel" hidden>
+          <span>Coach stopped.</span>
+          <button id="cook-arm" class="small" type="button">ARM</button>
+        </div>
+
+        <div class="btn-row cook-btns">
+          <input id="cook-ask-input" type="text" placeholder="Type to the coach…" style="flex:2">
+          <button id="cook-ask-send" class="small" type="button">ASK</button>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Wiring schematic</h2>
+        <div id="cook-schematic-svg"></div>
+        <div id="cook-schematic-wires" class="fine"></div>
+        <div class="btn-row" style="margin-top: 0.5rem;">
+          <button id="cook-schematic-download" class="small" type="button">DOWNLOAD SVG</button>
+          <button id="cook-schematic-speak" class="small" type="button">SPEAK WIRES</button>
+        </div>
+        <div class="btn-row" style="margin-top: 0.5rem;">
+          <select id="cook-flash-port"></select>
+          <button id="cook-flash-esp32" class="small" type="button">FLASH ESP32</button>
+        </div>
+        <div id="cook-flash-status" class="fine"></div>
+      </div>
+    </div>
+
+    <ol id="cook-parts" class="cook-chips"></ol>
+
+    <div class="cam-container">
+      <figure class="cook-cam">
+        <img id="cook-preview" alt="overhead camera view of the circuit">
+        <svg id="cook-svg" preserveAspectRatio="none"></svg>
+      </figure>
+    </div>
+
+    <div id="cook-status" class="panel">No measurements yet.</div>
+    
+    <div class="btn-row cook-btns" style="flex-wrap: wrap;">
+      <button id="cook-talk" class="small" type="button">TALK</button>
+      <button id="cook-check" class="small" type="button">CHECK</button>
+      <button id="cook-confirm" class="small" type="button" hidden>CONFIRM</button>
+      <button id="cook-repeat" class="small" type="button">REPEAT</button>
+      <button id="cook-look" class="small" type="button">LOOK</button>
+    </div>
+    
+    <label class="cook-handsfree">
+      <input id="cook-handsfree" type="checkbox"> Hands-free mode
+    </label>
+    
+    <div id="cook-done" hidden>
+      <div class="panel" style="margin-top: 1rem;">
+        <h2>Final Code</h2>
+        <div class="btn-row" style="margin-bottom: 1rem;">
+          <button id="cook-code" class="small" type="button">SEND CODE</button>
+          <button id="cook-step-code" class="small" type="button">STEP CODE</button>
+          <button id="cook-copy" class="small" type="button">COPY</button>
+        </div>
+        <pre id="cook-code-out"></pre>
+      </div>
+    </div>
   </div>
 </div>
 

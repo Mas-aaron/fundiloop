@@ -14,6 +14,7 @@ import base64
 import hashlib
 import json
 import os
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -30,7 +31,13 @@ from .camera_client import CameraClient
 from .change_detector import MotionSettler
 from .circuit_graph import CircuitGraph, load_circuit_graph
 from .fault_ranker import RANK_THRESHOLD, rank_faults
-from .fundi import chapter_for, plan_chapters, speak_passed, speak_start
+from .fundi import (
+    chapter_for,
+    plan_chapters,
+    speak_passed,
+    speak_start,
+    template_chapters,
+)
 from .models import (
     AgentState,
     AssemblyStep,
@@ -289,15 +296,47 @@ class AgentOrchestrator:
         }
         self.sessions[sid] = self.session
         self.current_id = sid
-        chapters = plan_chapters(self.session["plan"], self.Muse,
-                                 self.session["project_title"], key)
-        self.session["chapters"] = chapters
-        first = chapter_for(chapters, 0) or {}
+        # Instant start: templates answer now with zero model calls on
+        # the critical path; a proven-real adapter enriches every chapter
+        # in the background and swaps the full set when it lands (the
+        # step code attached below is template/patient either way).
+        self.session["chapters"] = template_chapters(self.session["plan"])
+        if not getattr(self.Muse, "mock", True):
+            worker = threading.Thread(
+                target=self._fill_chapters,
+                args=(sid, self.session, self.session["plan"],
+                      self.session["project_title"], key),
+                name="fundiloop-chapters", daemon=True)
+            worker.start()
+        first = chapter_for(self.session["chapters"], 0) or {}
         speak = speak_start(first, self.session["project_title"])
-        return self._learning_view(
+        view = self._learning_view(
             state="INSTRUCTING", instruction=speak, speak=speak,
             verification=None,
             fundi={"event": "CHAPTER_START", "chapter": first})
+        self._attach_step_code(view, self.session["plan"][0])
+        return view
+
+    def _fill_chapters(self, sid: str, session: dict, plan: list,
+                       project_title: str, board: str,
+                       Muse=None) -> None:
+        """Background worker: swap template chapters for full Fundi ones.
+
+        Runs off the request path after an instant template start. The
+        swap lands only if this is still the live session object;
+        anything unexpected leaves the templates standing (the adapter
+        log shows the attempt).
+        """
+        try:
+            full = plan_chapters(plan, Muse or MetaClaudeAdapter(),
+                                 project_title, board)
+        except Exception:
+            return
+        try:
+            if self.sessions.get(sid) is session:
+                session["chapters"] = full
+        except Exception:
+            pass
 
     def _learning_turn(self, req, progress=None) -> dict:
         """One sensor-gated learning step. The sensor alone advances."""
@@ -390,26 +429,54 @@ class AgentOrchestrator:
                 progress("CHAPTER_PASSED", {
                     "chapter": current_ch, "next_chapter": next_ch,
                     "celebration": str(current_ch.get("celebration") or praise)})
-            return done(self._learning_view(
+            view = self._learning_view(
                 state="INSTRUCTING", instruction=text, speak=text,
                 verification=verification,
                 fundi={"event": "CHAPTER_PASSED", "chapter": current_ch,
                        "next_chapter": next_ch,
-                       "celebration": str(current_ch.get("celebration") or praise)}))
+                       "celebration": str(current_ch.get("celebration") or praise)})
+            self._attach_step_code(view, plan[idx])
+            return done(view)
         if verification.get("needs_confirmation"):
             return done(self._offer_confirmation(step, verification))
         r_t0 = time.monotonic()
         hint = build_hint(step, verification, self.Muse)
         timings["reason_ms"] = (time.monotonic() - r_t0) * 1000
-        speak = "%s. %s" % (verification["measured"], hint)
+        if verification.get("board_state"):
+            # Known no-board failure: measured is a port dump for the
+            # screen, not for speech — say the guidance only.
+            speak = hint
+        else:
+            speak = "%s. %s" % (verification["measured"], hint)
         self.voice.speak(speak)
         if progress is not None:
             progress("CHAPTER_HINT", {"chapter": current_ch, "hint": hint})
-        return done(self._learning_view(
+        view = self._learning_view(
             state="VERIFYING", instruction=speak, speak=speak,
             verification=verification,
             fundi={"event": "CHAPTER_HINT", "chapter": current_ch,
-                   "hint": hint}))
+                   "hint": hint})
+        self._attach_step_code(view, step)
+        return done(view)
+
+    def _attach_step_code(self, view: dict, step: dict) -> None:
+        """Attach the current step's runnable sketch to a learn view.
+
+        The code is shown from the moment the step starts — never held
+        back until a failure. Instant sources only (template, patient,
+        cached model output): nothing here may burn a model call or
+        raise; any miss leaves the view unchanged.
+        """
+        try:
+            from .learning import generate_step_code
+            code, source = generate_step_code(
+                self.session, step, self.Muse, allow_model=False)
+        except Exception:
+            return
+        if not code:
+            return
+        view["step_code"] = {"n": step.get("n"), "code": code,
+                             "source": source}
 
     def _offer_confirmation(self, step: dict, verification: dict) -> dict:
         """Ask the technician to confirm what the probe cannot assess.

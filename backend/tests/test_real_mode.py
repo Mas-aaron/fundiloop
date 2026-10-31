@@ -73,6 +73,23 @@ VALID_DECISION = {
 }
 
 
+def expect_box(shipped: list) -> list:
+    """Shipped-space box mapped to source pixels, like the adapter does.
+
+    The adapter contract is source-pixel boxes: with OpenCV installed
+    (a declared dependency) prepare_frame resizes to 448px and boxes
+    map back; without it the rescale is the identity. Expectations
+    must follow the same mapping or they only hold on one path.
+    """
+    from backend.app.frames import prepare_frame, scale_box
+
+    prep = prepare_frame(TEST_JPEG)
+    if not prep.resized:
+        return list(shipped)
+    return scale_box(list(shipped), prep.dst_w, prep.dst_h,
+                     prep.src_w, prep.src_h)
+
+
 def fake_urlopen_factory(body: bytes):
     class FakeResp:
         headers = {"Content-Type": "image/jpeg"}
@@ -184,7 +201,8 @@ class RealModeTest(unittest.TestCase):
         by_label = {}
         for det in out["detections"]:
             by_label.setdefault(det["label"], []).append(det)
-        self.assertEqual(by_label["ESP32 DevKit"][0]["box"], [1, 2, 3, 4])
+        self.assertEqual(by_label["ESP32 DevKit"][0]["box"],
+                         expect_box([1, 2, 3, 4]))
         self.assertEqual(by_label["ESP32 DevKit"][0]["mask_svg"], "<svg-stub>")
         self.assertEqual(out["wire_count"], 2)
         log = os.path.join(self.tmp.name, "model_calls.jsonl")
@@ -284,7 +302,8 @@ class RealModeTest(unittest.TestCase):
         self.assertEqual(len(out["detections"]), 1)
         det = out["detections"][0]
         self.assertEqual(det["label"], "duck")
-        self.assertEqual(det["box"], [211, 228, 271, 255])  # half-open
+        self.assertEqual(det["box"],
+                         expect_box([211, 228, 271, 255]))  # source pixels
         self.assertAlmostEqual(det["confidence"], 0.87)
         self.assertTrue(det["mask_svg"].startswith("M"))
         self.assertEqual(out["request_id"], "resp-real")

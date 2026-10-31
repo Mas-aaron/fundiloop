@@ -62,6 +62,16 @@ def _coach(mock=True):
 class CoachTests(unittest.TestCase):
     def setUp(self):
         use_mock_env(self)
+        # Isolate from real user state: the kill switch is global, so a
+        # tripped switch on disk must never fail the core suite.
+        self.tmp = __import__("tempfile").TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {
+            "COACH_MEMORY_DIR": self.tmp.name,
+            "COACH_AUDIT_LOG": os.path.join(self.tmp.name, "audit.jsonl"),
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     # -- Tier 1: brain ----------------------------------------------------
     def test_system_names_coach_and_boundaries(self):

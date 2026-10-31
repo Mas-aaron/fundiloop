@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from backend.app.boards import pin_map_for
 from backend.app.fundi import (
     plan_chapters,
     speak_passed,
@@ -15,6 +16,7 @@ from backend.app.fundi import (
     template_chapters,
     validate_chapters,
 )
+from backend.app.learning import build_hint, run_learning_verification
 from backend.app.models import CheckNowRequest, ProbeReading
 from backend.tests.helpers import use_mock_env
 from backend.tests.test_latency import make_orchestrator
@@ -165,21 +167,50 @@ class LessonFlowTest(unittest.TestCase):
         self.orc = make_orchestrator(self.tmp.name)
 
     def start(self, plan, script, sid="fundi-1"):
+        # Start answers instantly from templates (zero model calls); the
+        # background thread stays suppressed here and the fill step runs
+        # explicitly below, so no real timing is involved.
         self.orc.Muse = StubBrain(script)
-        return self.orc.start_learning_session(
-            "blink", [dict(s) for s in plan], visible_parts=[],
-            session_id=sid, project_title="Blink", board="arduino_uno")
+
+        class NoThread:
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                pass
+
+        with mock.patch("threading.Thread", NoThread):
+            return self.orc.start_learning_session(
+                "blink", [dict(s) for s in plan], visible_parts=[],
+                session_id=sid, project_title="Blink", board="arduino_uno")
+
+    def fill(self, sid="fundi-1"):
+        self.orc._fill_chapters(
+            sid, self.orc.session, PLAN, "Blink", "arduino_uno",
+            Muse=StubBrain([json.dumps({"chapters": CHAPTERS})]))
 
     def test_start_emits_chapter_start(self):
-        v = self.start(PLAN, [json.dumps({"chapters": CHAPTERS})])
+        v = self.start(PLAN, [])
         self.assertEqual(v["fundi"]["event"], "CHAPTER_START")
-        self.assertEqual(v["fundi"]["chapter"]["title"], "Meet the sensor")
-        self.assertIn("two shared wires", v["speak"])
+        # Templates answer now, with zero model calls on the start path.
+        self.assertEqual(v["fundi"]["chapter"]["title"], "Step 1")
+        self.assertIn("Starting Blink", v["speak"])
         self.assertNotIn("Chapter", v["speak"])
         self.assertEqual(v["step_index"], 0)
+        self.assertEqual(len(self.orc.Muse.calls), 0)
+        # Step 1 code rides along from the start: no fail-first.
+        self.assertEqual(v["step_code"]["source"], "template")
+        self.assertEqual(v["step_code"]["n"], 1)
+        self.assertIn("scan done", v["step_code"]["code"])
+        # ...then the background fill swaps the full chapters in.
+        self.fill()
+        full = self.orc.session["chapters"]
+        self.assertEqual(full[0]["title"], "Meet the sensor")
+        self.assertIn("two shared wires", full[0]["teach"])
 
     def test_pass_emits_chapter_passed_with_next(self):
-        self.start(PLAN, [json.dumps({"chapters": CHAPTERS})])
+        self.start(PLAN, [json.dumps({"chapters": CHAPTERS[:1]})])
+        self.fill()
         seen = []
         with mock.patch.object(self.orc.probe, "read_all",
                                return_value=I2C_OK):
@@ -193,10 +224,14 @@ class LessonFlowTest(unittest.TestCase):
         self.assertIn("Boom! Verified:", v["speak"])
         self.assertIn("Next: GPIO pins switch on and off in code.", v["speak"])
         self.assertEqual(v["step_index"], 1)
+        # Passing hands over the NEXT step's code at once.
+        self.assertEqual(v["step_code"]["source"], "template")
+        self.assertEqual(v["step_code"]["n"], 2)
+        self.assertIn("LED_PIN", v["step_code"]["code"])
 
     def test_fail_emits_chapter_hint_without_advancing(self):
-        self.start(PLAN, [json.dumps({"chapters": CHAPTERS}),
-                          "Reseat the SDA wire."])
+        self.start(PLAN, [])
+        self.fill()
         seen = []
         with mock.patch.object(self.orc.probe, "read_all",
                                return_value=I2C_EMPTY):
@@ -204,10 +239,46 @@ class LessonFlowTest(unittest.TestCase):
                                    progress=lambda s, d: seen.append(s))
         self.assertEqual(v["fundi"]["event"], "CHAPTER_HINT")
         self.assertEqual(v["fundi"]["chapter"]["n"], 1)
-        self.assertEqual(v["fundi"]["hint"], "Reseat the SDA wire.")
+        # Classified failure: the instant template answers, no model call.
+        self.assertIn("SDA and SCL", v["fundi"]["hint"])
+        self.assertEqual(self.orc.Muse.calls, [])
         self.assertIn("CHAPTER_HINT", seen)
         self.assertEqual(v["step_index"], 0)
         self.assertNotIn("celebration", v["fundi"])  # cheer only on passes
+        # Classified failure: speech still carries measured plus the hint.
+        self.assertIn("I2C found", v["speak"])
+        self.assertIn("SDA and SCL", v["speak"])
+        # ...and the step's runnable code is attached, not just described.
+        self.assertEqual(v["step_code"]["source"], "template")
+        self.assertEqual(v["step_code"]["n"], 1)
+        self.assertIn("scan done", v["step_code"]["code"])
+
+    def test_silent_serial_fail_speaks_hint_and_attaches_code(self):
+        plan = [{"n": 1, "instruction": "Wire the serial link.",
+                 "verify": "CHECK_SERIAL", "expect": {},
+                 "depends_on_parts": []}]
+        self.start(plan, [])
+        silent = ProbeReading(
+            connected=False, i2c_devices=[], temperature_c=None,
+            humidity_pct=None, pressure_hpa=None, oled_ok=None, led_ok=None,
+            mock=False, raw=json.dumps({"ping": {
+                "cmd": "PING", "error": "no PING reply on COM3, COM9",
+                "board_state": "silent:COM9"}}))
+        with mock.patch.object(self.orc.probe, "read_all",
+                               return_value=silent):
+            v = self.orc.check_now(CheckNowRequest())
+        self.assertEqual(v["fundi"]["event"], "CHAPTER_HINT")
+        self.assertEqual(v["fundi"]["hint"],
+                         "The board on COM9 never answers. Flash the patient "
+                         "sketch, then press CHECK NOW.")
+        # Known failure: the port dump stays on screen, speech is guidance.
+        self.assertEqual(v["speak"], v["fundi"]["hint"])
+        self.assertEqual(v["instruction"], v["speak"])
+        self.assertNotIn("no live serial traffic", v["speak"])
+        self.assertEqual(v["step_code"]["source"], "patient")
+        self.assertIn("PING", v["step_code"]["code"])
+        # Template chapters + instant hint: no model calls at all.
+        self.assertEqual(len(self.orc.Muse.calls), 0)
 
     def test_unverifiable_asks_then_confirms_to_done(self):
         one = [dict(PLAN[1])]
@@ -232,6 +303,100 @@ class LessonFlowTest(unittest.TestCase):
         self.assertEqual(v["fundi"]["event"], "LESSON_DONE")
         self.assertEqual(v["fundi"]["chapters_total"], 1)
         self.assertIn("Boom", v["speak"])
+
+
+class BuildHintGuardTest(unittest.TestCase):
+    STEP = {"n": 1, "instruction": "wire it"}
+    VER = {"test": "CHECK_SERIAL",
+           "measured": "no live serial traffic (board silent)"}
+
+    def test_refusal_blob_falls_back(self):
+        blob = '{"refusal": "Loud refusal triggered:\\n[dev]: be brief"}'
+        hint = build_hint(self.STEP, self.VER, StubBrain([blob]))
+        self.assertIn("Check the wiring for step 1", hint)
+        self.assertNotIn("refusal", hint)
+        # The caller already speaks measured; the hint must not repeat it.
+        self.assertNotIn("no live serial traffic", hint)
+
+    def test_prose_refusal_falls_back(self):
+        hint = build_hint(self.STEP, self.VER,
+                          StubBrain(["Loud refusal triggered: caps conflict"]))
+        self.assertIn("Check the wiring for step 1", hint)
+
+    def test_good_hint_passes_through_caps_and_all(self):
+        hint = build_hint(self.STEP, self.VER,
+                          StubBrain(["Reseat the SDA wire."]))
+        self.assertEqual(hint, "Reseat the SDA wire.")
+
+    def test_model_error_falls_back(self):
+        hint = build_hint(self.STEP, self.VER,
+                          StubBrain([RuntimeError("boom")]))
+        self.assertIn("Check the wiring for step 1", hint)
+        self.assertNotIn("no live serial traffic", hint)
+
+    def test_known_board_states_skip_model(self):
+        for state, needle in (
+            ("silent:COM11", "COM11"),
+            ("unreachable:COM9", "COM9"),
+            ("no_usb", "USB"),
+            ("no_ports", "USB"),
+        ):
+            brain = StubBrain(["model hint"])
+            hint = build_hint(self.STEP, dict(self.VER, board_state=state),
+                              brain)
+            self.assertEqual(brain.calls, [], state)
+            self.assertIn(needle, hint, state)
+            self.assertIn("CHECK NOW", hint, state)
+
+    def test_classified_sensor_failures_skip_model(self):
+        cases = (
+            ({"test": "RUN_I2C_SCAN",
+              "measured": "I2C found [0x3C] MISSING 0x76"}, "SDA"),
+            ({"test": "READ_SENSOR",
+              "measured": "sensor read failed"}, "power"),
+        )
+        for ver, needle in cases:
+            brain = StubBrain(["model hint"])
+            hint = build_hint(self.STEP, ver, brain)
+            self.assertEqual(brain.calls, [], ver)
+            self.assertIn(needle, hint, ver)
+            self.assertIn("CHECK NOW", hint, ver)
+
+
+class SerialMeasuredTruncationTest(unittest.TestCase):
+    def _check(self, error):
+        reading = ProbeReading(
+            connected=False, i2c_devices=[], temperature_c=None,
+            humidity_pct=None, pressure_hpa=None, oled_ok=None, led_ok=None,
+            mock=False, raw=json.dumps({"ping": {"cmd": "PING", "error": error}}))
+        return run_learning_verification(
+            "CHECK_SERIAL", {}, reading, pin_map_for("esp32_devkit"))
+
+    def test_long_error_truncates_at_word_boundary(self):
+        v = self._check("COM3: could not open port 'COM3': "
+                        "FileNotFoundError(2, 'The system cannot find the "
+                        "file specified.', None, 2) and then some more text")
+        self.assertFalse(v["passed"])
+        self.assertTrue(v["measured"].endswith("…)"), v["measured"])
+        self.assertLessEqual(len(v["measured"]), len(
+            "no live serial traffic ()") + 120)
+
+    def test_short_error_passes_through_whole(self):
+        v = self._check("board silent")
+        self.assertEqual(v["measured"],
+                         "no live serial traffic (board silent)")
+        self.assertEqual(v["board_state"], "")
+
+    def test_board_state_carried_from_ping(self):
+        reading = ProbeReading(
+            connected=False, i2c_devices=[], temperature_c=None,
+            humidity_pct=None, pressure_hpa=None, oled_ok=None, led_ok=None,
+            mock=False, raw=json.dumps({"ping": {"cmd": "PING",
+                                                "error": "no PING reply",
+                                                "board_state": "silent:COM11"}}))
+        v = run_learning_verification(
+            "CHECK_SERIAL", {}, reading, pin_map_for("esp32_devkit"))
+        self.assertEqual(v["board_state"], "silent:COM11")
 
 
 if __name__ == "__main__":

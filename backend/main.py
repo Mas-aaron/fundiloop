@@ -80,6 +80,11 @@ def root():
     return FileResponse(str(STATIC_INDEX), media_type="text/html")
 
 
+@app.get("/app.js")
+def app_js():
+    return FileResponse(str(BASE_DIR / "static" / "app.js"), media_type="text/javascript")
+
+
 @app.get("/config")
 def get_config():
     return {"esp32_host": ESP32_HOST, "cam_url": cam_url_for(ESP32_HOST)}

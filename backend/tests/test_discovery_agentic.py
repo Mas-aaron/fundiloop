@@ -81,6 +81,73 @@ class LearningLoopTest(unittest.TestCase):
         use_mock_env(self)
         self.orc = _make_orc(self)
 
+    def test_start_answers_instantly_and_fills_chapters_in_background(self):
+        full = [{"n": 1, "title": "T1", "teach": "do it", "task": "wire",
+                 "verify": "RUN_I2C_SCAN", "celebration": ""},
+                {"n": 2, "title": "T2", "teach": "read it",
+                 "task": "read", "verify": "READ_SENSOR",
+                 "celebration": ""}]
+        calls, threads = [], []
+
+        def fake_plan(plan, Muse, title="", board=None):
+            calls.append(list(plan))
+            return [dict(c) for c in full]
+
+        class FakeThread:
+            def __init__(self, *a, **k):
+                threads.append(k)
+                self._target, self._args = k["target"], k["args"]
+
+            def start(self):
+                pass  # the worker itself runs explicitly below
+
+        self.orc.Muse = MetaClaudeAdapter(mock=False)
+        with mock.patch("backend.app.agent_orchestrator.plan_chapters",
+                        side_effect=fake_plan):
+            with mock.patch("threading.Thread", FakeThread):
+                view = self.orc.start_learning_session(
+                    "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
+                    session_id="learn-fast", project_title="Weather station")
+        # Zero model calls on the start path: templates answer now.
+        self.assertEqual(calls, [])
+        self.assertIn("Starting Weather station", view["speak"])
+        self.assertEqual(len(self.orc.session["chapters"]), 2)
+        self.assertEqual(self.orc.session["chapters"][0]["teach"], "")
+        self.assertEqual(len(threads), 1)
+        self.assertTrue(threads[0]["daemon"])
+        # Explicit fill step: the background worker swaps the full set.
+        with mock.patch("backend.app.agent_orchestrator.plan_chapters",
+                        side_effect=fake_plan):
+            threads[0]["target"](*threads[0]["args"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]), 2)
+        self.assertEqual(self.orc.session["chapters"][0]["teach"], "do it")
+        self.assertEqual(self.orc.session["chapters"][1]["teach"], "read it")
+
+    def test_fill_worker_swaps_full_chapters(self):
+        self.orc.start_learning_session(
+            "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
+            session_id="learn-fill")
+        self.orc.session["chapters"] = [{"marker": True}]
+        self.orc._fill_chapters("learn-fill", self.orc.session, PLAN_2STEP,
+                                "Weather station", "esp32_devkit")
+        chapters = self.orc.session["chapters"]
+        self.assertEqual(len(chapters), 2)
+        self.assertNotIn("marker", chapters[0])
+
+    def test_fill_worker_ignores_stale_session(self):
+        self.orc.start_learning_session(
+            "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
+            session_id="learn-stale")
+        old = self.orc.session
+        self.orc.start_learning_session(
+            "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
+            session_id="learn-stale")  # restart replaces the session object
+        self.orc.session["chapters"] = [{"marker": True}]
+        self.orc._fill_chapters("learn-stale", old, PLAN_2STEP,
+                                "Weather station", "esp32_devkit")
+        self.assertEqual(self.orc.session["chapters"], [{"marker": True}])
+
     def test_advances_one_step_per_pass_and_refuses_early_done(self):
         self.orc.start_learning_session(
             "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],

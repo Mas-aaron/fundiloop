@@ -236,6 +236,49 @@ validated and executed by the backend against the real verification module:
 The model proposes plans and instructions. The verification module
 disposes: it alone advances steps, declares DONE, and gates firmware.
 
+### Learning schematic + ESP32 flash
+
+Each learning step shows its wiring beside its code, and one tap
+pushes the step sketch to the board. ESP32 only (Uno out of scope).
+
+- `GET /project/{id}/step/{n}/schematic` returns the progressive
+  netlist (`{netlist, svg, unresolved[]}`): wiring for every part the
+  plan needs up to step N, so the last step is the full project.
+  Wiring comes from the plan + the ESP32 pin map + `SENSOR_INTERFACES`
+  only; unknown parts render "unresolved" with a reason and are never
+  auto-wired. The UI panel shows the SVG, a wire list (SPEAK WIRES
+  reads it aloud), and an SVG download.
+- `POST /project/{id}/step/{n}/flash` (`{"port": "..."}`) compiles
+  the step sketch (cached by code hash), releases both probe handles,
+  flashes via esptool at the build offsets, and re-probes PING:
+  `{ok, build_hash, port, verify_ping}`. Flashing is Learning-mode
+  only, explicit tap only, always to a user-picked port — never
+  automatic. Every flash (success and failure) audit-logs to
+  `backend/logs/coach_audit.jsonl`. Busy ports answer with
+  close-the-Serial-Monitor guidance instead of a traceback.
+- One-time toolchain install on the laptop (offline after):
+  1. `pip install -r backend/requirements.txt` (includes `esptool`).
+  2. Install `arduino-cli`, then
+     `arduino-cli core install esp32:esp32` (adds the ESP32 core).
+  3. Paths live in `.env`, never hardcoded: `ARDUINO_CLI_BIN`,
+     `ARDUINO_FQBN`, `ESPTOOL_BIN`, timeouts (see `.env.example`).
+
+Manual ESP32 flash checklist (run against real hardware before
+trusting a new toolchain install):
+
+1. Board on USB, nothing else holding the port (close Serial
+   Monitor/Plotter). Start a learning session on ESP32 DevKit.
+2. Step 1 schematic shows the expected wires, no surprises in
+   "unresolved". SVG download opens in a browser.
+3. Pick the board's port, press FLASH ESP32: ack speech sounds, the
+   ticker runs, success reports the build hash + PING verdict.
+4. With Serial Monitor open on the same port, FLASH again: the busy
+   guidance names the port and says to close Serial Monitor.
+5. Press FLASH twice unchanged: the second run reports a cached
+   build (no recompile).
+6. `backend/logs/coach_audit.jsonl` holds one `flash` event per
+   attempt with an intact hash chain.
+
 ### Cook Mode (voice-guided builds)
 
 Cook Mode is the NYT-Cooking-style runner for learning projects: starting
@@ -246,11 +289,24 @@ is spoken; the technician answers by voice:
 - TALK (or hands-free auto-listen) records a short clip of speech.
 - Say "check" to run the step's sensor verification, "repeat" to hear
   the step again, "look" to hear what the camera sees, or "exit" to
-  leave. Anything else goes to the live coach over
-  `WS /api/live/session`, which answers from the transcript, the probe
-  readings, and the current step — spoken back.
-- The sensor still alone advances steps and gates firmware; voice drives,
-  it never declares success.
+  leave. Anything else goes to the Learning coach core
+  (`POST /api/coach/ask/stream`, falling back to `POST /api/coach/ask`),
+  which remembers the conversation across restarts and calls read-only
+  teaching tools — spoken back clause by clause.
+- The ASK box types to the same brain without the microphone (debug
+  path). The sensor still alone advances steps and gates firmware;
+  voice drives, it never declares success.
+- Heartbeat: leave Cook Mode idle mid-step and the coach nudges once
+  (`POST /api/coach/nudge`) — spoken and bannered, dismissible, never
+  during quiet hours, never twice within the cooldown. All thresholds
+  live in `.env` (`COACH_IDLE_NUDGE_SECONDS`,
+  `COACH_NUDGE_COOLDOWN_SECONDS`, `QUIET_HOURS_START/END`).
+- Rails: unsafe tools pause for explicit CONFIRM/DENY
+  (`POST /api/coach/confirm`; `COACH_GATE_STRICT=true` gates even safe
+  tools). Rail events append to hash-chained
+  `backend/logs/coach_audit.jsonl`. The STOP button (or terminal
+  `/stop`) trips the persisted kill switch — all coach turns refuse
+  until ARM (`/arm`).
 
 ### Live guide (ambient coaching)
 
@@ -311,6 +367,9 @@ MUSE_MODEL=muse-spark-1.3
 SAM_MODEL=sam-3.1
 VOICE_MODEL=meta-voice-1
 # META_ASR_URL=                            # override only; default is base + /asr/transcribe
+TTS_PROVIDER=kokoro
+KOKORO_VOICE=af_heart
+# KOKORO_MODEL_DIR=                        # override only; default is backend/data/kokoro
 TTS_MODEL=muse-voice-tts-1.0
 META_TTS_VOICE=warm-female
 # META_TTS_URL=                            # override only; default is base + /tts/synthesize
@@ -329,14 +388,26 @@ data or a canned instruction. Every model call is logged to
 `backend/data/logs/model_calls.jsonl`, and every analysis still is saved to
 `backend/data/debug_frames/`.
 
-Voice: speech output tries Meta Voice TTS first (`POST /api/voice/speak`,
-warm female voice from `META_TTS_VOICE`) and falls back to default
-browser `speechSynthesis` for that utterance only on failure. Both paths
+Voice: speech output tries server TTS first (`POST /api/voice/speak`)
+and falls back to default browser `speechSynthesis` for that utterance
+only on failure. `TTS_PROVIDER` picks the engine: `kokoro` (local
+neural voice, `af_heart` American female default — works today) or
+`meta` (Meta Voice TTS, warm female from `META_TTS_VOICE`). Both paths
 speak the same normalized spoken form (`GND->GND` is said as "ground to
-ground", never spelled). NOTE: the public Meta Model API documents
-Transcribe but no TTS model today, so real-mode TTS 502s until Meta
-ships it — the fallback keeps every utterance audible meanwhile.
+ground", never spelled). NOTE: the Meta Model API lists Transcribe but
+no TTS model (verified live), so meta real mode 502s until Meta ships
+it — Kokoro or the fallback keeps every utterance audible meanwhile.
 Speech input uses the browser's own speech recognition where available
 and falls back to recording + upload to `POST /api/voice/transcribe`
 for Muse Voice Transcribe (WAV conversion via pydub/ffmpeg when
 available, raw upload otherwise).
+
+Kokoro setup (once): `backend\.venv\Scripts\python.exe -m pip install -r
+backend/requirements-kokoro.txt`, then download `kokoro-v1.0.onnx` and
+`voices-v1.0.bin` from the
+[kokoro-onnx model files](https://github.com/thewh1teagle/kokoro-onnx/releases?q=model-files&expanded=true)
+release into `backend/data/kokoro/`, and set `TTS_PROVIDER=kokoro`.
+Fully offline after that — no key, no network. If synthesis complains
+about espeak on Windows, install it once via
+`winget install eSpeak-NG.eSpeak-NG` (the bundled loader usually covers
+it, but a system install is the sure fix).

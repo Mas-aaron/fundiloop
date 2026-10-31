@@ -74,8 +74,10 @@ class MetaSAMAdapter:
 
             with self._client_lock:
                 if self._client is None:
+                    # No SDK retries: the app owns retry policy, and client
+                    # retries multiply tail latency (30s -> 90s hangs).
                     self._client = OpenAI(base_url=api_base_url(), api_key=api_key(),
-                                          timeout=api_timeout())
+                                          timeout=api_timeout(), max_retries=0)
         return self._client
 
     def analyze(
@@ -197,7 +199,8 @@ class MetaSAMAdapter:
             }],
             metadata={"include_confidence": "true"},
         )
-        texts, response_id = self._collect_output_texts(stream)
+        texts, response_id = self._collect_output_texts(
+            stream, deadline_s=api_timeout())
         parser = parser_mod.image_segmentation_format().create_parser()
         for text in texts:
             for _snapshot in parser.push(text):
@@ -230,7 +233,8 @@ class MetaSAMAdapter:
             }],
             metadata={"include_confidence": "true"},
         )
-        texts, response_id = self._collect_output_texts(stream)
+        texts, response_id = self._collect_output_texts(
+            stream, deadline_s=api_timeout())
         parser = parser_mod.video_segmentation_format().create_parser()
         for text in texts:
             for _snapshot in parser.push(text):
@@ -245,17 +249,26 @@ class MetaSAMAdapter:
         return self._combine_tracks(result, concept, clip_file, latency_ms, response_id)
 
     @staticmethod
-    def _collect_output_texts(stream) -> tuple:
+    def _collect_output_texts(stream, deadline_s: float | None = None) -> tuple:
         """Drain one streamed responses call into (texts, response_id).
 
         The SAM cookbook emits a single output_text lane; deltas and the
         finalized content part are both read so either shape decodes.
+        deadline_s caps the TOTAL drain wall time (the SDK timeout only
+        bounds each idle read, so a slow-dripping stream could otherwise
+        run for many minutes); on expiry TimeoutError propagates and the
+        caller degrades that prompt.
         """
         lanes: dict = {}
         parts: dict = {}
         response_id = ""
+        started = time.monotonic()
         with stream:
             for event in stream:
+                if deadline_s is not None \
+                        and time.monotonic() - started > deadline_s:
+                    raise TimeoutError(
+                        "SAM stream exceeded its total deadline")
                 data = event.model_dump() if hasattr(event, "model_dump") else dict(event)
                 resp = data.get("response") or {}
                 if isinstance(resp, dict) and resp.get("id") and not response_id:

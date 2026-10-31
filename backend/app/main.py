@@ -6,6 +6,12 @@ Serves the mobile web UI at / and the session API:
   POST /api/session/check-now run one Sense->Reason->Instruct->Verify turn
   POST /api/session/check-now/stream same turn as server-sent events
   POST /api/answer/stream       free-form spoken answer as SSE tokens
+  POST /api/coach/ask           one Learning coach turn (memory + tools)
+  POST /api/coach/ask/stream    same coach turn as SSE tokens (early speech)
+  POST /api/coach/nudge         maybe nudge an idle learner (null when silent)
+  POST /api/coach/confirm       resolve a pending gated tool (409: none)
+  GET  /api/coach/killswitch    kill switch state
+  POST /api/coach/killswitch    trip or re-arm the kill switch
   GET  /api/camera/latest    latest overhead frame (JPEG/PNG)
   GET  /api/frames/{name}     one saved analysis still (evidence)
   POST /api/voice/transcribe transcribe push-to-talk audio upload
@@ -22,6 +28,10 @@ Serves the mobile web UI at / and the session API:
   POST /discover/upload       save an equipment photo for /discover/parts
   POST /diagnose              start a learning session (mode="learning")
   POST /project/{id}/code     firmware (final when DONE, draft on request)
+  GET  /project/{id}/step/{n}/code one step's sketch (template, patient, model)
+  GET  /project/{id}/step/{n}/schematic progressive wiring netlist + SVG
+  POST /project/{id}/step/{n}/flash flash one step sketch to ESP32 (explicit tap)
+  GET  /api/patient-sketch       patient board sketch text for copy-paste flash
 
 Run from the repo root:
   uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
@@ -33,7 +43,9 @@ import base64
 import json
 import os
 import queue
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -48,8 +60,16 @@ from .adapters import MetaAPIError, mock_meta_enabled  # noqa: E402
 from .adapters.sam_adapter import DEFAULT_VIDEO_MIME  # noqa: E402
 from .agent_orchestrator import AgentOrchestrator, _probe_summary  # noqa: E402
 from .camera_client import CameraError  # noqa: E402
+from .coach import (  # noqa: E402
+    CoachKilledError,
+    CoachSession,
+    coach_killed,
+    rails_config,
+    sanitize_session_id,
+    set_killswitch,
+)
 from .discovery import detect_parts, plan_projects, understand_scene  # noqa: E402
-from .learning import generate_code  # noqa: E402
+from .learning import generate_code, generate_step_code, read_patient_sketch  # noqa: E402
 from .live import LiveGuide, clean_coach_text  # noqa: E402
 from .models import CheckNowRequest, StartSessionRequest  # noqa: E402
 from .prompts import LIVE_SYSTEM, live_guidance_prompt  # noqa: E402
@@ -60,7 +80,20 @@ FRONTEND = ROOT / "frontend"
 MAX_CLIP_BYTES = 12 * 1024 * 1024
 MAX_UPLOAD_BYTES = 6 * 1024 * 1024
 
-app = FastAPI(title="FundiLoop")
+@asynccontextmanager
+async def _lifespan(app):
+    # Warm the TTS engine off the request path: the first spoken turn
+    # otherwise pays the ~7s Kokoro model load mid-conversation.
+    try:
+        from .tts import warmup_kokoro
+    except Exception:
+        warmup_kokoro = None
+    if warmup_kokoro is not None:
+        threading.Thread(target=warmup_kokoro, daemon=True).start()
+    yield
+
+
+app = FastAPI(title="FundiLoop", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -75,17 +108,21 @@ live_guide = LiveGuide()
 # -- frontend -------------------------------------------------------------
 @app.get("/")
 def index():
-    return FileResponse(str(FRONTEND / "index.html"), media_type="text/html")
+    return FileResponse(str(FRONTEND / "index.html"), media_type="text/html",
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/app.js")
 def app_js():
-    return FileResponse(str(FRONTEND / "app.js"), media_type="text/javascript")
+    return FileResponse(str(FRONTEND / "app.js"),
+                        media_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/style.css")
 def style_css():
-    return FileResponse(str(FRONTEND / "style.css"), media_type="text/css")
+    return FileResponse(str(FRONTEND / "style.css"), media_type="text/css",
+                        headers={"Cache-Control": "no-store"})
 
 
 # -- API ------------------------------------------------------------------
@@ -115,8 +152,11 @@ def api_status():
         "voice_model": os.environ.get("VOICE_MODEL", "muse-voice-transcribe-1.0"),
         "voice_live": not orchestrator.voice.mock,
         "tts_mode": "mock" if mock_meta_enabled() else "real",
+        "tts_provider": os.environ.get("TTS_PROVIDER", "meta").strip().lower() or "meta",
         "tts_model": os.environ.get("TTS_MODEL", "muse-voice-tts-1.0"),
         "tts_voice": os.environ.get("META_TTS_VOICE", "warm-female"),
+        "coach_gate_strict": rails_config()["gate_strict"],
+        "coach_killed": coach_killed(),
     }
     return view
 
@@ -255,6 +295,142 @@ def api_answer_stream(body: dict):
                            str(body.get("step_text") or ""),
                            str(body.get("mode") or "GUIDED_ASSEMBLY")),
         media_type="text/event-stream")
+
+
+_COACH_SESSIONS: dict = {}
+_COACH_SESSION_CAP = 32
+
+
+def _coach_session(session_id: str = ""):
+    """Return (session, id) for one remembered web conversation.
+
+    Ids are sanitized (safe as dict keys and filenames); missing ones
+    mint. Unknown ids restore from disk when a saved file exists, else
+    start fresh. Oldest ids evict past the cap. Single user, no auth.
+    """
+    sid = sanitize_session_id(session_id)
+    if sid in _COACH_SESSIONS:
+        return _COACH_SESSIONS[sid], sid
+    _COACH_SESSIONS[sid] = CoachSession(session_id=sid)
+    while len(_COACH_SESSIONS) > _COACH_SESSION_CAP:
+        _COACH_SESSIONS.pop(next(iter(_COACH_SESSIONS)))
+    return _COACH_SESSIONS[sid], sid
+
+
+@app.post("/api/coach/ask")
+def api_coach_ask(body: dict):
+    """One Learning coach turn through the shared brain (memory + tools)."""
+    session, sid = _coach_session(str((body or {}).get("session_id") or ""))
+    try:
+        out = session.ask(str((body or {}).get("text") or ""))
+    except CoachKilledError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except MetaAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"reply": out["reply"], "tool_calls": out["tool_calls"],
+            "confirmation_pending": out["confirmation_pending"],
+            "session_id": sid, "mock": bool(session.Muse.mock)}
+
+
+def iter_coach_events(session_id: str, text: str):
+    """Yield SSE frames for one coach turn: ack -> tool_call/tool_result ->
+    token* -> done (reply + tool_calls) or error (real model detail).
+
+    Tokens replay the decided reply incrementally (the JSON decision must
+    validate whole before anything speaks); the frontend speaks clauses
+    as they land, which is where early speech comes from.
+    """
+    session, sid = _coach_session(session_id)
+    yield _sse("ack", {"status": "answering", "session_id": sid})
+    try:
+        events = list(session.ask_stream(text))
+    except MetaAPIError as exc:
+        yield _sse("error", {"detail": str(exc)})
+        return
+    for event in events:
+        kind = event.get("event")
+        if kind == "tool_call":
+            yield _sse("tool_call", {"name": event.get("name"),
+                                     "args": event.get("args")})
+        elif kind == "tool_result":
+            yield _sse("tool_result", {"name": event.get("name"),
+                                       "ok": event.get("ok")})
+        elif kind == "confirmation_pending":
+            yield _sse("confirmation_pending", {
+                "call_id": event.get("call_id"), "tool": event.get("tool"),
+                "args": event.get("args"), "question": event.get("question"),
+                "risk": event.get("risk")})
+        elif kind == "token":
+            yield _sse("token", {"text": event.get("text", "")})
+        elif kind == "done":
+            reply = event.get("reply", "")
+            yield _sse("done", {"reply": reply, "text": reply,
+                                "session_id": sid,
+                                "tool_calls": event.get("tool_calls", []),
+                                "confirmation_pending": event.get(
+                                    "confirmation_pending")})
+
+
+@app.post("/api/coach/ask/stream")
+def api_coach_ask_stream(body: dict):
+    """Same coach turn as SSE tokens (cook-mode ask path: early speech)."""
+    return StreamingResponse(
+        iter_coach_events(str((body or {}).get("session_id") or ""),
+                          str((body or {}).get("text") or "")),
+        media_type="text/event-stream")
+
+
+@app.post("/api/coach/nudge")
+def api_coach_nudge(body: dict):
+    """Maybe nudge an idle learner; quiet by default (null when silent).
+
+    Body: {"session_id", "idle_seconds", "step_label", "step_text"}.
+    Heartbeat failures stay silent: the caller only acts on a nudge.
+    """
+    session, sid = _coach_session(str((body or {}).get("session_id") or ""))
+    try:
+        nudge = session.nudge((body or {}).get("idle_seconds", 0),
+                              str((body or {}).get("step_label") or ""),
+                              step_text=str((body or {}).get("step_text") or ""))
+    except CoachKilledError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except MetaAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"nudge": nudge, "session_id": sid}
+
+
+@app.post("/api/coach/confirm")
+def api_coach_confirm(body: dict):
+    """Resolve a pending gated tool (409 when none matches)."""
+    session, sid = _coach_session(str((body or {}).get("session_id") or ""))
+    try:
+        out = session.confirm(str((body or {}).get("call_id") or ""),
+                              bool((body or {}).get("confirmed")))
+    except CoachKilledError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except MetaAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"reply": out["reply"], "tool_calls": out["tool_calls"],
+            "confirmation_pending": out["confirmation_pending"],
+            "session_id": sid, "mock": bool(session.Muse.mock)}
+
+
+@app.get("/api/coach/killswitch")
+def api_coach_killswitch_get():
+    """Kill switch state (persisted)."""
+    return {"tripped": coach_killed()}
+
+
+@app.post("/api/coach/killswitch")
+def api_coach_killswitch(body: dict):
+    """Trip or re-arm the kill switch. Audited either way."""
+    tripped = (body or {}).get("tripped")
+    if not isinstance(tripped, bool):
+        raise HTTPException(status_code=400,
+                            detail="killswitch needs {\"tripped\": bool}")
+    return set_killswitch(tripped, actor="web")
 
 
 @app.post("/api/session/check-now/stream")
@@ -483,6 +659,153 @@ def api_project_code(session_id: str, body: dict | None = None):
     steps = (session.get("verified") or {}).get("steps", [])
     return {"session_id": session_id, "code": code, "verified": verified,
             "steps_passed": len(steps), "steps_total": len(session.get("plan", []))}
+
+
+@app.get("/project/{session_id}/step/{step_n}/code")
+def api_step_code(session_id: str, step_n: int):
+    """Return one step's sketch: instant template when known, else model."""
+    session = orchestrator.sessions.get(session_id)
+    if session is None or not session.get("learning"):
+        raise HTTPException(status_code=404, detail="unknown learning session id")
+    steps = session.get("plan", []) or []
+    step = next((s for s in steps
+                 if isinstance(s, dict) and s.get("n") == step_n), None)
+    if step is None:
+        raise HTTPException(status_code=404, detail="unknown step %d" % step_n)
+    try:
+        code, source = generate_step_code(session, step, orchestrator.Muse)
+    except MetaAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"session_id": session_id, "n": step_n,
+            "verify": step.get("verify", ""), "code": code, "source": source}
+
+
+@app.get("/project/{session_id}/step/{step_n}/schematic")
+def api_step_schematic(session_id: str, step_n: int):
+    """Progressive wiring schematic for one learning step (ESP32 only).
+
+    Step N shows every part the plan needs up to and including N, so the
+    last step is the full project. Unknown parts render "unresolved"
+    with a reason; wiring is never invented.
+    """
+    from .schematic import build_netlist, render_svg
+
+    session = orchestrator.sessions.get(session_id)
+    if session is None or not session.get("learning"):
+        raise HTTPException(status_code=404, detail="unknown learning session id")
+    if session.get("board") != "esp32_devkit":
+        raise HTTPException(
+            status_code=400,
+            detail="schematic supports ESP32 only (session board: %s)"
+            % (session.get("board") or "?"))
+    steps = session.get("plan", []) or []
+    step = next((s for s in steps
+                 if isinstance(s, dict) and s.get("n") == step_n), None)
+    if step is None:
+        raise HTTPException(status_code=404, detail="unknown step %d" % step_n)
+    netlist = build_netlist(steps, step_n, session.get("pin_map", {}) or {})
+    return {"session_id": session_id, "n": step_n,
+            "netlist": netlist, "svg": render_svg(netlist, step_n),
+            "unresolved": netlist["unresolved"]}
+
+
+@app.post("/project/{session_id}/step/{step_n}/flash")
+def api_step_flash(session_id: str, step_n: int, body: dict | None = None):
+    """Flash one step's sketch to the ESP32 (explicit user action only).
+
+    Compile/cache -> release both probe handles -> esptool write_flash
+    at the build offsets -> re-probe PING. Every flash is audit-logged.
+    The port is always user-picked (never automatic); a step sketch is
+    not patient firmware, so a silent PING re-probe is reported, not a
+    failure.
+    """
+    from .firmware_build import compile_sketch
+    from .firmware_flash import (
+        audit_flash,
+        busy_port_guidance,
+        check_port,
+        flash_artifacts,
+        is_busy_port,
+        settle_before_ping,
+        verify_ping,
+    )
+
+    session = orchestrator.sessions.get(session_id)
+    if session is None or not session.get("learning"):
+        raise HTTPException(status_code=404, detail="unknown learning session id")
+    if session.get("board") != "esp32_devkit":
+        raise HTTPException(
+            status_code=400,
+            detail="flash supports ESP32 only (session board: %s)"
+            % (session.get("board") or "?"))
+    steps = session.get("plan", []) or []
+    step = next((s for s in steps
+                 if isinstance(s, dict) and s.get("n") == step_n), None)
+    if step is None:
+        raise HTTPException(status_code=404, detail="unknown step %d" % step_n)
+    port = str((body or {}).get("port") or "").strip()
+    if not port:
+        raise HTTPException(
+            status_code=400,
+            detail="flash needs an explicit port: pick one, then FLASH ESP32")
+    pre = check_port(port)
+    if not pre["ok"]:
+        audit_flash(session_id, step_n, port, "", False,
+                    "port_busy", pre["detail"])
+        raise HTTPException(
+            status_code=409,
+            detail="%s\n(%s)" % (busy_port_guidance(port), pre["detail"]))
+    try:
+        code, source = generate_step_code(session, step, orchestrator.Muse)
+    except MetaAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    if not code:
+        raise HTTPException(
+            status_code=409,
+            detail="step %d code unavailable: nothing to flash" % step_n)
+    build = compile_sketch(code)
+    if not build["ok"]:
+        audit_flash(session_id, step_n, port, build["build_hash"], False,
+                    "compile_failed", build["log_excerpt"])
+        raise HTTPException(
+            status_code=500,
+            detail="compile failed: %s" % build["log_excerpt"])
+    # esptool needs the port exclusively: drop both probe handles first.
+    orchestrator.probe.close()
+    live_guide.probe.close()
+    flashed = flash_artifacts(build["artifacts"], port)
+    if flashed["ok"]:
+        settle_before_ping(orchestrator.probe)
+        ping = verify_ping(orchestrator.probe)
+    else:
+        ping = {"answered": False, "reply": "skipped: flash failed"}
+    audit_flash(session_id, step_n, port, build["build_hash"],
+                flashed["ok"], "flashed" if flashed["ok"] else "flash_failed",
+                flashed["log_excerpt"])
+    if not flashed["ok"]:
+        detail = flashed["log_excerpt"]
+        if is_busy_port(detail):
+            detail = busy_port_guidance(port) + "\n" + detail
+        raise HTTPException(status_code=500,
+                            detail="flash failed: %s" % detail)
+    return {"ok": True, "session_id": session_id, "n": step_n,
+            "build_hash": build["build_hash"], "port": port,
+            "verify_ping": ping, "cached": build["cached"],
+            "source": source}
+
+
+@app.get("/api/patient-sketch")
+def api_patient_sketch():
+    """Serve the patient board sketch text for copy-paste flashing."""
+    try:
+        code = read_patient_sketch()
+    except OSError:
+        raise HTTPException(
+            status_code=404,
+            detail="patient sketch not found in firmware/patient_board")
+    if not code.strip():
+        raise HTTPException(status_code=404, detail="patient sketch is empty")
+    return {"filename": "patient_board.ino", "code": code}
 
 
 @app.post("/discover/capture")

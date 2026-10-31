@@ -65,8 +65,10 @@ class MetaClaudeAdapter:
 
             with self._client_lock:
                 if self._client is None:
+                    # No SDK retries: the app owns retry policy, and client
+                    # retries multiply tail latency (30s -> 90s hangs).
                     self._client = OpenAI(base_url=api_base_url(), api_key=api_key(),
-                                          timeout=api_timeout())
+                                          timeout=api_timeout(), max_retries=0)
         return self._client
 
     def decide(self, context: dict) -> AgentDecision:
@@ -96,13 +98,16 @@ class MetaClaudeAdapter:
     def complete_text_stream(self, system: str, user: str,
                              image_b64: str | None = None,
                              video_b64: str | None = None,
-                             video_mime: str = "video/mp4"):
+                             video_mime: str = "video/mp4",
+                             deadline_s: float | None = None):
         """Yield free-form answer tokens as they arrive (prose, no JSON mode).
 
         Nothing depends on streaming existing: when the stream cannot even
         start, the full completion is yielded once instead. A failure after
         the first token raises MetaAPIError — the caller keeps the partial
-        text already yielded. Mock mode yields "{}" once.
+        text already yielded. Mock mode yields "{}" once. The total stream
+        wall time is capped (default api_timeout): a stalled stream raises
+        instead of hanging for minutes.
         """
         import time
 
@@ -116,6 +121,7 @@ class MetaClaudeAdapter:
         messages = self._complete_messages(system, user, image_b64,
                                            video_b64, video_mime)
         started = time.monotonic()
+        limit = api_timeout() if deadline_s is None else deadline_s
         parts: list[str] = []
         try:
             client = self._api_client()
@@ -123,6 +129,9 @@ class MetaClaudeAdapter:
                 model=self.model, messages=messages, stream=True)
             try:
                 for event in stream:
+                    if time.monotonic() - started > limit:
+                        raise TimeoutError(
+                            "Muse stream exceeded its total deadline")
                     text = self._chunk_text(event)
                     if text:
                         parts.append(text)

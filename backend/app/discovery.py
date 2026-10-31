@@ -17,6 +17,7 @@ from pathlib import Path
 from .adapters.muse_adapter import MetaClaudeAdapter
 from .adapters.sam_adapter import MetaSAMAdapter
 from .capabilities import AVAILABLE_TESTS, KNOWN_PARTS, SAM_PROMPT_PARTS
+from .frames import prepare_frame
 from .prompts import plan_retry_suffix, plan_system_prompt, scene_system_prompt
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -57,17 +58,20 @@ def _empty_scene(reason: str) -> dict:
 
 
 def _ground_prompts(sam, frame: bytes, frame_path: str,
-                    prompts: list[str]) -> list[dict]:
+                    prompts: list[str]) -> tuple[list[dict], list[str]]:
     """One SAM call per prompt, overlapped; results in prompt order.
 
-    ex.map preserves input order and raises the first worker exception,
-    so the merged scene is identical to the sequential loop at roughly
-    1/8th of the wall time.
+    ex.map preserves input order at roughly 1/8th of the wall time.
+    Returns (results, failed_prompts): one flaky prompt degrades to
+    empty boxes instead of failing the whole scene.
     """
 
     def one(prompt: str) -> dict:
-        out = sam.analyze(frame, frame_path=frame_path,
-                          concepts=[(prompt, prompt)])
+        try:
+            out = sam.analyze(frame, frame_path=frame_path,
+                              concepts=[(prompt, prompt)])
+        except Exception:
+            return {"prompt": prompt, "boxes": [], "failed": True}
         boxes = [{"label": d.get("label", prompt), "box": d.get("box"),
                   "confidence": d.get("confidence", 0.0),
                   **({"mask": d["mask_svg"]} if d.get("mask_svg") else {})}
@@ -77,7 +81,9 @@ def _ground_prompts(sam, frame: bytes, frame_path: str,
     workers = max(1, min(8, len(prompts)))
     with ThreadPoolExecutor(max_workers=workers,
                             thread_name_prefix="fundiloop-sam") as ex:
-        return list(ex.map(one, prompts))
+        results = list(ex.map(one, prompts))
+    failed = [r["prompt"] for r in results if r.get("failed")]
+    return results, failed
 
 
 def understand_scene(frame_path: str) -> dict:
@@ -86,9 +92,13 @@ def understand_scene(frame_path: str) -> dict:
     Never raises on model or parse failure: uncertainties explains.
     """
     try:
-        frame, b64 = _read_frame(frame_path)
+        frame, _ = _read_frame(frame_path)
     except Exception as exc:
         return _empty_scene("cannot read frame: %s" % exc)
+    # Muse reads the same 448px still SAM segments (identity without
+    # OpenCV): shipping the full frame only burns upload bytes and
+    # vision time on every analysis.
+    b64 = base64.b64encode(prepare_frame(frame).payload).decode("ascii")
     prompts: list[str] = []
     for part in SAM_PROMPT_PARTS + ["jumper wire", "breadboard"]:
         phrase = part.replace("_", " ")
@@ -96,7 +106,7 @@ def understand_scene(frame_path: str) -> dict:
             prompts.append(phrase)
     sam = MetaSAMAdapter()
     try:
-        sam_results = _ground_prompts(sam, frame, frame_path, prompts)
+        sam_results, sam_failed = _ground_prompts(sam, frame, frame_path, prompts)
     except Exception as exc:
         return _empty_scene("discovery unavailable: %s" % exc)
     empty = [r["prompt"] for r in sam_results if not r["boxes"]]
@@ -122,6 +132,9 @@ def understand_scene(frame_path: str) -> dict:
     except Exception:
         return _empty_scene("scene understanding failed: %s" % raw[:200])
     parts, uncertainties = [], list(data.get("uncertainties") or [])
+    if sam_failed:
+        uncertainties.append("SAM prompt(s) failed, read from the frame only: "
+                             + ", ".join(sorted(sam_failed)))
     sam_labels = [(r["prompt"], b) for r in sam_results for b in r["boxes"]]
     for entry in data.get("visible_parts") or []:
         if not isinstance(entry, dict) or not entry.get("name"):
@@ -205,6 +218,37 @@ def validate_project(proj: dict, visible: list[str]) -> list[str]:
     return reasons
 
 
+def _request_miss_hint(user_project: str | None, visible: list[str],
+                       valid: list, rejected: list) -> str:
+    """Explain when the user's requested build is not among the plans.
+
+    Returns "" when there was no request, when the request is too short
+    to judge, or when a valid title shares a content word with it.
+    Otherwise names why (validator reasons when the request was
+    rejected, else the visible parts to rephrase with) so a fallback
+    project never arrives unexplained.
+    """
+    want = str(user_project or "").strip()
+    if not want:
+        return ""
+    sig = [w for w in re.findall(r"[a-z0-9]+", want.lower()) if len(w) > 3]
+    if not sig:
+        return ""
+    titles = " ".join(str(p.get("title", "")) for p in valid
+                      if isinstance(p, dict)).lower()
+    if any(word in titles for word in sig):
+        return ""
+    reasons = [r for entry in (rejected or [])
+               for r in (entry.get("reasons") or [])][:2]
+    if reasons:
+        return ("Couldn't plan '%s' with the visible parts (%s). Showing "
+                "buildable projects instead — add the missing parts and tap "
+                "SUGGEST again." % (want, "; ".join(reasons)))
+    return ("Couldn't match '%s' to a buildable plan. Showing buildable "
+            "projects instead — try describing it with the visible parts: "
+            "%s." % (want, ", ".join(visible) or "none"))
+
+
 def plan_projects(visible_parts: list[str], user_project: str | None = None,
                   constraints: str | None = None, connections_observed: list | None = None,
                   uncertainties: list | None = None,
@@ -227,7 +271,7 @@ def plan_projects(visible_parts: list[str], user_project: str | None = None,
         except Exception as exc:
             reasons = ["attempt %d: %s" % (attempt, exc)]
             rejected.append({"attempt": attempt, "title": "", "reasons": reasons})
-            user_msg = base_user + "\n" + plan_retry_suffix(reasons)
+            user_msg = base_user + "\n" + plan_retry_suffix(reasons, user_project)
             continue
         valid: list[dict] = []
         for proj in projects:
@@ -240,7 +284,12 @@ def plan_projects(visible_parts: list[str], user_project: str | None = None,
                 proj["session_id"] = session_id
                 valid.append(proj)
         if valid:
-            return {"projects": valid, "rejected_plans": rejected}
+            result = {"projects": valid, "rejected_plans": rejected}
+            miss = _request_miss_hint(user_project, visible, valid, rejected)
+            if miss:
+                result["hint"] = miss
+            return result
         user_msg = base_user + "\n" + plan_retry_suffix(
-            [r for entry in rejected if entry["attempt"] == attempt for r in entry["reasons"]])
+            [r for entry in rejected if entry["attempt"] == attempt for r in entry["reasons"]],
+            user_project)
     return {"projects": [], "rejected_plans": rejected}

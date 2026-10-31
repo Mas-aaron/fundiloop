@@ -6,3 +6,7 @@ venv/
 .DS_Store
 backend/data/debug_frames/
 backend/data/logs/
+backend/data/coach_memory/
+backend/data/kokoro/
+backend/data/firmware_builds/
+backend/logs/

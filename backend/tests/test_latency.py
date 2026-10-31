@@ -170,6 +170,9 @@ class ClientReuseTest(unittest.TestCase):
             adapter.decide({"probe": ProbeReading(connected=True)})
             adapter.decide({"probe": ProbeReading(connected=True)})
         self.assertEqual(len(made), 1)
+        # Client-level retries multiply tail latency (30s -> 90s); the app
+        # owns its retry policy, so the SDK must not retry on its own.
+        self.assertEqual(made[0].get("max_retries"), 0)
 
     def test_sam_client_reused_across_analyzes(self):
         install_sam_parser_stub(
@@ -185,6 +188,7 @@ class ClientReuseTest(unittest.TestCase):
             adapter.analyze(b"fakejpeg", concepts=[("duck", "duck")])
             adapter.analyze(b"fakejpeg", concepts=[("duck", "duck")])
         self.assertEqual(len(made), 1)
+        self.assertEqual(made[0].get("max_retries"), 0)
 
 
 class StreamEndpointTest(unittest.TestCase):

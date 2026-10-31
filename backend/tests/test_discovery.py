@@ -224,6 +224,25 @@ class DiscoveryTest(unittest.TestCase):
         # Sequential wall time is physically >= the sum of the sleeps.
         self.assertLess(wall, len(enters) * 0.3)
 
+    def test_sam_prompt_failure_degrades_gracefully(self):
+        base = FakeSAM([{"label": "esp32", "box": [1, 2, 3, 4],
+                         "confidence": 0.9}])
+        real_analyze = base.analyze
+
+        def flaky(frame, context=None, frame_path=None, concepts=None):
+            if concepts == [("led", "led")]:
+                raise RuntimeError("sam hiccup")
+            return real_analyze(frame, context=context,
+                                frame_path=frame_path, concepts=concepts)
+
+        base.analyze = flaky
+        Muse = FakeClaude([scene_json([part("esp32")])])
+        self.patch_clients(base, Muse)
+        out = discovery.understand_scene(self.frame_path)  # must not raise
+        self.assertIn("esp32", [p["name"] for p in out["visible_parts"]])
+        self.assertTrue(any("led" in u for u in out["uncertainties"]),
+                        out["uncertainties"])
+
     def test_understand_scene_muse_failure_returns_uncertainties(self):
         class FailingClaude(FakeClaude):
             def complete_text(self, system, user, image_b64=None):
@@ -233,6 +252,29 @@ class DiscoveryTest(unittest.TestCase):
         out = discovery.understand_scene(self.frame_path)  # must not raise
         self.assertEqual(out["visible_parts"], [])
         self.assertTrue(any("discovery unavailable" in u for u in out["uncertainties"]))
+
+    def test_scene_image_ships_downscaled(self):
+        import base64
+
+        from backend.app.frames import PreparedFrame
+
+        small = b"\xff\xd8smallthumb"
+        seen = {}
+
+        class CapturingClaude(FakeClaude):
+            def complete_text(self, system, user, image_b64=None):
+                seen["image_b64"] = image_b64
+                return super().complete_text(system, user,
+                                             image_b64=image_b64)
+
+        Muse = CapturingClaude([scene_json([part("esp32")])])
+        self.patch_clients(FakeSAM([]), Muse)
+        tiny = PreparedFrame(small, 100, 100, 100, 100, True)
+        with mock.patch("backend.app.discovery.prepare_frame",
+                        return_value=tiny):
+            discovery.understand_scene(self.frame_path)
+        # The scene call carries the 448px still, never the full upload.
+        self.assertEqual(base64.b64decode(seen["image_b64"]), small)
 
     # -- endpoints ----------------------------------------------------
     def test_discover_parts_backward_compatible(self):
@@ -261,6 +303,89 @@ class DiscoveryTest(unittest.TestCase):
             connections_observed=[{"from": "bme280", "to": "esp32"}],
             uncertainties=["wire route unclear"])
         self.assertIn("observed connections", Muse.calls[0]["system"])
+
+    # -- user request is honored, never silently swapped --------------
+    def test_plan_prompt_requires_requested_build_first(self):
+        from backend.app.prompts import plan_system_prompt
+
+        from backend.app.capabilities import AVAILABLE_TESTS
+
+        system = plan_system_prompt(AVAILABLE_TESTS, ["esp32"], [], [],
+                                    "weather station", None, None)
+        self.assertIn("FIRST project MUST be", system)
+        self.assertIn("weather station", system)
+        free = plan_system_prompt(AVAILABLE_TESTS, ["esp32"], [], [],
+                                  None, None, None)
+        self.assertNotIn("FIRST project MUST be", free)
+
+    def test_plan_retry_keeps_user_project(self):
+        bad = json.dumps({"projects": [{
+            "id": "p1", "title": "Magic", "summary": "s",
+            "steps": [{"n": 1, "instruction": "wave wand",
+                       "verify": "MAGIC_TEST", "expect": {},
+                       "depends_on_parts": ["esp32"]}],
+            "missing_parts": [], "alternatives": []}]})
+        good = json.dumps({"projects": [{
+            "id": "p1", "title": "Magic wand", "summary": "s",
+            "steps": [{"n": 1, "instruction": "blink",
+                       "verify": "CHECK_GPIO", "expect": {},
+                       "depends_on_parts": ["led"]}],
+            "missing_parts": [], "alternatives": []}]})
+        Muse = FakeClaude([bad, good])
+        self.patch_clients(FakeSAM([]), Muse)
+        res = discovery.plan_projects(["esp32", "led"], "magic wand", None)
+        self.assertEqual(len(res["projects"]), 1)
+        self.assertIn("without swapping", Muse.calls[1]["user"])
+        self.assertIn("magic wand", Muse.calls[1]["user"])
+
+    def test_plan_hint_when_request_unmatched(self):
+        plan = json.dumps({"projects": [{
+            "id": "p1", "title": "Blink", "summary": "s",
+            "steps": [{"n": 1, "instruction": "blink",
+                       "verify": "CHECK_GPIO", "expect": {},
+                       "depends_on_parts": ["led"]}],
+            "missing_parts": [], "alternatives": []}]})
+        Muse = FakeClaude([plan])
+        self.patch_clients(FakeSAM([]), Muse)
+        res = discovery.plan_projects(["esp32", "led"], "weather station",
+                                      None)
+        self.assertEqual(len(res["projects"]), 1)
+        self.assertIn("weather station", res["hint"])
+        self.assertIn("esp32", res["hint"])
+
+    def test_plan_no_hint_when_request_covered(self):
+        plan = json.dumps({"projects": [{
+            "id": "wx", "title": "Weather Station", "summary": "s",
+            "steps": [{"n": 1, "instruction": "read sensor",
+                       "verify": "READ_SENSOR", "expect": {},
+                       "depends_on_parts": ["bme280"]}],
+            "missing_parts": [], "alternatives": []}]})
+        Muse = FakeClaude([plan])
+        self.patch_clients(FakeSAM([]), Muse)
+        res = discovery.plan_projects(["esp32", "bme280"], "weather station",
+                                      None)
+        self.assertEqual(len(res["projects"]), 1)
+        self.assertNotIn("hint", res)
+
+    def test_plan_hint_carries_rejection_reasons(self):
+        bad = json.dumps({"projects": [{
+            "id": "p1", "title": "Servo arm", "summary": "s",
+            "steps": [{"n": 1, "instruction": "wire servo",
+                       "verify": "CHECK_GPIO", "expect": {},
+                       "depends_on_parts": ["servo"]}],
+            "missing_parts": [], "alternatives": []}]})
+        good = json.dumps({"projects": [{
+            "id": "p1", "title": "Blink", "summary": "s",
+            "steps": [{"n": 1, "instruction": "blink",
+                       "verify": "CHECK_GPIO", "expect": {},
+                       "depends_on_parts": ["led"]}],
+            "missing_parts": [], "alternatives": []}]})
+        Muse = FakeClaude([bad, good])
+        self.patch_clients(FakeSAM([]), Muse)
+        res = discovery.plan_projects(["esp32", "led"], "servo arm", None)
+        self.assertEqual(len(res["projects"]), 1)
+        self.assertIn("servo", res["hint"])
+        self.assertIn("visible parts", res["hint"])
 
 
 TEST_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 128

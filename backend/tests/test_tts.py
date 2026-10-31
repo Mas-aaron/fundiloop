@@ -1,8 +1,8 @@
-"""Project-wide Meta Voice TTS: server speech with browser fallback.
+"""Meta TTS provider (TTS_PROVIDER=meta): cloud speech with browser fallback.
 
-Primary speech path is POST /api/voice/speak (Meta Voice TTS, warm female
-voice). The frontend falls back to default browser speechSynthesis per
-utterance when the server path fails, then retries Meta next turn.
+Covers the Meta engine behind POST /api/voice/speak. Every factory and
+endpoint test pins TTS_PROVIDER=meta so a kokoro-configured .env can
+never leak in. Kokoro coverage lives in test_tts_kokoro.py.
 
 Run from the repo root:
   backend\\.venv\\Scripts\\python.exe -m unittest backend.tests.test_tts -v
@@ -75,7 +75,8 @@ class TTSProviderTests(unittest.TestCase):
     def test_mock_returns_valid_wav(self):
         from backend.app.tts import get_provider
 
-        with mock.patch.dict(os.environ, {"MOCK_META": "true"}):
+        with mock.patch.dict(os.environ, {"MOCK_META": "true",
+                                          "TTS_PROVIDER": "meta"}):
             audio = get_provider().synthesize("hello there")
         self.assertTrue(audio.startswith(b"RIFF"))
         with wave.open(io.BytesIO(audio), "rb") as wf:
@@ -86,7 +87,8 @@ class TTSProviderTests(unittest.TestCase):
     def test_mock_speakable_text_unchanged(self):
         from backend.app.tts import get_provider
 
-        with mock.patch.dict(os.environ, {"MOCK_META": "true"}):
+        with mock.patch.dict(os.environ, {"MOCK_META": "true",
+                                          "TTS_PROVIDER": "meta"}):
             a = get_provider().synthesize("hello")
             b = get_provider().synthesize("hello", voice="other-voice")
         # Mock voice is a no-op: same silence either way, never an error.
@@ -96,7 +98,8 @@ class TTSProviderTests(unittest.TestCase):
         from backend.app.adapters import MetaAPIError
         from backend.app.tts import get_provider
 
-        with mock.patch.dict(os.environ, {"MOCK_META": "false"}):
+        with mock.patch.dict(os.environ, {"MOCK_META": "false",
+                                          "TTS_PROVIDER": "meta"}):
             with self.assertRaises(MetaAPIError):
                 get_provider().synthesize("hi")
 
@@ -181,7 +184,8 @@ class VoiceSpeakEndpointTests(unittest.TestCase):
     def test_mock_returns_audio_response(self):
         import backend.app.main as app_main
 
-        with mock.patch.dict(os.environ, {"MOCK_META": "true"}):
+        with mock.patch.dict(os.environ, {"MOCK_META": "true",
+                                          "TTS_PROVIDER": "meta"}):
             resp = app_main.api_voice_speak({"text": "hello"})
         self.assertEqual(resp.media_type, "audio/wav")
         self.assertTrue(bytes(resp.body).startswith(b"RIFF"))
@@ -199,7 +203,8 @@ class VoiceSpeakEndpointTests(unittest.TestCase):
         import backend.app.main as app_main
         from fastapi import HTTPException
 
-        with mock.patch.dict(os.environ, {"MOCK_META": "false", "META_API_KEY": ""}):
+        with mock.patch.dict(os.environ, {"MOCK_META": "false", "META_API_KEY": "",
+                                          "TTS_PROVIDER": "meta"}):
             with self.assertRaises(HTTPException) as ctx:
                 app_main.api_voice_speak({"text": "hi"})
         self.assertEqual(ctx.exception.status_code, 502)

@@ -55,6 +55,17 @@ def _mock_enabled() -> bool:
     return mock_meta_enabled()
 
 
+def _is_usb_port(info: dict) -> bool:
+    """True when a listed port smells like a USB serial adapter.
+
+    USB enumeration carries "USB" in the hwid ("USB VID:PID=...") or
+    the description ("... USB to UART Bridge"); Bluetooth links
+    (BTHENUM) and legacy ports do not.
+    """
+    text = "%s %s" % (info.get("description", ""), info.get("hwid", ""))
+    return "USB" in text.upper()
+
+
 class SerialProbe:
     def __init__(
         self,
@@ -69,6 +80,7 @@ class SerialProbe:
         self.timeout = timeout if timeout is not None else _env_timeout()
         self.simulate_fault: str | None = None
         self.last_error: str = ""
+        self.last_scan_errors: dict[str, str] = {}
         self._ser = None  # persistent handle, opened lazily
 
     def configure(self, port: str | None = None, baud=None) -> dict:
@@ -88,25 +100,43 @@ class SerialProbe:
         return {"port": self.port, "baud": self.baud, "mock": self.mock,
                 "last_error": self.last_error}
 
-    def autodetect(self, timeout: float = 0.8) -> dict | None:
+    def autodetect(self, timeout: float = 0.8,
+                   exclude: tuple[str, ...] = ()) -> dict | None:
         """Find a port+baud answering the patient PING (explicit user action).
 
         Probes each listed port at the current baud first, then each known
         baud, with a short timeout, and adopts the first live one. Returns
-        {"port", "baud"} or None (original settings restored).
+        {"port", "baud"} or None (original settings restored). Ports in
+        `exclude` are skipped (already known dead by the caller). Each
+        scanned port's final failure is kept in `last_scan_errors`
+        (busy-vs-silent stays diagnosable after the scan). A port that
+        refuses to open is tried once: other bauds cannot fix that.
         """
         if self.mock:
             return None
         original_port, original_baud, original_timeout = (
             self.port, self.baud, self.timeout)
         self.timeout = min(timeout, self.timeout)
+        self.last_scan_errors = {}
         try:
             for info in list_serial_ports():
+                if info["port"] in exclude:
+                    continue
                 for baud in dict.fromkeys([original_baud, *KNOWN_BAUDS]):
                     self.close()
                     self.port, self.baud = info["port"], baud
-                    if "error" not in self.send("PING"):
+                    reply = self.send("PING")
+                    if "error" not in reply:
                         return {"port": self.port, "baud": self.baud}
+                    reason = str(reply["error"])
+                    if ": " in reason:  # strip the "PORT: " prefix we add
+                        reason = reason.split(": ", 1)[1]
+                    self.last_scan_errors[info["port"]] = reason
+                    if TIMEOUT_ERROR not in reason:
+                        # The port would not open at all: no baud will fix
+                        # that, so skip the remaining bauds for this port
+                        # instead of burning another open + timeout each.
+                        break
         finally:
             self.timeout = original_timeout
         self.close()
@@ -139,14 +169,18 @@ class SerialProbe:
         Real mode adapts to the equipment: when PING goes unanswered the
         probe retries it once per alternate known baud and adopts the
         first baud that answers (patient firmware at 115200, stock
-        Arduino sketches at 9600). When nothing answers anywhere, the
-        remaining commands short-circuit with instant honest errors
-        instead of burning a full timeout each.
+        Arduino sketches at 9600). When the configured port stays dead
+        it fails over to the first other listed port answering PING
+        (USB boards re-enumerate across COM ports freely). When nothing
+        answers anywhere, the remaining commands short-circuit with
+        instant honest errors instead of burning a full timeout each.
         """
         self.simulate_fault = simulate_fault
         ping = self.send("PING")
         if not self.mock and "error" in ping:
             ping = self._adopt_live_baud(ping)
+        if not self.mock and "error" in ping:
+            ping = self._adopt_live_port(ping)
         silent = not self.mock and "error" in ping
         replies = [ping]
         for command in ("I2C_SCAN", "READ_SENSOR", "SELFTEST"):
@@ -188,8 +222,12 @@ class SerialProbe:
 
         Returns the working PING reply, or the original failure when no
         baud answers. Retries use a short timeout so a dead board costs
-        one extra second per baud, not another full timeout each.
+        one extra second per baud, not another full timeout each. When
+        the port would not even open (no timeout marker), baud hunting
+        is skipped: reopening at 9600 fails exactly like 115200 did.
         """
+        if TIMEOUT_ERROR not in str(failed_ping.get("error", "")):
+            return failed_ping
         original_baud = self.baud
         original_timeout = self.timeout
         self.timeout = min(1.0, self.timeout)
@@ -207,6 +245,58 @@ class SerialProbe:
         self.close()
         self.baud = original_baud
         return failed_ping
+
+    def _adopt_live_port(self, failed_ping: dict) -> dict:
+        """Fail over to the first other listed port answering PING.
+
+        Returns a fresh PING reply on the adopted port, or the original
+        failure annotated with which ports were tried when nothing
+        answers anywhere. The failure also carries a "board_state"
+        classification (no_ports, no_usb, silent:<ports>, or
+        unreachable:<ports>) so callers can guide the technician
+        without another model round trip.
+        """
+        found = self.autodetect(timeout=0.5, exclude=(self.port,))
+        if found is not None:
+            return self.send("PING")
+        listed = list_serial_ports()
+        if not listed:
+            scan = "no serial ports found"
+            tried = [self.port]
+        else:
+            tried = [self.port, *(p["port"] for p in listed
+                                   if p["port"] != self.port)]
+            scan = "no PING reply on %s" % ", ".join(tried)
+            reasons = "; ".join(
+                "%s: %s" % (port, self.last_scan_errors[port][:64])
+                for port in tried if port in self.last_scan_errors)
+            if reasons:
+                scan += " [%s]" % reasons
+        failed_ping = dict(failed_ping)
+        orig = str(failed_ping.get("error", ""))
+        failed_ping["board_state"] = self._board_state(listed, tried, orig)
+        failed_ping["error"] = "%s (%s)" % (scan, orig)
+        self.last_error = "PING: %s" % failed_ping["error"]
+        return failed_ping
+
+    def _board_state(self, listed: list, tried: list, error: str) -> str:
+        """Classify a total PING failure for technician guidance.
+
+        A port that opens but never answers (our own timeout marker)
+        is "silent" (board needs the patient sketch); a USB-listed
+        port that will not open is "unreachable" (busy or blocked).
+        """
+        silent = [self.port] if TIMEOUT_ERROR in error else []
+        silent += [p for p in tried[1:]
+                   if self.last_scan_errors.get(p) == TIMEOUT_ERROR]
+        usb_ports = [p["port"] for p in listed if _is_usb_port(p)]
+        if not listed:
+            return "no_ports"
+        if silent:
+            return "silent:" + ",".join(silent)
+        if usb_ports:
+            return "unreachable:" + ",".join(usb_ports)
+        return "no_usb"
 
     # -- real serial ----------------------------------------------------
     def _real_send(self, command: str) -> dict:

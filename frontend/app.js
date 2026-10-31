@@ -18,17 +18,27 @@ let cameraConfigured = false;
 let voiceChoice = "";
 try { voiceChoice = localStorage.getItem("fundiloop-voice") || ""; } catch (e) { /* private mode */ }
 
-// Fallback voice: any English browser voice qualifies — an explicit pick
-// is always honored (even a robotic one), Auto takes the first English
-// voice, and no English voice means the default voice (null).
-function pickFallbackVoice(voices) {
+// Fallback voice ranking: an explicit pick always wins (even a robotic
+// one); otherwise prefer the most natural-sounding English voice so Auto
+// never settles for the cheap default. Never refuses: the last resort
+// is the first English voice, then the browser default (null).
+const FALLBACK_VOICE_PREFS = [/google us english/i, /google uk english female/i,
+  /google uk english/i, /natural/i, /neural/i, /premium/i, /enhanced/i,
+  /online/i, /google/i];
+function rankFallbackVoice(voices, choice) {
   const vs = (voices || []).filter((v) => v && v.lang && String(v.lang).toLowerCase().startsWith("en"));
-  if (voiceChoice) {
-    const named = vs.find((v) => v.name === voiceChoice);
+  if (choice) {
+    const named = vs.find((v) => v.name === choice);
     if (named) return named;
   }
-  if (!vs.length) return null;
-  return vs[0];
+  for (const p of FALLBACK_VOICE_PREFS) {
+    const hit = vs.find((v) => p.test(v.name || ""));
+    if (hit) return hit;
+  }
+  return vs[0] || null;
+}
+function pickFallbackVoice(voices) {
+  return rankFallbackVoice(voices, voiceChoice);
 }
 
 function browserVoices() {
@@ -238,6 +248,90 @@ function pumpServerQueue(id) {
   }
 }
 
+function splitSpeakChunks(say) {
+  const safe = String(say).replace(/(\d)\.(\d)/g, "$1<DOT>$2");
+  const parts = (safe.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [safe])
+    .map((p) => p.replace(/<DOT>/g, ".").trim()).filter((p) => p);
+  // Pack small sentences into 60-140 char chunks: first audio sounds
+  // after one short synthesis (~36ms/char server-side), and each
+  // chunk's playback (~1s per 15 chars) hides the next chunk's
+  // prefetch. Monster sentences split into even word-gap pieces.
+  const chunks = [];
+  let cur = "";
+  const pushCur = () => { if (cur) { chunks.push(cur); cur = ""; } };
+  const pushMonster = (p) => {
+    // Evenly spaced word-gap cuts: greedy slicing leaves a tiny tail
+    // chunk whose playback can't cover the next chunk's synthesis.
+    const n = Math.ceil(p.length / 140);
+    let start = 0;
+    for (let i = 1; i < n; i++) {
+      const target = Math.round((p.length * i) / n);
+      let cut = p.lastIndexOf(" ", target);
+      if (cut < start + 40) cut = p.indexOf(" ", target);
+      if (cut < 0 || cut <= start) break; // no usable gap: rest goes whole
+      const piece = p.slice(start, cut).trim();
+      if (piece) chunks.push(piece);
+      start = cut;
+    }
+    const tail = p.slice(start).trim();
+    if (tail) chunks.push(tail);
+  };
+  for (const p of parts) {
+    if (p.length > 140) { pushCur(); pushMonster(p); continue; }
+    if (cur && (cur.length >= 60 || (cur + " " + p).length > 140)) pushCur();
+    cur = cur ? cur + " " + p : p;
+  }
+  pushCur();
+  return chunks.length ? chunks : [say];
+}
+
+// Long utterances synthesize chunk-by-chunk with the next chunk
+// prefetched during playback: first audio sounds after one short
+// synthesis instead of one long one. Any chunk failure speaks the
+// REMAINDER via the browser fallback and stops the chain.
+function playServerChunks(chunks, mySpeech, done) {
+  const playUrl = (url, i) => {
+    if (mySpeech !== speakSeq) { revokeAudioUrl(url); return; }
+    if (i >= chunks.length) { done(); return; }
+    if (!url) {
+      speakBrowserNow(chunks.slice(i).join(" "), done);
+      return;
+    }
+    let el;
+    try {
+      el = new Audio(url);
+    } catch (e) {
+      revokeAudioUrl(url);
+      speakBrowserNow(chunks.slice(i).join(" "), done);
+      return;
+    }
+    serverAudio = el;
+    serverAudioUrl = url;
+    const nextPromise = (i + 1 < chunks.length)
+      ? fetchServerSpeech(chunks[i + 1]) : null;
+    const advance = () => {
+      if (mySpeech !== speakSeq) return;
+      stopServerAudio();
+      if (!nextPromise) { done(); return; } // last chunk played
+      nextPromise.then((nextUrl) => playUrl(nextUrl, i + 1));
+    };
+    el.onended = advance;
+    const broken = () => {
+      if (mySpeech !== speakSeq) return;
+      stopServerAudio();
+      speakBrowserNow(chunks.slice(i).join(" "), done);
+    };
+    el.onerror = broken;
+    try {
+      const play = el.play();
+      if (play && play.catch) play.catch(broken);
+    } catch (e) {
+      broken();
+    }
+  };
+  fetchServerSpeech(chunks[0]).then((url) => playUrl(url, 0));
+}
+
 const VoiceEngine = {
   // Single choke point for all spoken output. Meta Voice TTS audio is
   // primary; any server failure falls back to default browser speech
@@ -254,42 +348,7 @@ const VoiceEngine = {
     // never overlap into noise; a superseded speech drops silently.
     setTimeout(() => {
       if (mySpeech !== speakSeq) return;
-      const say = speakable(text);
-      fetchServerSpeech(say).then((url) => {
-        if (mySpeech !== speakSeq) { revokeAudioUrl(url); return; }
-        if (!url) { speakBrowserNow(say, done); return; }
-        let el;
-        try {
-          el = new Audio(url);
-        } catch (e) {
-          revokeAudioUrl(url);
-          speakBrowserNow(say, done);
-          return;
-        }
-        serverAudio = el;
-        serverAudioUrl = url;
-        el.onended = () => {
-          if (mySpeech !== speakSeq) return;
-          stopServerAudio();
-          done();
-        };
-        el.onerror = () => {
-          if (mySpeech !== speakSeq) return;
-          stopServerAudio();
-          speakBrowserNow(say, done);
-        };
-        try {
-          const play = el.play();
-          if (play && play.catch) play.catch(() => {
-            if (mySpeech !== speakSeq) return;
-            stopServerAudio();
-            speakBrowserNow(say, done);
-          });
-        } catch (e) {
-          stopServerAudio();
-          speakBrowserNow(say, done);
-        }
-      });
+      playServerChunks(splitSpeakChunks(speakable(text)), mySpeech, done);
     }, 60);
   },
   // Clause streaming: speak answer tokens as they arrive without chopping.
@@ -365,6 +424,44 @@ const VoiceEngine = {
 
 function speak(text, onend) { VoiceEngine.speak(text, onend); }
 
+// Orb: the visible voice of the app. One state at a time across every
+// .orb element (main screen + cook overlay): error > speaking >
+// listening > thinking > idle. Listening/thinking are explicit counters
+// (nested turns overlap); speaking is polled from live audio state.
+const Orb = (() => {
+  let listenDepth = 0, thinkDepth = 0, errUntil = 0;
+  function speakingNow() {
+    try {
+      if (serverAudio || serverPlaying) return true;
+      if ("speechSynthesis" in window) {
+        return !!(speechSynthesis.speaking || speechSynthesis.pending);
+      }
+    } catch (e) { /* no speech */ }
+    return false;
+  }
+  function paint() {
+    let state = "";
+    if (Date.now() < errUntil) state = "is-error";
+    else if (speakingNow()) state = "is-speaking";
+    else if (listenDepth > 0) state = "is-listening";
+    else if (thinkDepth > 0) state = "is-thinking";
+    for (const el of document.querySelectorAll(".orb")) {
+      if (el._orbState === state) continue;
+      el._orbState = state;
+      el.classList.remove("is-listening", "is-thinking", "is-speaking", "is-error");
+      if (state) el.classList.add(state);
+    }
+  }
+  setInterval(paint, 400);
+  return {
+    listenStart() { listenDepth++; paint(); },
+    listenEnd() { listenDepth = Math.max(0, listenDepth - 1); paint(); },
+    thinkStart() { thinkDepth++; paint(); },
+    thinkEnd() { thinkDepth = Math.max(0, thinkDepth - 1); paint(); },
+    error() { errUntil = Date.now() + 2500; paint(); },
+  };
+})();
+
 // clausestream:splitter:start
 const MIN_CLAUSE_LEN = 24; // start speaking once a clause passes this length
 // Split streamed answer text at punctuation boundaries (. , ? ! newline)
@@ -432,6 +529,7 @@ async function refreshBadge() {
 }
 
 function showError(msg) {
+  Orb.error();
   $("instruction").textContent = "Error: " + msg;
   $("instruction").classList.add("fault");
   $("instruction").classList.remove("done");
@@ -575,6 +673,7 @@ async function checkNowStream(payload, onStage) {
 async function checkNow(transcript) {
   if (busy) return;
   busy = true;
+  Orb.thinkStart();
   checkAbort = new AbortController();
   $("check").disabled = true;
   $("cancel").hidden = false;
@@ -635,6 +734,7 @@ async function checkNow(transcript) {
     }
   } finally {
     clearInterval(tick);
+    Orb.thinkEnd();
     busy = false;
     checkAbort = null;
     $("check").disabled = false;
@@ -809,6 +909,7 @@ $("mode-learn").onclick = () => {
 $("check").onclick = () => checkNow("");
 
 let learnParts = [], learnConns = [], learnUnc = [], learnProjects = [], learnSid = "";
+let learnStepN = 1; // current lesson step number (1-based) for STEP CODE
 let codeFetchedSid = ""; // session whose .ino is already on screen (cook + learn share)
 let learnBoard = "esp32_devkit";
 
@@ -864,6 +965,7 @@ function renderLearning(v) {
   paintConfirm(v);
   paintFundi(v.fundi);
   if (v.id) learnSid = v.id;
+  learnStepN = (v.step_index || 0) + 1;
   const box = $("instruction");
   box.textContent = v.instruction || "(no instruction)";
   lastInstruction = v.instruction || "";
@@ -893,6 +995,16 @@ function renderLearning(v) {
     // DONE: the project code arrives on its own; SEND CODE stays as retry.
     setTimeout(() => { if (!cookMode && learnSid && codeFetchedSid !== learnSid) fetchCode(true); }, 150);
   }
+  // Silent board: surface the sketch to copy without hunting for it.
+  const bs = ((v.verification) || {}).board_state || "";
+  if (String(bs).indexOf("silent:") === 0) fetchSketch(true);
+  if (v.step_code && v.step_code.code) {
+    $("code-out").textContent = v.step_code.code;
+    const ports = String(bs).indexOf("silent:") === 0 ? String(bs).slice(7) : "";
+    $("code-kind").textContent = "Step " + v.step_code.n + " sketch — copy it into Arduino IDE, Upload" +
+      (ports ? " to " + ports : "") + ", close Serial Monitor, then press CHECK NOW.";
+  }
+  refreshSchematics();
 }
 
 function enterLearning(v) {
@@ -918,7 +1030,7 @@ async function runPartsOnFrame(framePath) {
       body: JSON.stringify({ frame_path: framePath }),
     });
     const v = await pr.json();
-    if (!pr.ok) { showError("discovery failed"); return; }
+    if (!pr.ok) { showError("discovery failed"); return -1; }
     learnConns = v.connections_observed || [];
     learnUnc = v.uncertainties || [];
     learnParts = [...new Set((v.visible_parts || [])
@@ -932,7 +1044,11 @@ async function runPartsOnFrame(framePath) {
     lastSpeak = learnParts.length
       ? "I see " + learnParts.join(", ").replace(/_/g, " ")
       : "I could not identify any parts.";
-    speak(lastSpeak);
+    // The caller auto-continues into planning (its ack speaks next),
+    // so only speak here when there is nothing to continue into.
+    const want = ($("learn-project").value || "").trim();
+    if (!learnParts.length && !want) speak(lastSpeak);
+    return learnParts.length;
   } finally {
     clearInterval(tick);
   }
@@ -946,7 +1062,11 @@ async function showEquipment() {
     const capR = await fetch("/discover/capture", { method: "POST" });
     const cap = await capR.json();
     if (!capR.ok) { showError((cap && cap.detail) || "capture failed"); return; }
-    await runPartsOnFrame(cap.frame_path);
+    const found = await runPartsOnFrame(cap.frame_path);
+    busy = false;
+    if (found >= 0 && (found > 0 || ($("learn-project").value || "").trim())) {
+      await suggestProjects(); // analysis flows straight into suggestions
+    }
   } catch (e) { showError(e.message); } finally { busy = false; }
 }
 
@@ -963,7 +1083,11 @@ $("learn-file").onchange = async () => {
     const upR = await fetch("/discover/upload", { method: "POST", body: fd });
     const up = await upR.json();
     if (!upR.ok) { showError((up && up.detail) || "upload failed"); return; }
-    await runPartsOnFrame(up.frame_path);
+    const found = await runPartsOnFrame(up.frame_path);
+    busy = false;
+    if (found >= 0 && (found > 0 || ($("learn-project").value || "").trim())) {
+      await suggestProjects(); // analysis flows straight into suggestions
+    }
   } catch (e) { showError(e.message); } finally { busy = false; }
 };
 
@@ -1041,17 +1165,27 @@ async function suggestProjects() {
       return;
     }
     const titles = learnProjects.map((p) => p.title).join("; ");
-    $("instruction").textContent = "Tap a project to start: " + titles;
+    $("instruction").textContent = "Tap a project to start: " + titles +
+      (hint ? " Note: " + hint : "");
     speak("I found " + learnProjects.length + " projects: " + titles +
-      ". Say its name or number, or tap one to start.",
+      ". Say its name or number, or tap one to start." +
+      (hint ? " Note: " + hint : ""),
       () => listenForProjectChoice());
   };
+  let tick = null;
   try {
     if (planCache.key === key && planCache.projects) {
       renderPlans(planCache.projects, planCache.hint); // prefetched: instant
       return;
     }
-    $("instruction").textContent = "Planning projects for " + learnBoard + "…";
+    const label = "Planning projects for " + learnBoard;
+    const t0 = Date.now();
+    $("instruction").textContent = label + "…";
+    speak("Planning your projects.");
+    tick = setInterval(() => {
+      $("instruction").textContent = label + "… " +
+        Math.round((Date.now() - t0) / 1000) + "s";
+    }, 500);
     let v = null;
     if (planCache.key === key && planCache.promise) {
       v = await planCache.promise; // prefetch in flight: ride it
@@ -1062,14 +1196,22 @@ async function suggestProjects() {
         key, planPayload(learnParts, want, learnBoard, learnConns, learnUnc));
     }
     renderPlans(v.projects, v.hint);
-  } catch (e) { showError(e.message); } finally { busy = false; }
+  } catch (e) { showError(e.message); }
+  finally { if (tick) clearInterval(tick); busy = false; }
 }
 
 async function startLearning(project) {
   if (busy) return;
   busy = true;
   learnBoard = $("learn-board").value || "esp32_devkit";
-  $("instruction").textContent = "Starting " + (project.title || "project") + "…";
+  const startLabel = "Starting " + (project.title || "project");
+  const startT0 = Date.now();
+  $("instruction").textContent = startLabel + "…";
+  speak("Starting " + (project.title || "your project") + ". Building your steps.");
+  const startTick = setInterval(() => {
+    $("instruction").textContent = startLabel + "… " +
+      Math.round((Date.now() - startT0) / 1000) + "s";
+  }, 500);
   try {
     const r = await fetch("/diagnose", {
       method: "POST",
@@ -1090,7 +1232,8 @@ async function startLearning(project) {
     v.speak = "We'll build " + (project.title || "this project") + ". You need: " + parts +
       ". " + (v.speak || v.instruction || "");
     enterCookMode(v);
-  } catch (e) { showError(e.message); } finally { busy = false; }
+  } catch (e) { showError(e.message); }
+  finally { clearInterval(startTick); busy = false; }
 }
 
 // choice:matcher:start
@@ -1154,6 +1297,9 @@ $("learn-board").onchange = () => prefetchPlans();
 $("learn-cards").addEventListener("click", (e) => {
   const li = e.target.closest("li[data-p]");
   if (!li) return;
+  if (busy) { $("talk-hint").textContent = "Working — one moment…"; return; }
+  $("learn-cards").querySelectorAll(".tapped").forEach((t) => t.classList.remove("tapped"));
+  li.classList.add("tapped");
   const proj = learnProjects[+li.dataset.p];
   if (!proj) return;
   if (li.dataset.a !== undefined && li.dataset.a !== "") {
@@ -1197,7 +1343,23 @@ async function fetchCode(auto) {
     } else showError(e.message);
   } finally { busy = false; }
 }
+async function fetchStepCode(preId, heardId) {
+  if (busy || !learnSid) return;
+  busy = true;
+  $(heardId).textContent = "Fetching step " + learnStepN + " code…";
+  try {
+    const r = await fetch("/project/" + encodeURIComponent(learnSid) +
+      "/step/" + learnStepN + "/code");
+    const v = await r.json();
+    if (!r.ok) { $(heardId).textContent = "Step code unavailable."; return; }
+    $(preId).textContent = v.code || "";
+    $(heardId).textContent = "Step " + v.n + " code below (" +
+      (v.source || "template") + "). Upload it, then press CHECK NOW.";
+  } catch (e) { $(heardId).textContent = "Step code failed: " + e.message; }
+  finally { busy = false; }
+}
 $("send-code").onclick = () => fetchCode(false);
+$("send-step-code").onclick = () => fetchStepCode("code-out", "code-kind");
 
 async function copyCode(preId, heardId) {
   const text = $(preId).textContent || "";
@@ -1212,6 +1374,185 @@ async function copyCode(preId, heardId) {
 $("copy-code").onclick = () => copyCode("code-out", "talk-hint");
 $("cook-copy").onclick = () => copyCode("cook-code-out", "cook-heard");
 
+// Per-step wiring schematic (Learning mode, ESP32 only). The panel loads
+// quietly with each step render; SPEAK WIRES reads the wire list aloud
+// and DOWNLOAD SVG saves the drawing. Failures stay local to the panel.
+let schematicState = { svg: "", wires: [], n: 0, note: "" };
+let cookSchematicState = { svg: "", wires: [], n: 0, note: "" };
+let schematicBusy = false;
+
+function wireListText(wires, unresolved, net) {
+  const byPart = {};
+  (wires || []).forEach((w) => {
+    (byPart[w.part] = byPart[w.part] || []).push(
+      w.part_pin + " to " + w.board_pin);
+  });
+  const lines = Object.keys(byPart).sort().map((p) =>
+    p + ": " + byPart[p].join(", "));
+  (unresolved || []).forEach((u) => {
+    lines.push("unresolved: " + u.part + " (" + (u.reason || "no profile") + ")");
+  });
+  const notes = (net && net.notes) || [];
+  if (!lines.length && !notes.length) {
+    lines.push("No wiring yet for this step.");
+  }
+  notes.forEach((n) => lines.push(n));
+  return lines.join("\n");
+}
+
+function wireSpeechText(wires, n) {
+  const lead = (wires || []).slice(0, 8).map((w) =>
+    w.part + " " + w.part_pin + " to " + w.board_pin);
+  let text = "Step " + n + " wiring: " + lead.join(", ");
+  if ((wires || []).length > 8) {
+    text += ", and " + ((wires || []).length - 8) + " more wires";
+  }
+  return text;
+}
+
+async function fetchSchematic(svgId, wiresId, state) {
+  if (schematicBusy || !learnSid) return;
+  schematicBusy = true;
+  try {
+    const r = await fetch("/project/" + encodeURIComponent(learnSid) +
+      "/step/" + learnStepN + "/schematic");
+    const v = await r.json();
+    if (!r.ok) {
+      $(wiresId).textContent = "Schematic unavailable: " +
+        ((v && v.detail) || "unknown error");
+      return;
+    }
+    const net = v.netlist || {};
+    state.svg = v.svg || "";
+    state.wires = net.wires || [];
+    state.n = v.n || learnStepN;
+    state.note = ((net.notes || [])[0]) || "";
+    $(svgId).innerHTML = state.svg;
+    $(wiresId).textContent = wireListText(net.wires, v.unresolved, net);
+  } catch (e) {
+    $(wiresId).textContent = "Schematic failed: " + e.message;
+  } finally {
+    schematicBusy = false;
+  }
+}
+
+function refreshSchematics() {
+  if (!learnSid) return;
+  if (cookMode) fetchSchematic("cook-schematic-svg", "cook-schematic-wires", cookSchematicState);
+  else fetchSchematic("schematic-svg", "schematic-wires", schematicState);
+  refreshFlashPorts();
+}
+
+function downloadSchematic(state) {
+  if (!state.svg) return;
+  const blob = new Blob([state.svg], { type: "image/svg+xml" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "step-" + (state.n || learnStepN) + "-schematic.svg";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+
+$("schematic-download").onclick = () => downloadSchematic(schematicState);
+$("cook-schematic-download").onclick = () => downloadSchematic(cookSchematicState);
+$("schematic-speak").onclick = () => {
+  if (schematicState.wires.length) speak(wireSpeechText(schematicState.wires, schematicState.n));
+  else if (schematicState.note) speak(schematicState.note);
+};
+$("cook-schematic-speak").onclick = () => {
+  if (cookSchematicState.wires.length) cookSpeak(wireSpeechText(cookSchematicState.wires, cookSchematicState.n));
+  else if (cookSchematicState.note) cookSpeak(cookSchematicState.note);
+};
+
+// One-click ESP32 flash (Learning mode only, explicit tap only). The
+// port is user-picked from the dropdown — never automatic. Busy guard
+// + elapsed ticker while esptool runs; ack speech at tap, verdict
+// speech when it lands; busy-port guidance stays on screen.
+let flashBusy = false;
+
+async function refreshFlashPorts() {
+  if (flashBusy) return;
+  let ports = [], current = "";
+  try {
+    const r = await fetch("/api/serial/ports");
+    const v = await r.json();
+    ports = (v.ports || []).map((p) => p.port);
+    current = (v.current || {}).port || "";
+  } catch (e) { /* dropdown keeps its last options when offline */ }
+  if (current && ports.indexOf(current) < 0) ports.unshift(current);
+  if (!ports.length) ports = [current || "COM3"];
+  ["flash-port", "cook-flash-port"].forEach((id) => {
+    const sel = $(id);
+    if (!sel) return;
+    const keep = sel.value || current;
+    sel.innerHTML = "";
+    ports.forEach((p) => {
+      const o = document.createElement("option");
+      o.value = p;
+      o.textContent = p;
+      if (p === keep) o.selected = true;
+      sel.appendChild(o);
+    });
+  });
+}
+
+async function flashStep(portId, statusId) {
+  if (flashBusy || !learnSid) return;
+  const port = ($(portId) && $(portId).value) || "";
+  if (!port) {
+    $(statusId).textContent = "Pick a serial port first, then FLASH ESP32.";
+    return;
+  }
+  flashBusy = true;
+  ["flash-esp32", "cook-flash-esp32"].forEach((id) => {
+    if ($(id)) $(id).disabled = true;
+  });
+  const say = cookMode ? cookSpeak : speak;
+  say("Flashing step " + learnStepN + " to ESP32 on " + port + ".");
+  const t0 = Date.now();
+  $(statusId).textContent = "Flashing step " + learnStepN + " to " + port + "…";
+  const tick = setInterval(() => {
+    $(statusId).textContent = "Flashing step " + learnStepN + " to " + port +
+      "… " + Math.round((Date.now() - t0) / 1000) + "s";
+  }, 1000);
+  try {
+    const r = await fetch("/project/" + encodeURIComponent(learnSid) +
+      "/step/" + learnStepN + "/flash", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ port }),
+    });
+    const v = await r.json();
+    if (!r.ok) {
+      const detail = (v && v.detail) || "flash failed";
+      $(statusId).textContent = detail;
+      say(detail.indexOf("busy or blocked") >= 0
+        ? "Flash failed: the port is busy. Close the Serial Monitor and try again."
+        : "Flash failed. See the screen for the error.");
+      return;
+    }
+    const ping = (v.verify_ping && v.verify_ping.answered)
+      ? "Board answered PING."
+      : "Board silent after flash (step sketches do not answer PING) — press CHECK NOW.";
+    $(statusId).textContent = "Flashed step " + v.n + " to " + v.port +
+      " (" + (v.cached ? "cached build " : "build ") + (v.build_hash || "") + "). " + ping;
+    say("Flash complete. " + ping);
+  } catch (e) {
+    $(statusId).textContent = "Flash failed: " + e.message;
+    say("Flash failed. " + e.message);
+  } finally {
+    clearInterval(tick);
+    flashBusy = false;
+    ["flash-esp32", "cook-flash-esp32"].forEach((id) => {
+      if ($(id)) $(id).disabled = false;
+    });
+  }
+}
+
+$("flash-esp32").onclick = () => flashStep("flash-port", "flash-status");
+$("cook-flash-esp32").onclick = () => flashStep("cook-flash-port", "cook-flash-status");
+
 // Hands-free voice loop: tap PUSH TO TALK to record (MediaRecorder), tap
 // again to stop, upload to /api/voice/transcribe, show the transcript, and
 // auto-run one loop turn when it contains done / fixed / moved it.
@@ -1219,9 +1560,14 @@ const TRIGGER_WORDS = ["done", "fixed", "moved it"];
 let pttRec = null, pttChunks = [], pttRecording = false;
 
 async function transcribeUpload(blob) {
-  const fd = new FormData();
-  fd.append("file", blob, "talk.webm");
-  return (await fetch("/api/voice/transcribe", { method: "POST", body: fd })).json();
+  Orb.thinkStart();
+  try {
+    const fd = new FormData();
+    fd.append("file", blob, "talk.webm");
+    return (await fetch("/api/voice/transcribe", { method: "POST", body: fd })).json();
+  } finally {
+    Orb.thinkEnd();
+  }
 }
 
 // Browser-native speech recognition first: instant, on-device, no server
@@ -1244,10 +1590,12 @@ function startBrowserRecognition(opts) {
   opts.hintEl.textContent = opts.hintListening;
   voiceListening = true;
   activeRec = rec;
+  Orb.listenStart();
   let done = false;
   const finish = (fn, isFallback) => {
     if (done) return;
     done = true;
+    Orb.listenEnd();
     const mine = (activeRec === rec);
     if (mine) {
       voiceListening = false;
@@ -1318,6 +1666,7 @@ function startPttRecorder(btn) {
     pttRec = new MediaRecorder(stream);
     pttRec.ondataavailable = (e) => { if (e.data && e.data.size) pttChunks.push(e.data); };
     pttRec.onstop = async () => {
+      Orb.listenEnd();
       pttRecording = false;
       btn.classList.remove("rec");
       btn.textContent = "PUSH TO TALK";
@@ -1331,6 +1680,7 @@ function startPttRecorder(btn) {
       } catch (e) { $("talk-hint").textContent = "Transcription failed — use CHECK NOW."; }
     };
     pttRec.start();
+    Orb.listenStart();
     pttRecording = true;
     btn.classList.add("rec");
     btn.textContent = "LISTENING — TAP TO STOP";
@@ -1495,9 +1845,33 @@ $("live").onclick = () => { if (liveOn) stopLive(); else startLive(); };
 // parts chips, live camera with SAM boxes), driven by voice: TALK to ask
 // or command (check / repeat / look / exit), everything spoken back.
 // Verification still runs through checkNow: the sensor alone advances.
-let cookMode = false, cookWs = null, cookView = null;
-let cookRec = null, cookChunks = [], cookRecording = false, cookTurnResolve = null;
+let cookMode = false, cookView = null;
+let cookRec = null, cookChunks = [], cookRecording = false;
 const COOK_LISTEN_MS = 6000;
+
+// Heartbeat: while Cook Mode sits open, a 60s timer reports idleness
+// and the backend decides whether to nudge (threshold, quiet hours,
+// cooldown). Dismiss snoozes locally for 30 minutes.
+const HEARTBEAT_MS = 60000;
+const NUDGE_SNOOZE_MS = 30 * 60 * 1000;
+let cookLastActive = Date.now();
+let cookNudgeSnoozeUntil = 0;
+
+function markCookActive() { cookLastActive = Date.now(); }
+
+// One coach conversation per page load: the brain remembers earlier
+// turns under this id (a reload forgets, until Tier 4 persists).
+let coachPending = null; // gated tool awaiting CONFIRM/DENY
+let cookKilled = false; // kill switch state (synced from the backend)
+
+let cookSessionId = "";
+function coachSessionId() {
+  if (!cookSessionId) {
+    cookSessionId = "cook-" + Date.now().toString(36) + "-" +
+      Math.random().toString(36).slice(2, 10);
+  }
+  return cookSessionId;
+}
 
 let cookSilentStreak = 0; // consecutive heard-nothings; caps the loop
 
@@ -1518,11 +1892,37 @@ function cookSpeak(text) {
   });
 }
 
+async function heartbeatNudge() {
+  // Quiet by default: skip while busy, listening, or snoozed; the
+  // backend applies the idle threshold, quiet hours, and cooldown.
+  if (!cookMode || cookKilled) return;
+  if (busy || cookRecording || voiceListening) return;
+  if (Date.now() < cookNudgeSnoozeUntil) return;
+  const idleSeconds = Math.round((Date.now() - cookLastActive) / 1000);
+  let v = null;
+  try {
+    const r = await fetch("/api/coach/nudge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: coachSessionId(), idle_seconds: idleSeconds,
+        step_label: $("cook-step").textContent || "", step_text: lastInstruction }),
+    });
+    if (!r.ok) return;
+    v = await r.json();
+  } catch (e) { return; } // heartbeat failures stay silent
+  if (!v || !v.nudge || !v.nudge.text || !cookMode) return;
+  $("cook-nudge-text").textContent = v.nudge.text;
+  $("cook-nudge").hidden = false;
+  lastSpeak = v.nudge.text;
+  cookSpeak(v.nudge.text);
+}
+
 function renderCook(v) {
   paintConfirm(v);
   paintFundi(v.fundi);
   cookView = v;
   if (v.id) learnSid = v.id;
+  learnStepN = (v.step_index || 0) + 1;
   lastInstruction = v.instruction || "";
   if (v.speak) lastSpeak = v.speak;
   $("cook-project").textContent = (v.project_title || "Project") + (v.board ? " (" + v.board + ")" : "");
@@ -1556,6 +1956,14 @@ function renderCook(v) {
       if (cookMode && cookView && cookView.state === "DONE" && codeFetchedSid !== cookView.id) cookSendCode(true);
     }, 150);
   }
+  if (v.step_code && v.step_code.code) {
+    $("cook-code-out").textContent = v.step_code.code;
+    const cports = String(ver.board_state || "").indexOf("silent:") === 0
+      ? String(ver.board_state).slice(7) : "";
+    $("cook-heard").textContent = "Step " + v.step_code.n + " sketch — copy it into Arduino IDE, Upload" +
+      (cports ? " to " + cports : "") + ", close Serial Monitor, then press CHECK NOW.";
+  }
+  refreshSchematics();
 }
 
 function drawCookBoxes(detections) {
@@ -1570,67 +1978,75 @@ function drawCookBoxes(detections) {
   }).join("");
 }
 
-function cookConnect() {
-  cookClose();
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  cookWs = new WebSocket(proto + "//" + location.host + "/api/live/session");
-  cookWs.onopen = () => cookWs.send(JSON.stringify(
-    { type: "hello", mode: "LEARNING", step_text: lastInstruction }));
-  cookWs.onmessage = (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch (e) { return; }
-    if (msg.type === "ready") return;
-    if (cookTurnResolve) { const r = cookTurnResolve; cookTurnResolve = null; r(msg); }
-  };
-  cookWs.onerror = () => { if (cookMode) $("cook-heard").textContent = "Coach connection error."; };
-  cookWs.onclose = () => { if (cookMode) $("cook-heard").textContent = "Coach disconnected."; };
-}
-
-function cookClose() {
-  cookTurnResolve = null;
-  if (cookWs) { try { cookWs.close(); } catch (e) { /* already closed */ } cookWs = null; }
-}
-
-function cookAsk(transcript) {
-  return new Promise((resolve) => {
-    if (!cookWs || cookWs.readyState !== WebSocket.OPEN) {
-      resolve({ type: "error", detail: "coach offline" });
-      return;
-    }
-    cookTurnResolve = resolve;
-    cookWs.send(JSON.stringify({ type: "turn", transcript, step_text: lastInstruction }));
-  });
+// Blocking coach turn: the fallback when streaming is unavailable.
+// Same brain (memory + tools), one reply, spoken after it lands.
+async function cookAsk(text) {
+  let r;
+  try {
+    r = await fetch("/api/coach/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: coachSessionId(), text }),
+    });
+  } catch (e) { return { type: "error", detail: "coach unreachable" }; }
+  let v = null;
+  try { v = await r.json(); } catch (e) { /* non-JSON failure below */ }
+  if (!r.ok || !v) {
+    return { type: "error", detail: (v && v.detail) || "coach failed" };
+  }
+  if (v.confirmation_pending) return { pending: v.confirmation_pending };
+  if (typeof v.reply !== "string") {
+    return { type: "error", detail: "coach failed" };
+  }
+  return { speak: v.reply };
 }
 
 // Streamed coach answer: tokens paint live, clauses speak as they land.
 // Returns {speak} on done, {type:"error",detail} on model error, or null
 // when streaming itself is unavailable (caller falls back to cookAsk).
+// The brain thinks for seconds before the first token, so a slow ack
+// claims the gap; the stream starts lazily on first content so the ack
+// can never kill it.
 async function cookAskStream(text) {
   let r;
   try {
-    r = await fetch("/api/answer/stream", {
+    r = await fetch("/api/coach/ask/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: text, step_text: lastInstruction, mode: "LEARNING" }),
+      body: JSON.stringify({ session_id: coachSessionId(), text }),
     });
   } catch (e) { return null; }
   if (!r.ok || !r.body || !r.body.getReader) return null;
-  const id = VoiceEngine.streamStart();
+  let id = null;
+  const ensureStream = () => {
+    if (id === null) id = VoiceEngine.streamStart();
+    return id;
+  };
   const reader = r.body.getReader();
   const decoder = new TextDecoder();
-  let buf = "", pending = "", full = "", gotText = false;
+  let buf = "", pending = "", full = "", gotText = false, finished = null;
+  const ackTimer = setTimeout(() => {
+    if (!gotText && !finished) cookSpeak("On it — thinking…");
+  }, 1500);
   const paint = () => { $("cook-heard").textContent = 'coach: "' + full + '"'; };
   const emit = (flush) => {
+    if (id === null) return;
     const cut = cutClauses(pending, flush);
     pending = cut.rest;
     for (const c of cut.clauses) VoiceEngine.streamClause(id, c);
+  };
+  const settle = (res) => {
+    clearTimeout(ackTimer);
+    try { reader.cancel(); } catch (e) { /* already closed */ }
+    if (!gotText) return res; // caller speaks the full text itself
+    emit(true);
+    return finishStream(id, res);
   };
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (value) buf += decoder.decode(value, { stream: true });
       let cut;
-      let finished = null;
       while ((cut = buf.indexOf("\n\n")) >= 0) {
         const frame = buf.slice(0, cut);
         buf = buf.slice(cut + 2);
@@ -1641,20 +2057,28 @@ async function cookAskStream(text) {
         }
         if (name === "token") {
           const t = (JSON.parse(data) || {}).text || "";
-          if (t) { gotText = true; full += t; pending += t; paint(); emit(false); }
+          if (t) { gotText = true; full += t; pending += t; ensureStream(); paint(); emit(false); }
+        } else if (name === "tool_call") {
+          const d = JSON.parse(data) || {};
+          $("cook-heard").textContent = "[looking up " + (d.name || "bench notes") + "…]";
+        } else if (name === "confirmation_pending") {
+          finished = { pending: JSON.parse(data) || {} };
         } else if (name === "done") {
-          finished = { speak: (JSON.parse(data) || {}).text || full };
+          const d = JSON.parse(data) || {};
+          if (d.session_id) cookSessionId = d.session_id;
+          finished = { speak: d.reply || d.text || full };
         } else if (name === "error") {
           const detail = (JSON.parse(data) || {}).detail || "answer failed";
           finished = gotText ? { speak: full } : { type: "error", detail };
         }
         if (finished) break;
       }
-      if (finished) { emit(true); return finishStream(id, finished); }
+      if (finished) return settle(finished);
       if (done) break;
     }
   } catch (e) { /* transport died mid-stream: partial stands, else fall back */ }
   try { reader.cancel(); } catch (e) { /* already closed */ }
+  clearTimeout(ackTimer);
   if (!gotText) return null;
   emit(true);
   return finishStream(id, { speak: full });
@@ -1680,6 +2104,7 @@ async function handleCookTranscript(text, error) {
   }
   cookSilentStreak = 0;
   lastTranscript = text;
+  markCookActive();
   $("cook-heard").textContent = 'heard: "' + text + '"';
   await cookCommand(text);
 }
@@ -1691,6 +2116,7 @@ function startCookRecorder(btn) {
     cookRec = new MediaRecorder(stream);
     cookRec.ondataavailable = (e) => { if (e.data && e.data.size) cookChunks.push(e.data); };
     cookRec.onstop = async () => {
+      Orb.listenEnd();
       cookRecording = false;
       btn.classList.remove("rec");
       btn.textContent = "TALK";
@@ -1705,6 +2131,7 @@ function startCookRecorder(btn) {
       } catch (e) { $("cook-heard").textContent = "Transcription failed."; }
     };
     cookRec.start();
+    Orb.listenStart();
     cookRecording = true;
     btn.classList.add("rec");
     btn.textContent = "LISTENING…";
@@ -1747,25 +2174,77 @@ async function cookCommand(text) {
   if (/(check|next|verify|done|test)/.test(t)) { cookCheck(); return; }
   if (/(look|describe|what do you see|show)/.test(t)) { cookLook(); return; }
   if (/(exit|quit|close|stop cooking)/.test(t)) { exitCookMode(); return; }
-  const res = (await cookAskStream(text)) || await cookAsk(text);
+  if (cookKilled) {
+    $("cook-heard").textContent = "Coach is stopped — press ARM to resume.";
+    return;
+  }
+  Orb.thinkStart();
+  let res;
+  try {
+    res = (await cookAskStream(text)) || await cookAsk(text);
+  } finally {
+    Orb.thinkEnd();
+  }
   if (!cookMode) return;
   if (res.type === "error") {
+    Orb.error();
     $("cook-heard").textContent = "Coach: " + (res.detail || "unavailable");
     cookSpeak("Sorry, the coach is unavailable right now.");
     return;
   }
+  if (res.pending) { showCoachConfirm(res.pending); return; }
   $("cook-heard").textContent = 'coach: "' + (res.speak || "") + '"';
   if (res.speak) lastSpeak = res.speak;
   if (!res.streamed) cookSpeak(res.speak || ""); // streamed speech already sounded
 }
 
+// Gated tool: the brain paused for explicit CONFIRM/DENY. The reply
+// speaks only after the technician resolves it.
+function showCoachConfirm(pending) {
+  coachPending = pending;
+  $("cook-coach-confirm-text").textContent =
+    (pending.question || "Confirm?") + " (" + (pending.tool || "") + ")";
+  $("cook-coach-confirm").hidden = false;
+}
+
+async function sendCoachConfirm(confirmed) {
+  if (!coachPending || !cookMode) return;
+  const callId = coachPending.call_id;
+  coachPending = null;
+  $("cook-coach-confirm").hidden = true;
+  let v = null;
+  try {
+    const r = await fetch("/api/coach/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: coachSessionId(),
+        call_id: callId, confirmed: confirmed }),
+    });
+    v = await r.json();
+    if (!r.ok || !v) {
+      $("cook-heard").textContent = "Confirm failed: " + ((v && v.detail) || "");
+      return;
+    }
+  } catch (e) {
+    $("cook-heard").textContent = "Confirm failed: " + e.message;
+    return;
+  }
+  if (!cookMode) return;
+  if (v.confirmation_pending) { showCoachConfirm(v.confirmation_pending); return; }
+  $("cook-heard").textContent = 'coach: "' + (v.reply || "") + '"';
+  if (v.reply) lastSpeak = v.reply;
+  cookSpeak(v.reply || "");
+}
+
 function cookCheck() {
   if (!cookMode || busy) return;
+  markCookActive();
   checkNow("");
 }
 
 async function cookLook() {
   if (!cookMode || busy) return;
+  markCookActive();
   busy = true;
   $("cook-heard").textContent = "Looking…";
   speak("Looking.");
@@ -1822,33 +2301,102 @@ function enterCookMode(v) {
   cookMode = true;
   cookView = v;
   $("cook").hidden = false;
+  $("learn-sec").hidden = true; // one focused screen while cooking
   $("cook-heard").textContent = "";
   $("cook-svg").innerHTML = "";
+  $("cook-nudge").hidden = true;
+  $("cook-coach-confirm").hidden = true;
+  coachPending = null;
+  markCookActive();
   renderCook(v);
-  cookConnect();
   refreshCamera();
+  syncKillState();
   window.scrollTo(0, 0);
   cookSpeak(v.speak || v.instruction || "");
 }
 
 function exitCookMode() {
   cookMode = false;
-  cookClose();
+  $("cook-nudge").hidden = true;
+  $("cook-coach-confirm").hidden = true;
+  $("cook-killed").hidden = true;
+  coachPending = null;
   if (cookRecording && cookRec) { try { cookRec.stop(); } catch (e) { /* already stopped */ } }
   cookRecording = false;
   VoiceEngine.stop();
   $("cook-talk").classList.remove("rec");
   $("cook-talk").textContent = "TALK";
   $("cook").hidden = true;
+  $("learn-sec").hidden = false;
   if (cookView) renderLearning(cookView);
 }
 
-$("cook-talk").onclick = () => cookListen();
+function setKilled(killed) {
+  cookKilled = killed;
+  if (!cookMode) return;
+  $("cook-killed").hidden = !killed;
+  if (killed) {
+    $("cook-nudge").hidden = true;
+    $("cook-coach-confirm").hidden = true;
+    coachPending = null;
+  }
+}
+
+async function syncKillState() {
+  try {
+    const r = await fetch("/api/coach/killswitch");
+    if (!r.ok) return;
+    setKilled(!!(await r.json()).tripped);
+  } catch (e) { /* keep last state when offline */ }
+}
+
+async function flipKillswitch(tripped) {
+  try {
+    const r = await fetch("/api/coach/killswitch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tripped: tripped }),
+    });
+    if (!r.ok) { $("cook-heard").textContent = "Kill switch failed."; return; }
+    setKilled(!!(await r.json()).tripped);
+    if (tripped) VoiceEngine.stop();
+  } catch (e) { $("cook-heard").textContent = "Kill switch failed."; }
+}
+
+$("cook-talk").onclick = () => { markCookActive(); cookListen(); };
+$("cook-coach-yes").onclick = () => sendCoachConfirm(true);
+$("cook-coach-no").onclick = () => sendCoachConfirm(false);
+$("cook-stop").onclick = () => flipKillswitch(true);
+$("cook-arm").onclick = () => flipKillswitch(false);
+$("cook-nudge-x").onclick = () => {
+  $("cook-nudge").hidden = true;
+  cookNudgeSnoozeUntil = Date.now() + NUDGE_SNOOZE_MS;
+  VoiceEngine.stop(); // stop the nudge speech too
+};
+
+// Typed debug path: the same brain, without the microphone. Commands
+// (check, look, exit) and free questions all work as if spoken.
+async function cookAskTyped() {
+  if (!cookMode || busy) return;
+  const input = $("cook-ask-input");
+  const text = (input.value || "").trim();
+  if (!text) return;
+  input.value = "";
+  lastTranscript = text;
+  markCookActive();
+  $("cook-heard").textContent = 'asked: "' + text + '"';
+  await cookCommand(text);
+}
+$("cook-ask-send").onclick = () => cookAskTyped();
+$("cook-ask-input").onkeydown = (e) => {
+  if (e.key === "Enter") { e.preventDefault(); cookAskTyped(); }
+};
 $("cook-check").onclick = () => cookCheck();
-$("cook-repeat").onclick = () => cookSpeak(lastSpeak || (cookView && cookView.instruction) || "");
+$("cook-repeat").onclick = () => { markCookActive(); cookSpeak(lastSpeak || (cookView && cookView.instruction) || ""); };
 $("cook-look").onclick = () => cookLook();
 $("cook-exit").onclick = () => exitCookMode();
 $("cook-code").onclick = () => cookSendCode();
+$("cook-step-code").onclick = () => fetchStepCode("cook-code-out", "cook-heard");
 $("cook-resume").onclick = async () => {
   if (busy) return;
   busy = true;
@@ -1990,6 +2538,20 @@ async function refreshSerialPorts() {
   } catch (e) { $("serial-msg").textContent = "Serial list unavailable."; }
 }
 
+async function fetchSketch(auto) {
+  if ($("sketch-code").textContent) { $("sketch-panel").hidden = false; return; }
+  if (!auto) $("serial-msg").textContent = "Loading sketch…";
+  try {
+    const r = await fetch("/api/patient-sketch");
+    const v = await r.json();
+    if (!r.ok) { if (!auto) $("serial-msg").textContent = "Sketch unavailable."; return; }
+    $("sketch-code").textContent = v.code || "";
+    $("sketch-panel").hidden = false;
+    if (!auto) $("serial-msg").textContent = "Sketch ready — copy it into Arduino IDE.";
+  } catch (e) { if (!auto) $("serial-msg").textContent = "Sketch failed: " + e.message; }
+}
+$("show-sketch").onclick = () => fetchSketch(false);
+$("copy-sketch").onclick = () => copyCode("sketch-code", "serial-msg");
 $("save-serial").onclick = async () => {
   $("serial-msg").textContent = "Saving…";
   try {
@@ -2052,6 +2614,28 @@ function updateMuteBtn() {
   $("mute").textContent = muted ? "UNMUTE" : "MUTE";
   $("mute").classList.toggle("muted", muted);
 }
+$("settings-btn").onclick = () => { $("settings-modal").hidden = false; };
+$("settings-close").onclick = () => { $("settings-modal").hidden = true; };
+$("settings-modal").addEventListener("click", (e) => {
+  if (e.target === $("settings-modal")) $("settings-modal").hidden = true;
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") $("settings-modal").hidden = true;
+});
+
+// Guided typed path: the same ears as PUSH TO TALK, without a mic.
+async function guideAskTyped() {
+  const input = $("guide-ask-input");
+  const text = (input.value || "").trim();
+  if (!text) return;
+  input.value = "";
+  handlePttTranscript(text, " (typed)", "");
+}
+$("guide-ask-send").onclick = () => guideAskTyped();
+$("guide-ask-input").onkeydown = (e) => {
+  if (e.key === "Enter") { e.preventDefault(); guideAskTyped(); }
+};
+
 $("mute").onclick = () => {
   muted = !muted;
   try { localStorage.setItem("fundiloop-muted", muted ? "1" : "0"); } catch (e) { /* private mode */ }
@@ -2106,3 +2690,4 @@ refreshCamera();
 refreshSerialPorts();
 setInterval(refreshCamera, 3000);
 setInterval(refreshBadge, 5000);
+setInterval(heartbeatNudge, HEARTBEAT_MS);

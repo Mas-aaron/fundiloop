@@ -1,0 +1,4 @@
+# Kokoro TTS (local neural speech, af_heart default). Optional: install only
+# when TTS_PROVIDER=kokoro. Model files (~350MB) download separately into
+# backend/data/kokoro/ — see README "Voice" section.
+kokoro-onnx

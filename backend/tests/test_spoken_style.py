@@ -44,7 +44,8 @@ class SpokenStyleTest(unittest.TestCase):
 
         import backend.app.main as app_main
 
-        with mock.patch.dict(os.environ, {"MOCK_META": "true"}):
+        with mock.patch.dict(os.environ, {"MOCK_META": "true",
+                                          "TTS_PROVIDER": "meta"}):
             resp = app_main.api_voice_speak({"text": "hi"})
         self.assertEqual(resp.media_type, "audio/wav")
         self.assertTrue(bytes(resp.body).startswith(b"RIFF"))
