@@ -689,6 +689,7 @@ def api_step_schematic(session_id: str, step_n: int):
     with a reason; wiring is never invented.
     """
     from .schematic import build_netlist, render_svg
+    from .visual_schematic import render_visual_svg
 
     session = orchestrator.sessions.get(session_id)
     if session is None or not session.get("learning"):
@@ -704,8 +705,12 @@ def api_step_schematic(session_id: str, step_n: int):
     if step is None:
         raise HTTPException(status_code=404, detail="unknown step %d" % step_n)
     netlist = build_netlist(steps, step_n, session.get("pin_map", {}) or {})
+    
+    # Use the visual schematic if available for the specific project
+    svg = render_visual_svg(netlist, step_n)
+    
     return {"session_id": session_id, "n": step_n,
-            "netlist": netlist, "svg": render_svg(netlist, step_n),
+            "netlist": netlist, "svg": svg,
             "unresolved": netlist["unresolved"]}
 
 
