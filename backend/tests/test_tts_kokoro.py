@@ -206,7 +206,9 @@ class KokoroSynthesizeTests(unittest.TestCase):
             import struct
 
             vals = struct.unpack("<3h", wf.readframes(3))
-        self.assertEqual(vals, (32767, -32768, 0))
+        # Clamped first (no wraparound), then peak-normalized to 0.95
+        # (1 LSB under ideal from float rounding).
+        self.assertEqual(vals, (31127, -31128, 0))
         self.assertTrue(KokoroTTSProvider)  # provider import stays covered
 
     def test_fast_and_slow_conversion_agree(self):
@@ -217,8 +219,9 @@ class KokoroSynthesizeTests(unittest.TestCase):
         from backend.app.tts import _samples_to_wav
 
         samples = [0.5, -0.5, 2.0, -2.0, 0.0, 0.1, -0.1]
-        # Hand-derived: clamp, asymmetric scale, truncate toward zero.
-        want = (16383, -16384, 32767, -32768, 0, 3276, -3276)
+        # Hand-derived: clamp, asymmetric scale, truncate toward zero,
+        # then peak-normalize to 0.95 (uniform loudness contract).
+        want = (15563, -15564, 31127, -31128, 0, 3112, -3112)
         for feed in (samples, np.array(samples, dtype=np.float32)):
             audio = _samples_to_wav(feed, 24000)
             with wave.open(io.BytesIO(audio), "rb") as wf:
@@ -233,7 +236,8 @@ class KokoroSynthesizeTests(unittest.TestCase):
         audio = _samples_to_wav(["x", 0.5], 24000)
         with wave.open(io.BytesIO(audio), "rb") as wf:
             vals = struct.unpack("<2h", wf.readframes(2))
-        self.assertEqual(vals, (0, 16383))
+        # Bad item still falls back to 0; the survivor normalizes up.
+        self.assertEqual(vals, (0, 31128))
 
     def test_repeat_synthesis_served_from_cache(self):
         from backend.app.tts import KokoroTTSProvider
@@ -285,6 +289,33 @@ class KokoroSynthesizeTests(unittest.TestCase):
             self.assertFalse(tts_mod.warmup_kokoro())
 
 
+class KokoroNormalizationTests(unittest.TestCase):
+    def _frames(self, samples):
+        import struct
+
+        from backend.app.tts import _samples_to_wav
+
+        audio = _samples_to_wav(samples, 24000)
+        with wave.open(io.BytesIO(audio), "rb") as wf:
+            return struct.unpack("<%dh" % wf.getnframes(),
+                                 wf.readframes(wf.getnframes()))
+
+    def test_quiet_speech_boosted_to_full_scale(self):
+        vals = self._frames([0.2 * ((-1) ** i) for i in range(200)])
+        self.assertGreaterEqual(max(abs(v) for v in vals), 31000)
+
+    def test_loud_speech_leveled_to_target(self):
+        vals = self._frames([0.9, -0.9, 0.9, -0.9])
+        self.assertTrue(31000 <= max(abs(v) for v in vals) <= 31200)
+
+    def test_silence_stays_silent(self):
+        self.assertEqual(self._frames([0.0] * 10), (0,) * 10)
+
+    def test_near_silence_gain_capped(self):
+        vals = self._frames([0.003, -0.003])
+        self.assertEqual(vals, (490, -490))
+
+
 class KokoroEndpointTests(unittest.TestCase):
     def setUp(self):
         self.tmp = __import__("tempfile").TemporaryDirectory()
@@ -313,6 +344,22 @@ class KokoroEndpointTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as ctx:
                 app_main.api_voice_speak({"text": "hi"})
         self.assertEqual(ctx.exception.status_code, 502)
+
+    def test_speak_failure_logs_detail(self):
+        import backend.app.main as app_main
+        from backend.app.adapters import MetaAPIError
+        from fastapi import HTTPException
+
+        broken = mock.Mock()
+        broken.synthesize.side_effect = MetaAPIError("boom")
+        with mock.patch("backend.app.tts.get_provider",
+                        return_value=broken):
+            with self.assertLogs("fundiloop.voice",
+                                 level="WARNING") as logs:
+                with self.assertRaises(HTTPException) as ctx:
+                    app_main.api_voice_speak({"text": "hi"})
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertTrue(any("boom" in line for line in logs.output))
 
     def test_status_reports_provider(self):
         import backend.app.main as app_main

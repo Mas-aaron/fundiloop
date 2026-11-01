@@ -272,6 +272,9 @@ pushes the step sketch to the board. ESP32 only (Uno out of scope).
   1. `pip install -r backend/requirements.txt` (includes `esptool`).
   2. Install `arduino-cli`, then
      `arduino-cli core install esp32:esp32` (adds the ESP32 core).
+     Sketch libraries (Adafruit SSD1306/GFX/BME280, DHT,
+     ArduinoJson, ...) auto-install at first build; to pre-seed:
+     `arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" "Adafruit BME280 Library" "Adafruit Unified Sensor"`.
   3. Paths live in `.env`, never hardcoded: `ARDUINO_CLI_BIN`,
      `ARDUINO_FQBN`, `ESPTOOL_BIN`, timeouts (see `.env.example`).
 - Browser flash (Web Serial, Chrome/Edge): CONNECT BOARD opens the

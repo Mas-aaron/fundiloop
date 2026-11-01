@@ -140,11 +140,27 @@ function estimateSpeechMs(text) {
   return Math.max(2200, Math.round((n / 13) * 1000) + 800);
 }
 
+let speechLeadFrac = 0; // fraction of the utterance before wires are named
+let speechChunkHook = null; // called with each spoken chunk as it sounds
+
 function armSpeechClock(text, seq) {
   speechClockSeq = seq;
   speechClockStart = 0;
   speechClockMs = estimateSpeechMs(text);
   speechAudible = false;
+  // Where does this utterance first name a wire? The schematic draw
+  // waits out that preamble (title, parts list) instead of animating
+  // connections while the tutor is still introducing the step.
+  const raw = String(text || "");
+  const hit = raw.search(/GPIO|SDA|SCL|GND|ground|connect|wire|3V3|\bpin\b/i);
+  speechLeadFrac = (hit > 0 && raw.length) ? hit / raw.length : 0;
+}
+
+function markSpeechEnded() {
+  // The current utterance finished: the next step's draw must not
+  // mistake this stale flag for speech already sounding.
+  if (speechClockSeq === speakSeq) speechAudible = false;
+  flushFollowDraw(); // wires the narration never named still land
 }
 
 function speechRemainMs() {
@@ -182,17 +198,31 @@ function clearServerQueue() {
 // One Meta TTS fetch: object URL on playable audio, null on any failure
 // (the caller falls back to browser speech for that utterance only).
 async function fetchServerSpeech(text) {
-  try {
-    const r = await fetch("/api/voice/speak", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-    if (!r.ok) return null;
-    const blob = await r.blob();
-    if (!blob || !blob.size) return null;
-    return URL.createObjectURL(blob);
-  } catch (e) { return null; }
+  // One immediate retry: model-file reads can fail transiently
+  // (a download completing, cloud hydration) and heal within ms.
+  // Persistent failures still fall back to browser speech fast.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetch("/api/voice/speak", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!r.ok) {
+        // Surface the server's reason in the console; the utterance
+        // still falls back to browser speech if the retry also fails.
+        try {
+          const v = await r.json();
+          if (v && v.detail) console.log("voice speak failed:", v.detail);
+        } catch (e) { /* no body to report */ }
+        continue;
+      }
+      const blob = await r.blob();
+      if (!blob || !blob.size) return null;
+      return URL.createObjectURL(blob);
+    } catch (e) { /* network down: retry once, then null */ }
+  }
+  return null;
 }
 
 function speakBrowserNow(say, done) {
@@ -214,7 +244,13 @@ function speakBrowserNow(say, done) {
       u.rate = 0.98;
       u.pitch = 1.0;
       if (voice) u.voice = voice;
-      if (i === 0) u.onstart = () => markSpeechAudible(estimateSpeechMs(say));
+      u.onboundary = () => OrbWave.blip(0.55); // word-by-word shimmer
+      u.onstart = () => {
+        if (i === 0) markSpeechAudible(estimateSpeechMs(say));
+        if (speechChunkHook) {
+          try { speechChunkHook(p); } catch (e) { /* draw only */ }
+        }
+      };
       if (i === parts.length - 1) u.onend = finish;
       speechSynthesis.speak(u);
     });
@@ -231,6 +267,7 @@ function speakBrowserClause(say) {
     u.rate = 0.98;
     u.pitch = 1.0;
     if (voice) u.voice = voice;
+    u.onboundary = () => OrbWave.blip(0.55);
     speechSynthesis.speak(u);
   } catch (e) { console.log("speech failed", e); }
 }
@@ -255,6 +292,7 @@ function pumpServerQueue(id) {
     pumpServerQueue(id);
     return;
   }
+  OrbWave.tapElement(el); // orb vibrates with the streamed clause
   el.onended = () => {
     revokeAudioUrl(item.url);
     serverPlaying = false;
@@ -324,6 +362,14 @@ function splitSpeakChunks(say) {
 // synthesis instead of one long one. Any chunk failure speaks the
 // REMAINDER via the browser fallback and stops the chain.
 function playServerChunks(chunks, mySpeech, done) {
+  if (!chunks.length) { done(); return; }
+  // Two-deep prefetch: while chunk i plays, synthesis for i+1 AND i+2
+  // is already running, so a short chunk ("You need: ...") never ends
+  // before the next long one is ready — no dead air mid-speech.
+  const pending = chunks.map(() => null);
+  const prime = (i) => {
+    if (i < chunks.length && !pending[i]) pending[i] = fetchServerSpeech(chunks[i]);
+  };
   const playUrl = (url, i) => {
     if (mySpeech !== speakSeq) { revokeAudioUrl(url); return; }
     if (i >= chunks.length) { done(); return; }
@@ -341,21 +387,29 @@ function playServerChunks(chunks, mySpeech, done) {
     }
     serverAudio = el;
     serverAudioUrl = url;
-    const nextPromise = (i + 1 < chunks.length)
-      ? fetchServerSpeech(chunks[i + 1]) : null;
+    OrbWave.tapElement(el); // orb vibrates with this chunk
+    prime(i + 1);
+    prime(i + 2);
     const advance = () => {
       if (mySpeech !== speakSeq) return;
       stopServerAudio();
-      if (!nextPromise) { done(); return; } // last chunk played
-      nextPromise.then((nextUrl) => playUrl(nextUrl, i + 1));
+      if (i + 1 >= chunks.length) { done(); return; } // last chunk played
+      pending[i + 1].then((nextUrl) => playUrl(nextUrl, i + 1));
     };
     el.onended = advance;
     const restMs = estimateSpeechMs(chunks.slice(i).join(" "));
+    let hooked = false;
     const noteStart = () => {
       const heard = (el.duration && isFinite(el.duration) && el.duration > 0)
         ? (el.duration * 1000 + estimateSpeechMs(chunks.slice(i + 1).join(" ")))
         : restMs;
       markSpeechAudible(heard);
+      if (!hooked) {
+        hooked = true;
+        if (speechChunkHook) {
+          try { speechChunkHook(chunks[i]); } catch (e) { /* draw only */ }
+        }
+      }
     };
     el.onplaying = noteStart;
     const broken = () => {
@@ -372,7 +426,9 @@ function playServerChunks(chunks, mySpeech, done) {
       broken();
     }
   };
-  fetchServerSpeech(chunks[0]).then((url) => playUrl(url, 0));
+  prime(0);
+  prime(1);
+  pending[0].then((url) => playUrl(url, 0));
 }
 
 const VoiceEngine = {
@@ -381,10 +437,21 @@ const VoiceEngine = {
   // for that utterance only, retried fresh next turn. speak() stays a
   // thin wrapper so existing call sites are unchanged.
   speak(text, onend) {
-    const done = () => { if (onend) { try { onend(); } catch (e) { console.log("speak onend failed", e); } } };
+    const done = () => {
+      markSpeechEnded();
+      if (onend) { try { onend(); } catch (e) { console.log("speak onend failed", e); } }
+    };
     clauseStreamSeq++; // a full speak takes over: any live stream goes silent
     stopServerAudio();
     clearServerQueue();
+    // Browser-fallback utterances queued by the previous speak must die
+    // too, or they keep talking under this utterance's server audio.
+    try {
+      if ("speechSynthesis" in window) {
+        speechSynthesis.cancel();
+        if (speechSynthesis.paused) speechSynthesis.resume();
+      }
+    } catch (e) { /* no speech */ }
     if (!text || muted) {
       speechAudible = true;
       speechClockStart = Date.now();
@@ -475,6 +542,133 @@ const VoiceEngine = {
 
 function speak(text, onend) { VoiceEngine.speak(text, onend); }
 
+// OrbWave: Trillion-style live motion for the orb. It breathes at idle,
+// ripples with live mic level while listening, and vibrates with speaker
+// level while talking. Levels come from AnalyserNodes tapped onto mic
+// streams and audio elements; paths without a tap (speech recognition,
+// browser speech) fall back to a synthetic pulse so the orb never lies
+// still mid-turn. All taps are guarded no-ops where Web Audio is absent.
+const OrbWave = (() => {
+  let actx = null, analyser = null, micAnalyser = null, micSource = null;
+  let mode = "idle"; // idle | listen | speak (set from Orb.paint)
+  let level = 0, blipLevel = 0;
+  const scratch = new Uint8Array(512);
+
+  function ensureCtx() {
+    if (actx) return actx;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      actx = new AC();
+    } catch (e) { return null; }
+    return actx;
+  }
+
+  function rmsOf(an) {
+    if (!an) return -1;
+    try {
+      an.getByteTimeDomainData(scratch);
+      let sum = 0;
+      for (let i = 0; i < scratch.length; i++) {
+        const v = (scratch[i] - 128) / 128;
+        sum += v * v;
+      }
+      return Math.sqrt(sum / scratch.length);
+    } catch (e) { return -1; }
+  }
+
+  function paintWave(v) {
+    try {
+      const s = (1 + v * 0.45).toFixed(3);
+      const o = (0.1 + v * 0.65).toFixed(3);
+      const b = (1 + v * 0.45).toFixed(3);
+      for (const w of document.querySelectorAll(".orb-wave")) {
+        w.style.transform = "scale(" + s + ")";
+        w.style.opacity = o;
+      }
+      for (const el of document.querySelectorAll(".orb")) {
+        el.style.filter = "brightness(" + b + ")";
+      }
+    } catch (e) { /* static orb */ }
+  }
+
+  function frame(t) {
+    try { requestAnimationFrame(frame); } catch (e) { return; }
+    let target = 0;
+    if (mode === "speak") {
+      const r = rmsOf(analyser);
+      target = r >= 0 ? Math.min(1, r * 3) : 0;
+      if (blipLevel > 0) target = Math.max(target, blipLevel);
+      if (target <= 0.02) target = 0.25 + 0.15 * Math.sin(t / 130);
+    } else if (mode === "listen") {
+      const r = rmsOf(micAnalyser);
+      target = r >= 0 ? Math.min(1, r * 4) : 0;
+      if (target <= 0.02) target = 0.35 + 0.25 * Math.sin(t / 170);
+    } else {
+      target = 0.07 + 0.05 * Math.sin(t / 900);
+    }
+    blipLevel *= 0.9;
+    level += (target - level) * 0.35;
+    paintWave(level);
+  }
+
+  try {
+    let reduced = false;
+    try {
+      reduced = !!(window.matchMedia &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    } catch (e) { /* assume motion is fine */ }
+    if (!reduced && typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(frame);
+    }
+  } catch (e) { /* static orb */ }
+
+  return {
+    setMode(m) { mode = m; },
+    level() { return level; },
+    blip(v) { blipLevel = Math.max(blipLevel, v || 0.6); },
+    tapElement(el) {
+      const ctx = ensureCtx();
+      if (!ctx || !el || el._orbTapped) return;
+      try {
+        const src = ctx.createMediaElementSource(el);
+        const an = ctx.createAnalyser();
+        an.fftSize = 512;
+        src.connect(an);
+        an.connect(ctx.destination); // without this the element goes silent
+        analyser = an;
+        el._orbTapped = true;
+        if (ctx.resume) {
+          try { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); }
+          catch (e) { /* suspended context still analyses */ }
+        }
+      } catch (e) { /* one tap per element; blobs only */ }
+    },
+    tapStream(stream) {
+      const ctx = ensureCtx();
+      if (!ctx || !stream) return;
+      this.releaseMic();
+      try {
+        const src = ctx.createMediaStreamSource(stream);
+        const an = ctx.createAnalyser();
+        an.fftSize = 512;
+        src.connect(an); // mic: analyse only, never route to speakers
+        micSource = src;
+        micAnalyser = an;
+        if (ctx.resume) {
+          try { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); }
+          catch (e) { /* suspended context still analyses */ }
+        }
+      } catch (e) { micAnalyser = null; }
+    },
+    releaseMic() {
+      try { if (micSource) micSource.disconnect(); } catch (e) { /* done */ }
+      micSource = null;
+      micAnalyser = null;
+    },
+  };
+})();
+
 // Orb: the visible voice of the app. One state at a time across every
 // .orb element (main screen + cook overlay): error > speaking >
 // listening > thinking > idle. Listening/thinking are explicit counters
@@ -496,6 +690,10 @@ const Orb = (() => {
     else if (speakingNow()) state = "is-speaking";
     else if (listenDepth > 0) state = "is-listening";
     else if (thinkDepth > 0) state = "is-thinking";
+    try {
+      OrbWave.setMode(state === "is-listening" ? "listen"
+        : state === "is-speaking" ? "speak" : "idle");
+    } catch (e) { /* static orb */ }
     for (const el of document.querySelectorAll(".orb")) {
       if (el._orbState === state) continue;
       el._orbState = state;
@@ -540,26 +738,19 @@ function cutClauses(pending, flush) {
 }
 // clausestream:splitter:end
 
-function refreshCamera() {
-  const url = "/api/camera/latest?t=" + Date.now();
-  $("preview").src = url;
-  if (cookMode) $("cook-preview").src = url;
-}
-
-// Header badge: LIVE (green) only when the real camera AND the real Meta
-// models are connected; MOCK (red) otherwise.
+// Header badge: LIVE (green) only when the real Meta models are
+// connected; MOCK (red) otherwise.
 function paintBadge(cfg) {
   const badge = $("mode-badge");
-  const live = !!cfg && cfg.mock_meta === false && cfg.camera_online === true &&
+  const live = !!cfg && cfg.mock_meta === false &&
     cfg.sam_mode === "real" && cfg.muse_mode === "real" && cfg.meta_api_configured === true;
   badge.textContent = live ? "LIVE" : "MOCK";
   badge.classList.toggle("live", live);
   badge.classList.toggle("mock", !live);
   badge.title = live
-    ? "Real camera + real Meta models connected"
+    ? "Real Meta models connected"
     : "Not fully live: " + [
       cfg.mock_meta ? "MOCK_META=true" : null,
-      !cfg.camera_online ? "camera offline" : null,
       cfg.sam_mode !== "real" ? "SAM is mock" : null,
       cfg.muse_mode !== "real" ? "Muse is mock" : null,
       !cfg.meta_api_configured ? "META_API_KEY missing" : null,
@@ -571,11 +762,7 @@ async function refreshBadge() {
     const r = await fetch("/api/status");
     if (!r.ok) return;
     const v = await r.json();
-    if (v.config) {
-      paintBadge(v.config);
-      cameraConfigured = !!v.config.camera_capture_url;
-      if (v.config.camera_error) $("cam-src").textContent = "camera: " + v.config.camera_error;
-    }
+    if (v.config) paintBadge(v.config);
   } catch (e) { /* badge keeps its last state when offline */ }
 }
 
@@ -602,6 +789,12 @@ async function startSession() {
 }
 
 const CHECK_STAGES = { ack: "Checking…", sense: "Sensing…", reason: "Reasoning…", verify: "Verifying…" };
+// A turn always settles: probe + two model passes stay under ~90s, so
+// 120s means the turn is wedged, not slow. The timer aborts it into
+// the normal cancel path with a timeout message instead of silence.
+const CHECK_TIMEOUT_MS = 120000;
+const CHECK_TIMEOUT_MSG = "Check timed out after 120s — the board or network is stuck. " +
+  "Try CHECK NOW again, or MOVE ON to continue anyway.";
 let checkAbort = null; // AbortController for the in-flight turn (CANCEL)
 let pendingCheck = ""; // voice trigger heard mid-turn, run when free
 let pendingConfirmSid = ""; // learning session waiting on CONFIRM
@@ -618,6 +811,15 @@ function paintConfirm(v) {
   const pend = v && v.confirm_pending;
   $("confirm-bar").hidden = !pend;
   $("cook-confirm").hidden = !pend;
+  // The eyeball ask gets its own unmissable card in cook view: the
+  // question plus both answers, where the learner is already looking.
+  const card = $("cook-eyeball");
+  if (card) {
+    card.hidden = !pend;
+    if (pend) {
+      $("cook-eyeball-q").textContent = pend.question || "Confirm this step?";
+    }
+  }
   if (pend) {
     pendingConfirmSid = v.id || learnSid || "";
     $("confirm-q").textContent = pend.question || "Confirm this step?";
@@ -627,7 +829,20 @@ function paintConfirm(v) {
 }
 
 async function sendConfirm(confirmed) {
-  if (!pendingConfirmSid || busy) return;
+  if (!pendingConfirmSid) return;
+  // A check turn (often the AUTO loop) may be mid-flight: wait for it
+  // to settle instead of silently dropping this tap, and say so where
+  // the learner is actually looking.
+  let waited = 0;
+  while (busy && waited < 40) {
+    if (cookMode) $("cook-heard").textContent = "Checking - confirming as soon as it finishes…";
+    await new Promise((res) => setTimeout(res, 500));
+    waited++;
+  }
+  if (busy || !pendingConfirmSid) {
+    if (cookMode) $("cook-heard").textContent = "Still checking - press CONFIRM again in a moment.";
+    return;
+  }
   busy = true;
   try {
     const r = await fetch("/api/session/confirm", {
@@ -637,17 +852,29 @@ async function sendConfirm(confirmed) {
     });
     const v = await r.json();
     if (!r.ok) {
-      showError((v && v.detail) || "confirm failed");
+      const detail = (v && v.detail) || "confirm failed";
+      if (cookMode) {
+        $("cook-heard").textContent = "Confirm failed: " + detail +
+          " - press CHECK, then CONFIRM again.";
+      }
+      showError(detail);
       return;
     }
     if (cookMode && v.learning) {
       renderCook(v);
+      $("cook-heard").textContent = confirmed
+        ? "Confirmed - next step below."
+        : "Not confirmed - fix it up, then CHECK.";
       cookSpeak(v.speak);
     } else {
       renderLearning(v);
       speak(v.speak);
     }
   } catch (e) {
+    if (cookMode) {
+      $("cook-heard").textContent = "Confirm failed: " + e.message +
+        " - is the backend window still running?";
+    }
     showError(e.message);
   } finally {
     busy = false;
@@ -656,6 +883,52 @@ async function sendConfirm(confirmed) {
 $("confirm-yes").onclick = () => sendConfirm(true);
 $("confirm-no").onclick = () => sendConfirm(false);
 $("cook-confirm").onclick = () => sendConfirm(true);
+$("cook-eyeball-yes").onclick = () => sendConfirm(true);
+$("cook-eyeball-no").onclick = () => sendConfirm(false);
+
+// MOVE ON: learner-paced advance, audit-logged as unverified. Always
+// available - no step can trap the learner behind a sensor, an eyeball
+// question, or a wedged check turn: the escape hatch aborts an
+// in-flight turn first, then advances. During an eyeball ask it counts
+// as confirming.
+async function sendAdvance() {
+  if (!learnSid) return;
+  if (checkAbort) checkAbort.abort();
+  let waited = 0;
+  while (busy && waited < 10) {
+    await new Promise((res) => setTimeout(res, 200));
+    waited++;
+  }
+  if (busy) return;
+  busy = true;
+  try {
+    const r = await fetch("/api/session/advance", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: learnSid, transcript: "move on" }),
+    });
+    const v = await r.json();
+    if (!r.ok) {
+      if (cookMode) $("cook-heard").textContent =
+        "Move on failed: " + ((v && v.detail) || "unknown session");
+      return;
+    }
+    if (cookMode && v.learning) {
+      renderCook(v);
+      $("cook-heard").textContent = "Moved on - next step below.";
+      cookSpeak(v.speak);
+    } else {
+      renderLearning(v);
+      speak(v.speak);
+    }
+  } catch (e) {
+    if (cookMode) $("cook-heard").textContent = "Move on failed: " + e.message;
+  } finally {
+    busy = false;
+  }
+}
+$("cook-move-on").onclick = () => sendAdvance();
+$("move-on").onclick = () => sendAdvance(); // learn escape hatch: same as cook
 $("cancel").onclick = () => { if (checkAbort) checkAbort.abort(); };
 $("rescan").onclick = async () => {
   if (busy) return;
@@ -666,18 +939,40 @@ $("rescan").onclick = async () => {
   checkNow("");
 };
 
+let flashSpokenFor = ""; // "sid:n" already told to flash, so it nags once
+
+// A silent board with a step sketch means one thing: the user must
+// upload code, and the cook-heard line alone never says so out loud.
+// Returns the sentence to speak (once per step), or "" when the board
+// talks or the sketch was already announced.
+function flashSpeech(view) {
+  const code = (view && view.step_code) || {};
+  if (!code.code) return "";
+  const bs = String(((view.verification) || {}).board_state || "");
+  if (bs.indexOf("silent:") !== 0) return "";
+  const key = ((view && view.id) || learnSid || "") + ":" + (code.n || learnStepN);
+  if (flashSpokenFor === key) return "";
+  flashSpokenFor = key;
+  return "Your board is silent — it needs this step's sketch. " +
+    "Press FLASH ESP32, then CHECK.";
+}
+
 function renderCheckView(view) {
   if (cookMode && view.learning) {
     renderCook(view);
     // Auto-checks speak on PASS and on state changes, but a repeated
     // identical FAIL stays silent (panels still update) so the loop
     // waits quietly while the user wires. Manual checks always speak.
+    // A first-time flash instruction always sounds, even on a quiet
+    // repeat — a silent board means the user is stuck, not wiring.
     const key = learnStepN + ":" + (((view.verification) || {}).passed ? "P" : "F");
     const wasAuto = autoFired;
     autoFired = false;
     const quiet = wasAuto && key === lastAutoKey && key.slice(-1) === "F";
     lastAutoKey = key;
-    if (!quiet) cookSpeak(view.speak);
+    const flashSay = flashSpeech(view);
+    if (!quiet) cookSpeak((view.speak || "") + (flashSay ? " " + flashSay : ""));
+    else if (flashSay) cookSpeak(flashSay);
   } else {
     if (view.learning) renderLearning(view); else render(view);
     speak(view.speak);
@@ -730,13 +1025,32 @@ async function checkNowStream(payload, onStage) {
 }
 
 async function checkNow(transcript) {
-  if (busy || flashBusy) return;
+  if (!cookMode && !learnSid) {
+    $("instruction").textContent =
+      "Start a project first - pick one above, then CHECK NOW verifies your wiring.";
+    speak("Start a project first, then I will check your wiring.");
+    return;
+  }
+  if (flashBusy) {
+    const box = $(cookMode ? "cook-instruction" : "instruction");
+    if (box) box.textContent = "Flashing — CHECK unlocks when it finishes.";
+    return;
+  }
+  if (busy) return;
   cancelWireSpeech(); // this run owns speech and the diagram now
   busy = true;
   clearAutoTimer(); // this run owns the loop now; finally re-arms it
-  await closeWebPortQuiet(); // an open page port would block the probe
+  // An open page port would block the probe; a wedged port must not hang
+  // the check before its own cancel exists (busy would stick forever).
+  await Promise.race([closeWebPortQuiet(),
+    new Promise((r) => setTimeout(r, 2000))]);
   Orb.thinkStart();
   checkAbort = new AbortController();
+  let checkTimedOut = false;
+  const checkTimer = setTimeout(() => {
+    checkTimedOut = true;
+    if (checkAbort) checkAbort.abort();
+  }, CHECK_TIMEOUT_MS);
   $("check").disabled = true;
   $("cancel").hidden = false;
   const t0 = Date.now();
@@ -770,8 +1084,14 @@ async function checkNow(transcript) {
     } catch (e) {
       if (checkAbort && checkAbort.signal.aborted) {
         pendingCheck = "";
-        $("instruction").textContent = "Cancelled.";
-        VoiceEngine.stop();
+        if (checkTimedOut) {
+          $("instruction").textContent = CHECK_TIMEOUT_MSG;
+          if (cookMode) $("cook-heard").textContent = CHECK_TIMEOUT_MSG;
+          speak("Check timed out. Try again, or move on.");
+        } else {
+          $("instruction").textContent = "Cancelled.";
+          VoiceEngine.stop();
+        }
         return;
       }
       console.log("stream turn failed, falling back", e);
@@ -793,11 +1113,18 @@ async function checkNow(transcript) {
   } catch (e) {
     if (checkAbort && checkAbort.signal.aborted) {
       pendingCheck = "";
-      $("instruction").textContent = "Cancelled.";
+      if (checkTimedOut) {
+        $("instruction").textContent = CHECK_TIMEOUT_MSG;
+        if (cookMode) $("cook-heard").textContent = CHECK_TIMEOUT_MSG;
+        speak("Check timed out. Try again, or move on.");
+      } else {
+        $("instruction").textContent = "Cancelled.";
+      }
     } else {
       showError(e.message);
     }
   } finally {
+    clearTimeout(checkTimer);
     clearInterval(tick);
     Orb.thinkEnd();
     busy = false;
@@ -805,15 +1132,18 @@ async function checkNow(transcript) {
     autoFired = false; // backstop: render already consumed it normally
     $("check").disabled = false;
     $("cancel").hidden = true;
-    refreshCamera();
-    const q = pendingCheck;
+        const q = pendingCheck;
     pendingCheck = "";
     if (q) checkNow(q); // voice trigger heard mid-turn: run it now
     else scheduleAutoCheck(); // cook loop continues unless interrupted
+    drainCookVoice(); // cook feedback heard mid-check gets answered now
   }
 }
 
 function drawEvidence(frameFile, detections, mock) {
+  // Evidence frame UI removed (Learning-first surface): no-op so the
+  // guided render path can keep calling it harmlessly.
+  return;
   const sec = $("evidence-sec"), img = $("evidence-img"), svg = $("evidence-svg");
   if (!frameFile) {
     sec.hidden = true;
@@ -852,17 +1182,7 @@ function render(v) {
   box.classList.toggle("fault", v.state === "FAULT_FOUND");
   box.classList.toggle("done", v.state === "COMPLETE" || v.state === "VERIFIED_FIXED");
   if (v.speak) lastSpeak = v.speak;
-  if (v.camera_source) {
-    const src = v.camera_source;
-    $("cam-src").textContent = src + (v.frame_file ? "  ·  " + v.frame_file.split(/[\\/]/).pop() : "");
-    const ov = $("cam-overlay");
-    if (src.indexOf("snap (override)") === 0) {
-      ov.hidden = false;
-      ov.textContent = "Phone snap pinned — press CHECK NOW to analyze it.";
-    } else {
-      ov.hidden = true;
-    }
-  }
+  // Camera preview removed from the UI: frame sources are not shown.
   $("state-line").textContent =
     "state: " + (v.state || "—") + "  ·  mode: " + (v.mode || "—") +
     (v.step ? "  ·  step " + (v.step_index + 1) + ": " + v.step.step_id : "") +
@@ -870,7 +1190,6 @@ function render(v) {
     (v.camera_source ? "  ·  " + v.camera_source : "") +
     (v.frame_settled === false ? "  ·  frame settling…" : "") +
     (v.timings ? "  ·  " + fmtTimings(v.timings) : "");
-  if (v.cam_src) $("cam-src").textContent = v.cam_src;
   if (v.handoff) {
     pendingHandoff = v.handoff;
     $("handoff-learn").hidden = false;
@@ -945,34 +1264,10 @@ function render(v) {
   drawEvidence(v.frame_file, (v.sam && v.sam.detections) || [], v.sam && v.sam.mock);
 }
 
-// Mode toggle restarts the session in that mode.
-$("mode-guided").onclick = () => {
-  mode = "GUIDED_ASSEMBLY";
-  $("mode-guided").classList.add("active");
-  $("mode-diag").classList.remove("active");
-  $("mode-learn").classList.remove("active");
-  $("learn-sec").hidden = true;
-  $("code-sec").hidden = true;
-  startSession().catch((e) => { showError(e.message); });
-};
-$("mode-diag").onclick = () => {
-  mode = "DIAGNOSTIC";
-  $("mode-diag").classList.add("active");
-  $("mode-guided").classList.remove("active");
-  $("mode-learn").classList.remove("active");
-  $("learn-sec").hidden = true;
-  $("code-sec").hidden = true;
-  startSession().catch((e) => { showError(e.message); });
-};
-$("mode-learn").onclick = () => {
-  mode = "LEARNING";
-  $("mode-learn").classList.add("active");
-  $("mode-guided").classList.remove("active");
-  $("mode-diag").classList.remove("active");
-  $("learn-sec").hidden = false;
-  $("code-sec").hidden = true;
-  $("instruction").textContent = "Learning mode: SHOW EQUIPMENT, name a project (type or PUSH TO TALK), then SUGGEST PROJECTS.";
-};
+// Learning is the only mode on this surface. Guided/Diagnostic
+// sessions and their startSession/render implementations remain in
+// the codebase, unreachable from the UI.
+mode = "LEARNING";
 $("check").onclick = () => checkNow("");
 
 let learnParts = [], learnConns = [], learnUnc = [], learnProjects = [], learnSid = "";
@@ -995,7 +1290,7 @@ function renderLearnCards(projects) {
     const alts = (p.alternatives || []).map((a, j) =>
       '<li data-p="' + i + '" data-a="' + j + '"><b>ALT: ' + esc(a.title || "alternative") + "</b><br><span class='fine'>" + esc(a.summary || "") + "</span> — Start</li>"
     ).join("");
-    return '<li data-p="' + i + '"><b>' + (i + 1) + ". " + esc(p.title || "project") + "</b><br><span class='fine'>" + esc(p.summary || "") + "</span>" +
+    return '<li data-p="' + i + '"><b>' + (learnProjects.length > 1 ? (i + 1) + ". " : "") + esc(p.title || "project") + "</b><br><span class='fine'>" + esc(p.summary || "") + "</span>" +
       ((p.missing_parts || []).length ? "<br><span class='fine'>missing: " + esc(p.missing_parts.join(", ")) + "</span>" : "") +
       " — Start</li>" + alts;
   }).join("");
@@ -1068,17 +1363,13 @@ function renderLearning(v) {
   if (v.step_code && v.step_code.code) {
     $("code-out").textContent = v.step_code.code;
     const ports = String(bs).indexOf("silent:") === 0 ? String(bs).slice(7) : "";
-    $("code-kind").textContent = "Step " + v.step_code.n + " sketch — copy it into Arduino IDE, Upload" +
-      (ports ? " to " + ports : "") + ", close Serial Monitor, then press CHECK NOW.";
+    $("code-kind").textContent = stepSketchLabel(v.step_code.n, ports);
   }
   refreshSchematics();
 }
 
 function enterLearning(v) {
   mode = "LEARNING";
-  $("mode-learn").classList.add("active");
-  $("mode-guided").classList.remove("active");
-  $("mode-diag").classList.remove("active");
   $("learn-sec").hidden = false;
   renderLearning(v);
 }
@@ -1119,22 +1410,6 @@ async function runPartsOnFrame(framePath) {
   } finally {
     clearInterval(tick);
   }
-}
-
-async function showEquipment() {
-  if (busy) return;
-  busy = true;
-  $("instruction").textContent = "Capturing the bench…";
-  try {
-    const capR = await fetch("/discover/capture", { method: "POST" });
-    const cap = await capR.json();
-    if (!capR.ok) { showError((cap && cap.detail) || "capture failed"); return; }
-    const found = await runPartsOnFrame(cap.frame_path);
-    busy = false;
-    if (found >= 0 && (found > 0 || ($("learn-project").value || "").trim())) {
-      await suggestProjects(); // analysis flows straight into suggestions
-    }
-  } catch (e) { showError(e.message); } finally { busy = false; }
 }
 
 $("learn-upload").onclick = () => { if (!busy) $("learn-file").click(); };
@@ -1218,7 +1493,7 @@ async function suggestProjects() {
   if (busy) return;
   const want = ($("learn-project").value || "").trim();
   if (!learnParts.length && !want) {
-    $("talk-hint").textContent = "Show equipment or name a project first.";
+    $("talk-hint").textContent = "Upload a parts photo or name a project first.";
     return;
   }
   busy = true;
@@ -1232,10 +1507,11 @@ async function suggestProjects() {
       return;
     }
     const titles = learnProjects.map((p) => p.title).join("; ");
-    $("instruction").textContent = "Tap a project to start: " + titles +
+    $("instruction").textContent =
+      (learnProjects.length === 1 ? "Tap the project to start: "
+                                  : "Tap a project to start: ") + titles +
       (hint ? " Note: " + hint : "");
-    speak("I found " + learnProjects.length + " projects: " + titles +
-      ". Say its name or number, or tap one to start." +
+    speak(projectChoiceSpeech(learnProjects) +
       (hint ? " Note: " + hint : ""),
       () => listenForProjectChoice());
   };
@@ -1274,7 +1550,11 @@ async function startLearning(project) {
   const startLabel = "Starting " + (project.title || "project");
   const startT0 = Date.now();
   $("instruction").textContent = startLabel + "…";
-  speak("Starting " + (project.title || "your project") + ". Building your steps.");
+  // Ack only when the start actually takes a while: a fast start speaks
+  // once (the cook intro), never ack-then-intro back to back.
+  const ackTimer = setTimeout(() => {
+    speak("Getting your project ready.");
+  }, 900);
   const startTick = setInterval(() => {
     $("instruction").textContent = startLabel + "… " +
       Math.round((Date.now() - startT0) / 1000) + "s";
@@ -1295,13 +1575,29 @@ async function startLearning(project) {
     });
     const v = await r.json();
     if (!r.ok) { showError((v && v.detail) || "could not start project"); return; }
-    const parts = learnParts.length ? learnParts.join(", ") : "your parts";
-    v.speak = "We'll build " + (project.title || "this project") + ". You need: " + parts +
-      ". " + (v.speak || v.instruction || "");
+    // One natural opening line; the parts inventory stays on screen
+    // (guide + parts list) instead of being read out like a script.
+    v.speak = "Let's build " + (project.title || "this project") + ". " +
+      (v.speak || v.instruction || "");
     enterCookMode(v);
   } catch (e) { showError(e.message); }
-  finally { clearInterval(startTick); busy = false; }
+  finally { clearTimeout(ackTimer); clearInterval(startTick); busy = false; }
 }
+
+// choice:prompt:start
+function projectChoiceSpeech(projects) {
+  // The prompt matches the actual count: one project is picked by name
+  // or tap (a "number" means nothing yet); several add number picking.
+  const list = projects || [];
+  const titles = list.map((p) => p.title).join("; ");
+  if (list.length === 1) {
+    return "I found one project: " + titles +
+      ". Tap it to start, or say its name.";
+  }
+  return "I found " + list.length + " projects: " + titles +
+    ". Say its name or number, or tap one to start.";
+}
+// choice:prompt:end
 
 // choice:matcher:start
 function matchProjectChoice(text, projects) {
@@ -1334,7 +1630,9 @@ function listenForProjectChoice() {
   suggestListening = true;
   const started = startBrowserRecognition({
     btn: $("talk"), activeText: "LISTENING…", idleText: "PUSH TO TALK",
-    hintEl: $("talk-hint"), hintListening: "Say the name or number…",
+    hintEl: $("talk-hint"),
+    hintListening: learnProjects.length === 1 ? "Say its name…"
+                                             : "Say the name or number…",
     onText: (text) => {
       if (!suggestListening) return;
       suggestListening = false;
@@ -1358,7 +1656,6 @@ function listenForProjectChoice() {
   if (!started) suggestListening = false;
 }
 
-$("learn-equip").onclick = () => showEquipment();
 $("learn-suggest").onclick = () => suggestProjects();
 $("learn-board").onchange = () => prefetchPlans();
 $("learn-cards").addEventListener("click", (e) => {
@@ -1508,30 +1805,84 @@ function playSchematicDraw(svgId, stepN, prevN) {
     groups.push(g);
     g.querySelectorAll("path, line").forEach(hideWireStroke);
   });
-  parkedDraw = { svgId: svgId, groups: groups, parkedAt: Date.now() };
+  // Animate in the order the tutor names the wires, not the order the
+  // drawing stacks them top-to-bottom: a wire spoken last must move
+  // last, wherever it sits on screen. Unnamed wires keep drawing
+  // order, after every named one.
+  const drawState = (svgId === "cook-schematic-svg")
+    ? cookSchematicState : schematicState;
+  const spokenText = String(lastSpeak || lastInstruction || "");
+  const spokenWireOrder = (g, docIdx) => {
+    const wire = (drawState.wires || []).find(
+      (w) => schematicWireId(w) === g.getAttribute("id"));
+    const titleEl = g.querySelector("title");
+    const needles = wire
+      ? [wire.board_pin, wire.part_pin, wire.part]
+      : [(titleEl && titleEl.textContent) || ""];
+    for (const needle of needles) {
+      if (!needle) continue;
+      const at = spokenText.indexOf(String(needle));
+      if (at >= 0) return at;
+    }
+    return Number.MAX_SAFE_INTEGER - 10000 + docIdx;
+  };
+  const ordered = groups
+    .map((g, i) => [spokenWireOrder(g, i), i, g])
+    .sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]))
+    .map((entry) => entry[2]);
+  parkedDraw = { svgId: svgId, groups: ordered, parkedAt: Date.now() };
   if (muted || speechAudible) {
     runParkedSchematicDraw();
     return;
   }
+  scheduleParkedDrawFallback();
+}
+
+let parkedFallbackTimer = null;
+
+function scheduleParkedDrawFallback() {
+  // The draw paces itself to the tutor's voice (markSpeechAudible runs
+  // it). Only fall back to untimed drawing when no speech for this step
+  // is on its way — a cold first-phase TTS can take seconds to sound,
+  // and drawing at default speed meanwhile finishes before the tutor
+  // has said the wires. Later steps sound promptly, so they never wait.
+  if (parkedFallbackTimer) clearTimeout(parkedFallbackTimer);
   const job = parkedDraw;
-  setTimeout(() => {
-    if (parkedDraw === job) runParkedSchematicDraw();
-  }, 8000);
+  if (!job) return;
+  parkedFallbackTimer = setTimeout(() => {
+    parkedFallbackTimer = null;
+    if (parkedDraw !== job) return;
+    const speechPending = !muted && !speechAudible && speechClockMs &&
+      speechClockSeq === speakSeq;
+    if (speechPending && Date.now() - job.parkedAt < 25000) {
+      scheduleParkedDrawFallback();
+      return;
+    }
+    runParkedSchematicDraw();
+  }, 2000);
 }
 
 function runParkedSchematicDraw() {
   const job = parkedDraw;
   if (!job) return;
   parkedDraw = null;
+  if (parkedFallbackTimer) {
+    clearTimeout(parkedFallbackTimer);
+    parkedFallbackTimer = null;
+  }
   const groups = job.groups || [];
   const n = groups.length;
   if (!n) return;
   const remain = speechRemainMs();
   let startPad = 0.35, slot = 1.8, dur = 1.5;
   if (remain > 900) {
-    startPad = Math.min(1.4, remain * 0.12) / 1000;
-    slot = Math.max(1.6, ((remain / 1000) - startPad) / n);
-    dur = Math.max(1.5, Math.min(4, slot * 0.9));
+    // Hold the wires until the speech reaches its first wire mention
+    // (preamble first), then spread them over what is left of it.
+    const leadMs = Math.min(remain * 0.6, speechLeadFrac * remain);
+    startPad = 0.3 + leadMs / 1000;
+    const availMs = Math.max(800, remain - leadMs - 400);
+    slot = Math.max(1.2, (availMs / 1000) / n);
+    dur = Math.max(1.2, Math.min(4, slot * 0.9));
   }
   groups.forEach((g, i) => {
     g.classList.add("schematic-drawing");
@@ -1540,8 +1891,83 @@ function runParkedSchematicDraw() {
       p.style.setProperty("--wire-dur", dur + "s");
       p.style.animationDelay = (startPad + i * slot) + "s";
     });
+    g._followAt = Date.now() + (startPad + i * slot) * 1000;
+    g._followDur = dur;
+  });
+  // Follow mode: as each spoken chunk actually sounds, its wires
+  // re-time to NOW (the spread above is only the fallback schedule).
+  followJob = { groups: groups.slice(), drawn: new Set(), svgId: job.svgId };
+}
+
+let followJob = null;
+
+function animateWireNow(g, delaySec) {
+  g.classList.remove("schematic-drawing");
+  g.querySelectorAll("path, line").forEach((p) => {
+    p.style.animation = "none";
+  });
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    g.querySelectorAll("path, line").forEach((p) => {
+      p.style.animation = "";
+      p.style.setProperty("--wire-dur", "1.15s");
+      p.style.animationDelay = delaySec + "s";
+    });
+    g.classList.add("schematic-drawing");
+  }));
+}
+
+function followWireNeedles(g, svgId) {
+  const state = (svgId === "cook-schematic-svg")
+    ? cookSchematicState : schematicState;
+  const wire = (state.wires || []).find(
+    (w) => schematicWireId(w) === g.getAttribute("id"));
+  if (!wire) return [];
+  const needles = [wire.board_pin, wire.part_pin, wire.part];
+  if (wire.board_pin === "GND") needles.push("GROUND");
+  return needles.filter(Boolean);
+}
+
+function followSpokenChunk(chunkText) {
+  if (!followJob) return;
+  const norm = (s) => String(s || "").toUpperCase()
+    .replace(/[^A-Z0-9+]+/g, "");
+  const hay = norm(chunkText);
+  if (!hay) return;
+  let slot = 0;
+  followJob.groups.forEach((g) => {
+    if (followJob.drawn.has(g)) return;
+    if (g._followAt && Date.now() > g._followAt + (g._followDur || 1) * 1000) {
+      followJob.drawn.add(g); // fallback schedule already drew it
+      return;
+    }
+    const hit = followWireNeedles(g, followJob.svgId).some((nd) => {
+      const n = norm(nd);
+      return n.length >= 2 && hay.includes(n);
+    });
+    if (hit) {
+      animateWireNow(g, slot * 0.3);
+      followJob.drawn.add(g);
+      slot++;
+    }
   });
 }
+
+function flushFollowDraw() {
+  if (!followJob) return;
+  const job = followJob;
+  followJob = null;
+  let slot = 0;
+  job.groups.forEach((g) => {
+    if (job.drawn.has(g)) return;
+    if (g._followAt && Date.now() > g._followAt + (g._followDur || 1) * 1000) {
+      return; // already drawn on the fallback schedule
+    }
+    animateWireNow(g, slot * 0.25); // narration ended: land the rest
+    slot++;
+  });
+}
+
+speechChunkHook = followSpokenChunk;
 
 function paintSchematic(svgId, selId, state, animate, prevN) {
   const box = $(svgId);
@@ -1602,8 +2028,19 @@ async function fetchSchematic(svgId, wiresId, state, selId) {
 
 function refreshSchematics() {
   if (!learnSid) return;
+  refreshFlashPorts();
   if (cookMode) fetchSchematic("cook-schematic-svg", "cook-schematic-wires", cookSchematicState, "cook-schematic-sel");
   else fetchSchematic("schematic-svg", "schematic-wires", schematicState, "schematic-sel");
+}
+
+function stepSketchLabel(n, ports) {
+  // A silent board needs its step sketch flashed: point at the in-app
+  // flash buttons first (they compile + write + release the port), and
+  // keep the manual Arduino IDE route as the fallback.
+  return "Step " + n + " sketch below — flash it with FLASH ESP32" +
+    " (recommended) or FLASH IN BROWSER below, or copy it into Arduino IDE, Upload" +
+    (ports ? " to " + ports : "") +
+    ", close Serial Monitor, then press CHECK NOW.";
 }
 
 // Click a wire to isolate it (rest dim, selection described below);
@@ -1752,12 +2189,22 @@ function renderGuide() {
     const li = document.createElement("li");
     li.dataset.n = s.n;
     li.innerHTML = '<span class="guide-num">' + s.n + "</span> " +
-      "<strong>" + escapeHtml(s.title) + "</strong><div>" +
-      escapeHtml(s.text) + "</div>";
+      "<strong>" + escapeHtml(s.title) + "</strong>" +
+      (s.teach ? "<div>" + escapeHtml(s.teach) + "</div>" : "") +
+      "<div>" + escapeHtml(s.text) + "</div>";
     li.onclick = () => speakGuideStep(s);
     ol.appendChild(li);
   });
   markGuideStep();
+}
+
+function stepIntroPhrase(s) {
+  // Say the step once: a chapter title that already IS "Step 2" must
+  // not become "Step 2: Step 2".
+  const title = String((s && s.title) || "").trim();
+  if (!title) return "Step " + s.n;
+  if (/^step\s+\d+/i.test(title)) return title;
+  return "Step " + s.n + ": " + title;
 }
 
 // Tap a guide card: narrate it wire by wire, lighting each wire on the
@@ -1768,12 +2215,14 @@ function speakGuideStep(s) {
   const wires = (s.wire_ids || []).map((id) => byId[id]).filter(Boolean);
   if (!wires.length) {
     cancelWireSpeech();
-    cookSpeak(s.title + ". " + s.text);
+    cookSpeak(s.title + ". " + (s.teach ? s.teach + " " : "") + s.text);
     return;
   }
+  // Teach first (what this step is and why), then wire by wire.
+  const intro = [{ id: "", phrase: stepIntroPhrase(s) }];
+  if (s.teach) intro.push({ id: "", phrase: s.teach });
   speakWireList(
-    [{ id: "", phrase: "Step " + s.n + ": " + s.title }]
-      .concat(wireSpeechItems(wires, s.n)),
+    intro.concat(wireSpeechItems(wires, s.n)),
     cookSpeak, "cook-schematic-svg", "cook-schematic-sel");
 }
 
@@ -1817,23 +2266,117 @@ $("cook-schematic-speak").onclick = () => {
   else if (cookSchematicState.note) cookSpeak(cookSchematicState.note);
 };
 
-// Shared busy guard across both flash paths (server endpoint kept as
-// an API fallback, but the UI only offers browser flash now).
+// Shared flash guard. FLASH ESP32 is the primary path: it calls the
+// server's native Python esptool at 921600 baud, matching Arduino IDE's
+// auto-reset upload. FLASH IN BROWSER remains the Web Serial fallback.
 let flashBusy = false;
 
 function setFlashButtonsDisabled(disabled) {
   ["web-flash", "cook-web-flash",
-   "web-connect", "cook-web-connect"].forEach((id) => {
+   "web-connect", "cook-web-connect",
+   "flash-esp32", "cook-flash-esp32",
+   "flash-port", "cook-flash-port"].forEach((id) => {
     if ($(id)) $(id).disabled = disabled;
   });
 }
+
+async function refreshFlashPorts() {
+  if (flashBusy) return;
+  let ports = [], current = "";
+  try {
+    const r = await fetch("/api/serial/ports");
+    const v = await r.json();
+    ports = (v.ports || []).map((p) => p.port);
+    current = (v.current || {}).port || "";
+  } catch (e) { /* keep the last options while the server is offline */ }
+  if (current && ports.indexOf(current) < 0) ports.unshift(current);
+  if (!ports.length) ports = [current || "COM3"];
+  ["flash-port", "cook-flash-port"].forEach((id) => {
+    const sel = $(id);
+    if (!sel) return;
+    const keep = sel.value || current;
+    sel.innerHTML = "";
+    ports.forEach((p) => {
+      const o = document.createElement("option");
+      o.value = p;
+      o.textContent = p;
+      if (p === keep) o.selected = true;
+      sel.appendChild(o);
+    });
+  });
+}
+
+async function flashStep(portId, statusId) {
+  if (!learnSid || flashBusy) return;
+  if (busy) {
+    // Same deal as browser flash: a check must never trap this button —
+    // "wait" is a dead end when checks run back-to-back, so stop it and
+    // hand the port over for one more tap.
+    if (checkAbort) { try { checkAbort.abort(); } catch (e) { /* already gone */ } }
+    cancelWireSpeech();
+    $(statusId).textContent = "Stopped what was running — press FLASH ESP32 " +
+      "again to flash.";
+    return;
+  }
+  const port = ($(portId) && $(portId).value) || "";
+  if (!port) {
+    $(statusId).textContent = "Pick the ESP32 serial port first, then press FLASH ESP32.";
+    return;
+  }
+  const say = cookMode ? cookSpeak : speak;
+  say("Flashing step " + learnStepN + " to the ESP32 on " + port + ".");
+  const t0 = Date.now();
+  $(statusId).textContent = "Native esptool at 921600 baud: compiling and flashing step " +
+    learnStepN + " to " + port + "...";
+  const tick = setInterval(() => {
+    $(statusId).textContent = "Native esptool at 921600 baud: compiling and flashing step " +
+      learnStepN + " to " + port + "... " +
+      Math.round((Date.now() - t0) / 1000) + "s";
+  }, 1000);
+  try {
+    flashBusy = true;
+    setFlashButtonsDisabled(true);
+    const r = await fetch("/project/" + encodeURIComponent(learnSid) +
+      "/step/" + learnStepN + "/flash", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ port }),
+    });
+    const v = await r.json().catch(() => null);
+    if (!r.ok) {
+      const detail = (v && v.detail) || "native flash failed";
+      $(statusId).textContent = detail;
+      say(detail.indexOf("busy or blocked") >= 0
+        ? "Flash failed: the port is busy. Close Arduino IDE and Serial Monitor, then try again."
+        : "Flash failed. See the screen for the error.");
+      return;
+    }
+    const ping = (v.verify_ping && v.verify_ping.answered)
+      ? "Board answered PING."
+      : "Board is silent after the flash, which is expected for a step sketch. Press CHECK NOW.";
+    $(statusId).textContent = "Flashed step " + v.n + " to " + v.port +
+      " at 921600 baud (" + (v.cached ? "cached build " : "build ") +
+      (v.build_hash || "") + "). " + ping;
+    say("Flash complete. Press CHECK NOW.");
+  } catch (e) {
+    $(statusId).textContent = "Flash failed: " + e.message +
+      " Check that the backend window is still running, then try again.";
+    say("Flash failed. Check that the server is still running.");
+  } finally {
+    clearInterval(tick);
+    flashBusy = false;
+    setFlashButtonsDisabled(false);
+  }
+}
+
+$("flash-esp32").onclick = () => flashStep("flash-port", "flash-status");
+$("cook-flash-esp32").onclick = () => flashStep("cook-flash-port", "cook-flash-status");
 
 // Browser-side flashing (Web Serial + vendored esptool-js bundle):
 // CONNECT BOARD opens the browser's own port picker (Chrome/Edge;
 // localhost counts as a secure context), then FLASH IN BROWSER
 // downloads the server-compiled binaries and flashes locally with a
-// progress bar. Server-side FLASH ESP32 stays as the fallback that
-// works in any browser. The page releases the port when done so
+// progress bar. The page releases the port when done so
 // CHECK NOW can use it right after.
 let webPort = null;
 
@@ -1851,19 +2394,40 @@ function u8ToBstr(u8) {
   return s;
 }
 
+// Classify a browser-flash failure so each kind gets its own recovery
+// guidance: expired (server restarted, session gone) / dead (USB gone,
+// re-pick) / busy (another program holds the port) / link (transfer
+// broke mid-write, slower re-sync may fix it) / sync (BOOT retry on
+// the same port, incl. packet corruption) / generic.
+function flashFailureKind(msg) {
+  const s = String(msg || "");
+  if (/failed to fetch|networkerror|network error|load failed/i.test(s)) {
+    return "unreachable";
+  }
+  if (/unknown learning session id/.test(s)) return "expired";
+  if (/disconnect|detached|no such device/i.test(s)) return "dead";
+  if (/failed to execute 'open'|failed to open serial port/i.test(s)) return "busy";
+  if (/packet content transfer stopped/i.test(s)) return "link";
+  if (/failed to connect|connect with the device|sync|timed out|timeout|no serial data received|invalid head of packet|serial noise|corruption/i.test(s)) return "sync";
+  return "generic";
+}
+
 async function closeWebPortQuiet() {
   if (!webPort) return;
   if (!webPort.readable && !webPort.writable) return; // picked, never opened
   try {
     await webPort.close();
   } catch (e) { /* already closed or never opened */ }
-  webPort = null;
+  // Closed but KEPT: closing releases the OS port for the probe while
+  // the selection survives, so the next FLASH IN BROWSER reopens it
+  // with no picker round-trip. Only a dead handle (unplugged board)
+  // drops the selection — see webFlash's catch.
 }
 
 async function webConnect(statusId) {
   if (!(navigator.serial && navigator.serial.requestPort)) {
     $(statusId).textContent = "Web Serial needs Chrome or Edge — " +
-      "or use FLASH ESP32 (server flash) in any browser.";
+      "open this page there to flash the board.";
     return;
   }
   try {
@@ -1880,13 +2444,21 @@ async function webConnect(statusId) {
 }
 
 async function webFlash(statusId, progId) {
-  if (flashBusy || busy || !learnSid) return;
+  if (!learnSid || flashBusy) return; // not in a build, or already flashing
+  if (busy) {
+    // A check must never trap the flash button: stop it and hand the
+    // port over — one more tap flashes. Screen only: the dying check's
+    // own speech owns the audio right now.
+    if (checkAbort) { try { checkAbort.abort(); } catch (e) { /* already gone */ } }
+    cancelWireSpeech();
+    $(statusId).textContent = "Stopped what was running — press FLASH IN " +
+      "BROWSER again to flash; your board stays selected.";
+    return;
+  }
   if (!webPort) {
     $(statusId).textContent = "Press CONNECT BOARD first, then select the ESP32.";
     return;
   }
-  flashBusy = true;
-  setFlashButtonsDisabled(true);
   $(progId).hidden = false;
   $(progId).removeAttribute("value"); // indeterminate until bytes flow
   $(statusId).textContent = "";
@@ -1896,6 +2468,8 @@ async function webFlash(statusId, progId) {
   let transport = null;
   let sawProgress = false;
   try {
+    flashBusy = true;
+    setFlashButtonsDisabled(true);
     webLog(statusId, "Loading flasher (first run fetches it once)…");
     let esp;
     try {
@@ -1921,25 +2495,55 @@ async function webFlash(statusId, progId) {
       files.length + " file(s) before writing…");
     const fileArray = [];
     for (const f of files) {
-      const fr = await fetch(f.url);
-      if (!fr.ok) throw new Error("download failed: " + f.url);
-      const buf = await fr.arrayBuffer();
+      // Retried per file: a backend that restarts or hiccups
+      // mid-download should cost a second, not the whole flash.
+      let buf = null;
+      for (let attempt = 0; attempt < 3 && !buf; attempt++) {
+        try {
+          const fr = await fetch(f.url);
+          if (!fr.ok) throw new Error("download failed: " + f.url);
+          buf = await fr.arrayBuffer();
+        } catch (e) {
+          if (attempt === 2) {
+            throw new Error("download failed after retries: " + f.url +
+              " (" + ((e && e.message) || e) + ")");
+          }
+          webLog(statusId, "Download hiccup on file " + (f.index + 1) +
+            " - retrying.");
+          await new Promise((res) => setTimeout(res, 1000));
+        }
+      }
       // esptool-js 0.5.7 wants binary STRINGS here (its write loop
       // calls .charCodeAt); a Uint8Array dies with "A.charCodeAt is
       // not a function". Chunked conversion avoids call-stack limits.
       fileArray.push({ data: u8ToBstr(new Uint8Array(buf)),
                        address: parseInt(f.offset, 16) });
     }
+    // The server probe holds the port persistently once a check adopts
+    // it; the browser can't open it until the server lets go (same
+    // release the server-side flash does before esptool runs).
+    webLog(statusId, "Releasing the server probe's port…");
+    try {
+      const rr = await fetch("/api/serial/release", { method: "POST" });
+      if (!rr.ok) {
+        webLog(statusId, "Note: the server predates port release — restart " +
+          "it if the port stays busy.");
+      }
+    } catch (e) { /* the open attempt below reports the truth */ }
     const terminal = {
       writeLine: (s) => webLog(statusId, String(s).replace(/\r?\n$/, "")),
       write: (s) => webLog(statusId, String(s)),
       clean: () => {},
     };
-    // Fast first, then slower: some cables/bridges corrupt above
-    // 460800 or even 115200. Binaries stay in memory; only the
-    // sync+write reruns, on the same open port.
-    const BAUDS = [921600, 460800, 115200];
-    for (const baud of BAUDS) {
+    // Fixed 115200 baud: this link corrupts after the stub speed-up
+    // at anything faster, and the ladder only wasted minutes proving
+    // it again on every flash. One re-sync retry at the same speed,
+    // since flaky links often succeed on the second connect. Only
+    // sync/link failures retry - anything else throws immediately.
+    const BAUDS = [115200, 115200];
+    for (let bi = 0; bi < BAUDS.length; bi++) {
+      const baud = BAUDS[bi];
+      const last = bi === BAUDS.length - 1;
       try {
         webLog(statusId, "Entering bootloader at " + baud + " baud…");
         transport = new esp.Transport(webPort);
@@ -1947,7 +2551,6 @@ async function webFlash(statusId, progId) {
                                            baudrate: baud,
                                            terminal: terminal });
         await loader.main();
-        await loader.flashId();
         const base = $(statusId).textContent;
         await loader.writeFlash({
           fileArray: fileArray,
@@ -1960,19 +2563,24 @@ async function webFlash(statusId, progId) {
             const pct = total ? Math.floor((written / total) * 100) : 0;
             sawProgress = true;
             $(progId).value = pct;
-            $(statusId).textContent = base + "\nFlashing… " + pct + "%";
+            $(statusId).textContent = base + "\nFlashing file " +
+              (fileIndex + 1) + " of " + fileArray.length + "… " + pct + "%";
           },
         });
         break;
       } catch (e) {
-        const retryable = /invalid head of packet|serial noise|corruption|timed out|timeout/i
-          .test(String((e && e.message) || e));
+        const kind = flashFailureKind((e && e.message) || e);
+        const retryable = kind === "sync" || kind === "link";
         try {
           if (transport && transport.disconnect) await transport.disconnect();
         } catch (e2) { /* port already gone */ }
         transport = null;
-        if (!retryable || baud === BAUDS[BAUDS.length - 1]) throw e;
-        webLog(statusId, baud + " baud is too fast for this cable — retrying slower…");
+        if (!retryable || last) throw e;
+        if (BAUDS[bi + 1] < baud) {
+          webLog(statusId, baud + " baud is too fast for this cable — retrying slower…");
+        } else {
+          webLog(statusId, baud + " baud failed — trying once more at the same speed…");
+        }
         $(progId).removeAttribute("value");
       }
     }
@@ -1984,13 +2592,47 @@ async function webFlash(statusId, progId) {
     const msg = e && e.message ? e.message : e;
     if (!sawProgress) $(progId).value = 0; // died before bytes: park it empty
     webLog(statusId, "Browser flash failed: " + msg);
-    if (/failed to connect|connect with the device|sync|timed out|timeout/i.test(String(msg))) {
-      webLog(statusId, "The board never answered: hold its BOOT button, " +
-        "press FLASH IN BROWSER again, and release BOOT once flashing " +
-        "starts. Also close Arduino IDE and any Serial Monitor — only " +
-        "one program can hold the port.");
+    const kind = flashFailureKind(msg);
+    if (kind === "unreachable") {
+      // The server stopped answering mid-flash (window closed, process
+      // crashed, or a --reload restart). Nothing on the board side can
+      // fix this; a restarted server also forgets the session build.
+      webLog(statusId, "The server stopped answering - check the backend " +
+        "window is still running (restart it if it closed or crashed), " +
+        "then tap EXIT, start the project fresh, and flash again.");
+      say("The server stopped answering. Restart it, start the project " +
+        "again, then flash.");
+    } else if (kind === "expired") {
+      // The page outlived the server: sessions live in server memory,
+      // so a restart orphans this build. A fresh start is the only fix.
+      webLog(statusId, "This build expired — the server restarted and " +
+        "forgot it. Tap EXIT, tap your project again to start fresh, " +
+        "then flash.");
+      say("This build expired. Start the project again, then flash.");
+    } else {
+      if (kind === "dead") {
+        // Stale handle (USB unplugged): the kept port would fail the same
+        // way forever, so drop it and send the user back to the picker.
+        webPort = null;
+        webLog(statusId, "The board disconnected — replug USB, press CONNECT " +
+          "BOARD, and select the ESP32 entry again.");
+      } else if (kind === "busy") {
+        webLog(statusId, "Something else is holding the port — close Arduino " +
+          "IDE and any Serial Monitor, then press FLASH IN BROWSER again. " +
+          "No reconnect needed.");
+      } else if (kind === "link") {
+        webLog(statusId, "The link broke mid-write: use a different USB cable " +
+          "or port (avoid hubs), hold the BOOT button, and press FLASH IN " +
+          "BROWSER again.");
+      } else if (kind === "sync") {
+        webLog(statusId, "The board stopped answering: hold its BOOT button, " +
+          "press FLASH IN BROWSER again, and release BOOT once flashing " +
+          "starts. Also close Arduino IDE and any Serial Monitor. If it " +
+          "keeps failing, try another cable or port — or press FLASH " +
+          "ESP32, the server's native uploader.");
+      }
+      say("Browser flash failed. See the screen for the error.");
     }
-    say("Browser flash failed. See the screen for the error.");
   } finally {
     try {
       if (transport && transport.disconnect) await transport.disconnect();
@@ -2040,6 +2682,7 @@ let voiceCancelFallback = false; // manual stop: reset UI, stay quiet
 function startBrowserRecognition(opts) {
   const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!Ctor) return false;
+  stopWake(); // one recognizer at a time; the wake watchdog resumes later
   let rec;
   try {
     rec = new Ctor();
@@ -2071,11 +2714,46 @@ function startBrowserRecognition(opts) {
     fn();
   };
   rec.lang = "en-US";
-  rec.interimResults = false;
-  rec.maxAlternatives = 1;
+  // Interim results on: the learner sees their words land live instead
+  // of speaking into a void, and we keep every alternative so a
+  // low-confidence best guess can hand off to server transcription
+  // instead of acting on a mis-hear.
+  rec.interimResults = true;
+  rec.maxAlternatives = 3;
+  let gotFinal = false;
   rec.onresult = (e) => {
-    const text = (((e.results || [])[0] || [])[0] || {}).transcript || "";
-    finish(() => opts.onText(text.trim()), false);
+    const results = e.results || [];
+    let interim = "";
+    for (let i = e.resultIndex || 0; i < results.length; i++) {
+      const res = results[i];
+      if (!res.isFinal) { interim += (res[0] || {}).transcript || ""; continue; }
+      gotFinal = true;
+      const alts = [];
+      for (let j = 0; j < res.length; j++) {
+        alts.push({ text: String((res[j] || {}).transcript || "").trim(),
+                    confidence: (res[j] || {}).confidence || 0 });
+      }
+      const best = alts.slice().sort((a, b) => b.confidence - a.confidence)[0] ||
+        { text: "", confidence: 0 };
+      window.__lastRecognition = { text: best.text,
+        confidence: best.confidence, alternatives: alts, at: Date.now() };
+      console.log("recognition", window.__lastRecognition);
+      if (!best.text) { finish(opts.onEmpty || opts.onFallback, false); return; }
+      if (best.confidence && best.confidence < 0.5) {
+        // Garbled: do not act on it. The recorder path transcribes on
+        // the server; tell the learner why they are asked to repeat.
+        opts.hintEl.textContent = "Not clear - heard \"" + best.text +
+          "\" (" + Math.round(best.confidence * 100) +
+          "% sure). Recording for a cleaner transcription: say it again.";
+        finish(opts.onFallback, true);
+        return;
+      }
+      finish(() => opts.onText(best.text), false);
+      return;
+    }
+    if (interim) {
+      opts.hintEl.textContent = "… " + interim.trim();
+    }
   };
   rec.onerror = (e) => {
     if ((e.error || "") === "no-speech" && opts.onEmpty) {
@@ -2084,7 +2762,12 @@ function startBrowserRecognition(opts) {
       finish(opts.onFallback, true);
     }
   };
-  rec.onend = () => finish(opts.onFallback, true);
+  rec.onend = () => {
+    // Silence with no final result is "heard nothing", not a reason
+    // to make the learner repeat themselves into the recorder.
+    if (!gotFinal && opts.onEmpty) finish(opts.onEmpty, false);
+    else finish(opts.onFallback, true);
+  };
   try {
     rec.start();
   } catch (e) {
@@ -2092,6 +2775,102 @@ function startBrowserRecognition(opts) {
   }
   return true;
 }
+
+// Wake word (opt-in, off by default): continuous recognition listens
+// for "hey Fundi", then opens an ordinary talk turn. The watchdog
+// restarts listening after each command turn and stays quiet while
+// the tutor is speaking so it never transcribes Fundi's own voice.
+let wakeOn = false, wakeRec = null, wakeWatch = null;
+try { wakeOn = localStorage.getItem("fundiloop-wake") === "1"; } catch (e) { /* private mode */ }
+
+function paintWake() {
+  const b = $("wake-toggle");
+  if (!b) return;
+  b.textContent = wakeOn ? "WAKE ON" : "WAKE OFF";
+  b.setAttribute("aria-pressed", wakeOn ? "true" : "false");
+}
+
+function wakeSpeaking() {
+  try {
+    return !!(speechAudible || serverPlaying ||
+      (("speechSynthesis" in window) && speechSynthesis.speaking));
+  } catch (e) { return false; }
+}
+
+function stopWake() {
+  if (!wakeRec) return;
+  const r = wakeRec;
+  wakeRec = null;
+  try { r.abort(); } catch (e) { /* already ended */ }
+}
+
+function onWakeWord() {
+  stopWake();
+  speak("Yes?", () => {
+    const b = cookMode ? $("cook-talk") : $("talk");
+    if (b) b.click();
+  });
+}
+
+function startWake() {
+  if (!wakeOn || wakeRec || voiceListening || document.hidden) return;
+  if (wakeSpeaking()) return;
+  const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Ctor) return;
+  let rec;
+  try { rec = new Ctor(); } catch (e) { return; }
+  wakeRec = rec;
+  rec.lang = "en-US";
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.maxAlternatives = 1;
+  rec.onresult = (e) => {
+    const results = e.results || [];
+    for (let i = e.resultIndex || 0; i < results.length; i++) {
+      const t = (((results[i] || [])[0] || {}).transcript || "").toLowerCase();
+      if (/\b(hey|ok|okay)?\s*(fundi|fundy|funday)\b/.test(t)) {
+        onWakeWord();
+        return;
+      }
+    }
+  };
+  rec.onerror = (e) => {
+    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      wakeOn = false;
+      paintWake();
+      stopWakeWatch();
+      $("talk-hint").textContent = "Wake word needs microphone permission - use the mic button instead.";
+    }
+  };
+  rec.onend = () => { if (wakeRec === rec) wakeRec = null; };
+  try { rec.start(); } catch (e) { wakeRec = null; }
+}
+
+function startWakeWatch() {
+  if (wakeWatch) return;
+  wakeWatch = setInterval(() => { if (wakeOn && !wakeRec) startWake(); }, 1500);
+  startWake();
+}
+
+function stopWakeWatch() {
+  if (wakeWatch) { clearInterval(wakeWatch); wakeWatch = null; }
+  stopWake();
+}
+
+$("wake-toggle").onclick = () => {
+  wakeOn = !wakeOn;
+  try { localStorage.setItem("fundiloop-wake", wakeOn ? "1" : "0"); } catch (e) { /* private mode */ }
+  paintWake();
+  if (wakeOn) {
+    startWakeWatch();
+    $("talk-hint").textContent = "Wake word on - say \"hey Fundi\" to talk.";
+  } else {
+    stopWakeWatch();
+    $("talk-hint").textContent = "Wake word off.";
+  }
+};
+paintWake();
+if (wakeOn) startWakeWatch();
 
 function handlePttTranscript(text, tag, error) {
   if (text) lastTranscript = text;
@@ -2130,6 +2909,7 @@ function startPttRecorder(btn) {
       btn.classList.remove("rec");
       btn.textContent = "PUSH TO TALK";
       stream.getTracks().forEach((t) => t.stop());
+      OrbWave.releaseMic();
       $("talk-hint").textContent = "Transcribing…";
       try {
         const t = await transcribeUpload(new Blob(pttChunks, { type: "audio/webm" }));
@@ -2139,6 +2919,7 @@ function startPttRecorder(btn) {
       } catch (e) { $("talk-hint").textContent = "Transcription failed — use CHECK NOW."; }
     };
     pttRec.start();
+    OrbWave.tapStream(stream); // orb ripples with the mic
     Orb.listenStart();
     pttRecording = true;
     btn.classList.add("rec");
@@ -2297,7 +3078,9 @@ function stopLive(note) {
   liveHint(note || "Live guide stopped.");
 }
 
-$("live").onclick = () => { if (liveOn) stopLive(); else startLive(); };
+// Live Guide UI removed with the camera surface; the live session
+// implementation (startLive/stopLive + /api/live/session) stays in
+// the codebase, unreachable from this UI.
 
 // Cook Mode: NYT-style guided step runner for learning projects.
 // One step at a time on a full-screen card (step X of Y, progress bar,
@@ -2306,6 +3089,8 @@ $("live").onclick = () => { if (liveOn) stopLive(); else startLive(); };
 // Verification still runs through checkNow: the sensor alone advances.
 let cookMode = false, cookView = null;
 let cookRec = null, cookChunks = [], cookRecording = false;
+let cookPendingVoice = ""; // cook feedback heard mid-check, answered when free
+let cookListenAuto = false; // this listen was hands-free, not a TALK tap
 const COOK_LISTEN_MS = 6000;
 
 // Heartbeat: while Cook Mode sits open, a 60s timer reports idleness
@@ -2379,6 +3164,10 @@ function scheduleAutoCheck() {
   autoTimer = setTimeout(() => {
     autoTimer = null;
     if (!cookMode || !autoCheckOn) return;
+    if (pendingConfirmSid) {
+      scheduleAutoCheck(); // eyeball ask open: wait for the learner
+      return;
+    }
     if (busy || flashBusy || cookRecording || voiceListening) {
       scheduleAutoCheck(); // mid-turn: wait for the next slot
       return;
@@ -2396,7 +3185,7 @@ function pumpHandsfree(tries) {
     if ((tries || 0) > 0) setTimeout(() => pumpHandsfree(tries - 1), 1500);
     return;
   }
-  cookListen();
+  cookListen(true);
 }
 
 function cookSpeak(text, onend) {
@@ -2462,6 +3251,7 @@ function renderCook(v) {
   if (v.timings) html += "\n" + esc(fmtTimings(v.timings));
   $("cook-status").innerHTML = html;
   $("cook-done").hidden = !done;
+  if (done) $("cook-stepcode").hidden = true; // final code panel takes over
   if (!done) {
     $("cook-code-out").textContent = "";
   } else if (v.id && codeFetchedSid !== v.id) {
@@ -2471,17 +3261,23 @@ function renderCook(v) {
     }, 150);
   }
   if (v.step_code && v.step_code.code) {
+    // Visible copy: the Final Code panel stays hidden until DONE, so
+    // the step sketch also lands in the always-visible pre under the
+    // instruction - the label below tells the user to copy THIS code.
     $("cook-code-out").textContent = v.step_code.code;
+    $("cook-step-out").textContent = v.step_code.code;
+    $("cook-stepcode").hidden = false;
     const cports = String(ver.board_state || "").indexOf("silent:") === 0
       ? String(ver.board_state).slice(7) : "";
-    $("cook-heard").textContent = "Step " + v.step_code.n + " sketch — copy it into Arduino IDE, Upload" +
-      (cports ? " to " + cports : "") + ", close Serial Monitor, then press CHECK NOW.";
+    $("cook-heard").textContent = stepSketchLabel(v.step_code.n, cports);
   }
   refreshSchematics();
   fetchGuide();
 }
 
 function drawCookBoxes(detections) {
+  // Cook camera overlay removed with the camera UI: no-op.
+  return;
   const img = $("cook-preview"), svg = $("cook-svg");
   const w = img.naturalWidth || 640, h = img.naturalHeight || 480;
   svg.setAttribute("viewBox", "0 0 " + w + " " + h);
@@ -2612,7 +3408,11 @@ function finishStream(id, res) {
 async function handleCookTranscript(text, error) {
   if (!cookMode) return;
   if (!text) {
-    $("cook-heard").textContent = "Heard nothing" + (error ? ": " + error : "") + ".";
+    // Hands-free silence stays off-screen (it retries quietly); only a
+    // manual TALK tap reports that it heard nothing.
+    if (!cookListenAuto) {
+      $("cook-heard").textContent = "Heard nothing" + (error ? ": " + error : "") + ".";
+    }
     cookSilentStreak += 1;
     if (cookSilentStreak < 3) pumpHandsfree(1); // brief silence keeps listening
     return;
@@ -2620,8 +3420,21 @@ async function handleCookTranscript(text, error) {
   cookSilentStreak = 0;
   lastTranscript = text;
   markCookActive();
+  if (busy) {
+    cookPendingVoice = text; // a check owns the turn; answered right after
+    $("cook-heard").textContent = 'heard: "' + text + '" → queued, will answer when ready.';
+    return;
+  }
   $("cook-heard").textContent = 'heard: "' + text + '"';
   await cookCommand(text);
+}
+
+// A check just closed with cook feedback waiting: answer it now.
+function drainCookVoice() {
+  if (!cookMode || !cookPendingVoice) return;
+  const v = cookPendingVoice;
+  cookPendingVoice = "";
+  cookCommand(v);
 }
 
 function startCookRecorder(btn) {
@@ -2636,6 +3449,7 @@ function startCookRecorder(btn) {
       btn.classList.remove("rec");
       btn.textContent = "TALK";
       stream.getTracks().forEach((t) => t.stop());
+      OrbWave.releaseMic();
       if (!cookMode) return;
       $("cook-heard").textContent = "Transcribing…";
       try {
@@ -2646,6 +3460,7 @@ function startCookRecorder(btn) {
       } catch (e) { $("cook-heard").textContent = "Transcription failed."; }
     };
     cookRec.start();
+    OrbWave.tapStream(stream); // orb ripples with the mic
     Orb.listenStart();
     cookRecording = true;
     btn.classList.add("rec");
@@ -2655,7 +3470,7 @@ function startCookRecorder(btn) {
   }).catch(() => { $("cook-heard").textContent = "Microphone blocked."; });
 }
 
-function cookListen() {
+function cookListen(auto) {
   const btn = $("cook-talk");
   if (activeRec) {
     voiceCancelFallback = true;
@@ -2663,7 +3478,10 @@ function cookListen() {
     return;
   }
   if (cookRecording) { try { cookRec.stop(); } catch (e) { /* already stopped */ } return; }
-  if (!cookMode || busy) return;
+  if (!cookMode) return;
+  cookListenAuto = !!auto;
+  // Recording stays available mid-check like the home mic; the transcript
+  // queues and the coach answers it when the turn closes.
   VoiceEngine.stop(); // never capture while speaking; the tap owns speech now
   if (startBrowserRecognition({
     btn: btn, activeText: "LISTENING…", idleText: "TALK",
@@ -2681,6 +3499,23 @@ function cookListen() {
 
 async function cookCommand(text) {
   const t = text.toLowerCase();
+  // While an eyeball ask is pending, answers belong to it - before
+  // every other phrase, so "yes" never falls through to the coach and
+  // "done" never fires a fresh check that would re-ask the question.
+  if (pendingConfirmSid) {
+    if (/^(yes|yeah|yep|it works|works|confirm|confirmed|correct|blinking|lit|on)\b/.test(t)) {
+      sendConfirm(true);
+      return;
+    }
+    if (/^(no|not yet|nope|not working|isn'?t|doesn'?t)\b/.test(t)) {
+      sendConfirm(false);
+      return;
+    }
+  }
+  if (/(move on|skip( this| the)? step|just continue)/.test(t)) {
+    sendAdvance();
+    return;
+  }
   if (/(repeat|say again|again)/.test(t)) {
     cookSpeak(lastSpeak || (cookView && cookView.instruction) || "");
     return;
@@ -2753,7 +3588,11 @@ async function sendCoachConfirm(confirmed) {
 }
 
 function cookCheck() {
-  if (!cookMode || busy) return;
+  if (!cookMode) return;
+  if (busy) {
+    $("cook-heard").textContent = "Still working — CANCEL, or MOVE ON if I'm stuck.";
+    return;
+  }
   markCookActive();
   checkNow("");
 }
@@ -2762,33 +3601,32 @@ function cookCheck() {
 // auto loop. One tap (or voice phrase) tells the system the wiring
 // is finished — the sensor still verifies and decides, same as CHECK.
 function cookPhaseDone() {
-  if (!cookMode || busy) return;
+  if (!cookMode) return;
+  if (busy) {
+    $("cook-heard").textContent = "Still working — CANCEL, or MOVE ON if I'm stuck.";
+    return;
+  }
   markCookActive();
   checkNow("phase done");
 }
 
 async function cookLook() {
-  if (!cookMode || busy) return;
+  if (!cookMode) return;
+  if (busy) {
+    $("cook-heard").textContent = "Still working — CANCEL, or MOVE ON if I'm stuck.";
+    return;
+  }
   markCookActive();
+  // No camera on this surface anymore: LOOK means look at the wiring
+  // diagram - hear this step's wires as each one lights up.
   cancelWireSpeech();
-  busy = true;
-  $("cook-heard").textContent = "Looking…";
-  speak("Looking.");
-  try {
-    const r = await fetch("/api/vision/describe", { method: "POST" });
-    const v = await r.json();
-    if (!r.ok) {
-      $("cook-heard").textContent = "Look failed: " + ((v && v.detail) || "");
-      return;
-    }
-    drawCookBoxes((v.sam && v.sam.detections) || []);
-    $("cook-heard").textContent = v.description || "";
-    if (v.description) lastSpeak = v.description;
-    cookSpeak(v.description || "");
-  } catch (e) {
-    $("cook-heard").textContent = "Look failed: " + e.message;
-  } finally {
-    busy = false;
+  const st = cookSchematicState;
+  if (st.wires && st.wires.length) {
+    $("cook-heard").textContent = "Looking at the diagram…";
+    speakWireList(wireSpeechItems(st.wires, st.n || learnStepN),
+      cookSpeak, "cook-schematic-svg", "cook-schematic-sel");
+  } else {
+    cookSpeak((cookView && cookView.instruction) || "");
   }
 }
 
@@ -2829,14 +3667,12 @@ function enterCookMode(v) {
   $("cook").hidden = false;
   $("learn-sec").hidden = true; // one focused screen while cooking
   $("cook-heard").textContent = "";
-  $("cook-svg").innerHTML = "";
   $("cook-nudge").hidden = true;
   $("cook-coach-confirm").hidden = true;
   coachPending = null;
   markCookActive();
   renderCook(v);
-  refreshCamera();
-  syncKillState();
+    syncKillState();
   window.scrollTo(0, 0);
   cookSpeak(v.speak || v.instruction || "");
   // Prime the loop baseline so the first auto FAIL waits silently
@@ -2849,6 +3685,7 @@ function enterCookMode(v) {
 function exitCookMode() {
   cookMode = false;
   cancelWireSpeech();
+  cookPendingVoice = "";
   clearAutoTimer();
   autoFired = false;
   $("cook-nudge").hidden = true;
@@ -2897,7 +3734,7 @@ async function flipKillswitch(tripped) {
   } catch (e) { $("cook-heard").textContent = "Kill switch failed."; }
 }
 
-$("cook-talk").onclick = () => { markCookActive(); cookListen(); };
+$("cook-talk").onclick = () => { markCookActive(); cookListen(false); };
 $("cook-coach-yes").onclick = () => sendCoachConfirm(true);
 $("cook-coach-no").onclick = () => sendCoachConfirm(false);
 $("cook-stop").onclick = () => flipKillswitch(true);
@@ -2938,6 +3775,11 @@ $("cook-look").onclick = () => cookLook();
 $("cook-exit").onclick = () => exitCookMode();
 $("cook-code").onclick = () => cookSendCode();
 $("cook-step-code").onclick = () => fetchStepCode("cook-code-out", "cook-heard");
+$("cook-fetch-step").onclick = () => {
+  $("cook-stepcode").hidden = false;
+  fetchStepCode("cook-step-out", "cook-heard");
+};
+$("cook-copy-step").onclick = () => copyCode("cook-step-out", "cook-heard");
 $("cook-resume").onclick = async () => {
   if (busy) return;
   busy = true;
@@ -2958,9 +3800,6 @@ $("handoff-learn").onclick = () => {
   pendingHandoff = null;
   $("handoff-learn").hidden = true;
   mode = "LEARNING";
-  $("mode-learn").classList.add("active");
-  $("mode-guided").classList.remove("active");
-  $("mode-diag").classList.remove("active");
   $("learn-sec").hidden = false;
   $("code-sec").hidden = true;
   if (h.board) {
@@ -2983,62 +3822,8 @@ $("handoff-learn").onclick = () => {
       ". Pick the closest board above, name your project, then SUGGEST PROJECTS.";
   } else {
     $("instruction").textContent = "I see " + (h.board_label || h.board) +
-      " but no parts yet — tap SHOW EQUIPMENT, then SUGGEST PROJECTS.";
+      " but no parts yet — upload a parts photo, then SUGGEST PROJECTS.";
   }
-};
-
-async function pinSnapResult(r, kind) {
-  const j = await r.json();
-  if (!r.ok || !j.ok) throw new Error((j && j.detail) || "snap failed");
-  $("cam-src").textContent = kind + " snap (" + Math.round(j.bytes / 1024) +
-    " KB) pinned — press CHECK NOW to analyze what it shows";
-  const ov = $("cam-overlay");
-  ov.hidden = false;
-  ov.textContent = kind + " snap pinned — press CHECK NOW to analyze it.";
-  refreshCamera();
-}
-
-$("snap").onclick = async () => {
-  if (!cameraConfigured) { $("snap-file").click(); return; } // no overhead cam: phone upload
-  $("cam-src").textContent = "Snapping overhead camera…";
-  try {
-    await pinSnapResult(await fetch("/api/camera/snap", { method: "POST" }), "Overhead");
-  } catch (e) { $("cam-src").textContent = "Snap failed: " + e.message; }
-};
-$("snap-file").onchange = async () => {
-  const f = $("snap-file").files[0];
-  $("snap-file").value = "";
-  if (!f) return;
-  $("cam-src").textContent = "Uploading photo…";
-  try {
-    const fd = new FormData();
-    fd.append("file", f, f.name || "snap.jpg");
-    await pinSnapResult(await fetch("/api/camera/snap", { method: "POST", body: fd }), "Phone");
-  } catch (e) { $("cam-src").textContent = "Snap failed: " + e.message; }
-};
-$("save-cam").onclick = async () => {
-  const stream = $("cam-stream").value.trim();
-  const capture = $("cam-capture").value.trim();
-  $("cam-msg").textContent = "Saving…";
-  try {
-    const r = await fetch("/api/config/camera", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ stream_url: stream, capture_url: capture }),
-    });
-    const j = await r.json();
-    cameraConfigured = !!j.camera_frame_url_set;
-    $("cam-msg").textContent = cameraConfigured
-      ? "Saved — overhead camera live (SNAP now uses it)."
-      : "Cleared — camera offline until URLs are set.";
-    refreshCamera();
-    refreshBadge();
-  } catch (e) { $("cam-msg").textContent = "Save failed: " + e.message; }
-};
-$("clear-snap").onclick = async () => {
-  try { await fetch("/api/camera/snap", { method: "DELETE" }); } catch (e) { /* offline */ }
-  refreshCamera();
-  $("cam-src").textContent = "Phone snap cleared.";
 };
 
 function paintSerialMsg(cur) {
@@ -3144,11 +3929,10 @@ $("describe").onclick = async () => {
     }
     $("instruction").textContent = d.description || "(no description)";
     lastSpeak = d.description || "";
-    if (d.camera_source) $("cam-src").textContent = d.camera_source;
     drawEvidence(d.frame_file, (d.sam && d.sam.detections) || [], d.sam && d.sam.mock);
     speak(d.description);
   } catch (e) { showError(e.message); }
-  finally { busy = false; refreshCamera(); }
+  finally { busy = false; }
 };
 
 function updateMuteBtn() {
@@ -3207,28 +3991,16 @@ if ("speechSynthesis" in window) {
   speechSynthesis.onvoiceschanged = populateVoices; // voices load async
 }
 
-// Boot: load status (or start a session), then keep the preview fresh.
+// Boot: Learning is the landing surface. An existing learning
+// session resumes; guided/diagnostic sessions are never started here.
 fetch("/api/status").then((r) => r.json()).then((v) => {
-  if (v.config) {
-    paintBadge(v.config);
-    cameraConfigured = !!v.config.camera_capture_url;
-    if (v.config.camera_stream_url) $("cam-stream").value = v.config.camera_stream_url;
-    if (v.config.camera_capture_url) $("cam-capture").value = v.config.camera_capture_url;
-    if (cameraConfigured) {
-      $("cam-src").textContent = "camera: configured — waiting for first frame…";
-    } else {
-      $("cam-src").textContent = "camera: offline (set CAMERA_STREAM_URL / CAMERA_CAPTURE_URL in .env)";
-      const ov = $("cam-overlay");
-      ov.hidden = false;
-      ov.textContent = "Camera offline — set CAMERA_STREAM_URL / CAMERA_CAPTURE_URL in .env for the live overhead feed.";
-    }
-  }
+  if (v.config) paintBadge(v.config);
   if (v.learning) { enterLearning(v); return; }
-  if (!v.session && !v.step) return startSession();
-  render(v);
+  mode = "LEARNING";
+  $("learn-sec").hidden = false;
+  $("instruction").textContent =
+    "Hi! Upload a photo of your parts, name your project, then tap SUGGEST — or tap the mic and tell me what you want to build.";
 }).catch((e) => { showError("backend unreachable: " + e.message); });
-refreshCamera();
 refreshSerialPorts();
-setInterval(refreshCamera, 3000);
 setInterval(refreshBadge, 5000);
 setInterval(heartbeatNudge, HEARTBEAT_MS);

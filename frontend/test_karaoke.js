@@ -1,9 +1,16 @@
-/* Karaoke wire speech: focused check for frontend/app.js.
+/* Karaoke wire speech + TTS prefetch + flash retry: focused check for
+ * frontend/app.js.
  *
- * Loads the REAL app.js with minimal DOM stubs (no framework, node only)
- * and drives speakWireList / wireSpeechItems / speakGuideStep with a fake
- * narrator: phrases must sound in order, each wire must light up exactly
- * as it is named, and a cancel or a newer speech must retire the rest.
+ * Loads the REAL app.js with minimal DOM stubs (no framework, node only).
+ * Narrator checks drive speakWireList / wireSpeechItems / speakGuideStep
+ * with a fake voice: phrases must sound in order, each wire must light
+ * up exactly as it is named, and a cancel or a newer speech must retire
+ * the rest. The prefetch check drives playServerChunks with deferred
+ * synthesis + stub audio: chunk 3 must be requested while chunk 1 plays.
+ * The retry check drives webFlash guards + closeWebPortQuiet with a fake
+ * port: a running check is stopped with a retap prompt, the selection
+ * survives checks, empty routes to the picker, and a failed attempt
+ * leaves the button free to retry.
  *
  * Run: node frontend/test_karaoke.js   (exit 0 = pass)
  */
@@ -38,6 +45,8 @@ function makeEl(tag) {
       if (k === "addEventListener") return () => {};
       if (k === "removeEventListener") return () => {};
       if (k === "remove" || k === "click" || k === "focus" || k === "blur") return () => {};
+      if (k === "removeAttribute" || k === "setAttribute") return () => {};
+      if (k === "scrollIntoView") return () => {};
       return undefined;
     },
     set(o, k, v) { o[k] = v; return true; },
@@ -61,10 +70,21 @@ globalThis.location = { href: "http://localhost/", reload() {} };
 globalThis.fetch = async () => ({ ok: false, status: 0, json: async () => ({}), text: async () => "" });
 globalThis.requestAnimationFrame = () => 0;
 globalThis.WebSocket = class { constructor() { this.readyState = 3; } send() {} close() {} };
+// Controllable audio: instances are driven by hand via .onended().
+globalThis.Audio = class {
+  constructor(url) {
+    this.url = url;
+    this.onended = null; this.onplaying = null; this.onerror = null;
+    globalThis.Audio.instances.push(this);
+  }
+  play() { return Promise.resolve(); }
+  pause() {}
+};
+globalThis.Audio.instances = [];
 
 // --- Probe: appended to the real app source, same scope. ---
 const probe = `
-;(function karaokeProbe() {
+;(async function karaokeProbe() {
   const calls = { say: [], isolate: [] };
   const hold = []; // pending onend continuations, in phrase order
   const fakeSay = (text, onend) => { calls.say.push(text); hold.push(onend); };
@@ -151,15 +171,220 @@ const probe = `
   assert.deepEqual(calls.say, ["Check. look"]);
   cookSpeak = realCookSpeak;
   console.log("PASS guide");
+
+  // 6. Prefetch: chunk 3 synthesis starts while chunk 1 still plays, so
+  // a short chunk never ends before the next one is ready (dead air).
+  const fetchCalls = [];
+  const fetchResolvers = [];
+  const realFetchSpeech = fetchServerSpeech;
+  fetchServerSpeech = (t) => {
+    fetchCalls.push(t);
+    return new Promise((res) => fetchResolvers.push(res));
+  };
+  globalThis.Audio.instances.length = 0;
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  let prefetchDone = 0;
+  playServerChunks(["alpha one", "bravo two", "charlie three"], speakSeq,
+    () => { prefetchDone++; });
+  assert.deepEqual(fetchCalls, ["alpha one", "bravo two"]); // primed pre-sound
+  fetchResolvers[0]("u0");
+  await tick();
+  assert.deepEqual(fetchCalls, ["alpha one", "bravo two", "charlie three"]);
+  assert.equal(globalThis.Audio.instances.length, 1);
+  globalThis.Audio.instances[0].onended();
+  fetchResolvers[1]("u1");
+  await tick();
+  assert.equal(globalThis.Audio.instances.length, 2);
+  globalThis.Audio.instances[1].onended();
+  fetchResolvers[2]("u2");
+  await tick();
+  assert.equal(globalThis.Audio.instances.length, 3);
+  globalThis.Audio.instances[2].onended();
+  await tick();
+  assert.equal(prefetchDone, 1);
+  assert.equal(fetchCalls.length, 3); // each chunk fetched exactly once
+  fetchServerSpeech = realFetchSpeech;
+  console.log("PASS prefetch");
+
+  // 7. Flash retry: a running check is stopped (never a silent tap),
+  // an empty selection routes to the picker, and releasing the port
+  // for a check keeps the selection for next time.
+  learnSid = "test-sid";
+  flashBusy = false;
+  busy = true;
+  let aborted = false;
+  checkAbort = { abort: () => { aborted = true; } };
+  webPort = { readable: null, writable: null };
+  await webFlash("retry-status", "retry-prog");
+  assert.equal(aborted, true);
+  assert.ok($("retry-status").textContent.indexOf("press FLASH IN BROWSER again") >= 0);
+  busy = false;
+  checkAbort = null;
+  webPort = null;
+  $("retry-status").textContent = "";
+  await webFlash("retry-status", "retry-prog");
+  assert.ok($("retry-status").textContent.indexOf("CONNECT BOARD") >= 0);
+  const kept = { readable: {}, writable: {},
+    close: async function () { this.readable = null; this.writable = null; } };
+  webPort = kept;
+  await closeWebPortQuiet();
+  assert.equal(webPort, kept); // closed, still selected
+  assert.equal(kept.readable, null);
+  learnSid = "";
+  console.log("PASS retry");
+
+  // 8. Flash failure resets: a failed attempt leaves the button free to
+  // retry (guard off, buttons enabled, failure on screen).
+  learnSid = "test-sid";
+  flashBusy = false;
+  busy = false;
+  webPort = { readable: {}, writable: {}, close: async () => {} };
+  $("retry-status").textContent = "";
+  await webFlash("retry-status", "retry-prog");
+  assert.equal(flashBusy, false);
+  assert.ok($("retry-status").textContent.indexOf("flasher unavailable") >= 0);
+  assert.equal($("web-flash").disabled, false);
+  learnSid = "";
+  webPort = null;
+  console.log("PASS flash-reset");
+
+  // 9. Failure kinds: expired sessions, dead handles, and sync misses
+  // each route to their own recovery guidance.
+  assert.equal(flashFailureKind("unknown learning session id"), "expired");
+  assert.equal(flashFailureKind("The device was disconnected."), "dead");
+  assert.equal(flashFailureKind("No such device"), "dead");
+  assert.equal(flashFailureKind("Failed to execute 'open' on 'SerialPort': Failed to open serial port."), "busy");
+  assert.equal(flashFailureKind("Packet content transfer stopped"), "link");
+  assert.equal(flashFailureKind("Invalid head of packet (0x80): Possible serial noise or corruption."), "sync");
+  assert.equal(flashFailureKind("Failed to connect with the device"), "sync");
+  assert.equal(flashFailureKind("Timed out waiting for packet header"), "sync");
+  assert.equal(flashFailureKind("No serial data received."), "sync");
+  assert.equal(flashFailureKind("compile failed: nope"), "generic");
+  assert.equal(flashFailureKind(""), "generic");
+  console.log("PASS failure-kinds");
+
+  // 10. Cook voice feedback: TALK stays available mid-check like the
+  // home mic; transcripts heard while busy queue and drain after.
+  cookMode = true;
+  busy = true;
+  $("cook-heard").textContent = "";
+  cookListen();
+  assert.equal($("cook-heard").textContent, "Audio capture unavailable — use CHECK.");
+  cookMode = false;
+  $("cook-heard").textContent = "";
+  cookListen();
+  assert.equal($("cook-heard").textContent, "");
+  cookMode = true;
+  await handleCookTranscript("why is it dark?", "");
+  assert.equal(cookPendingVoice, "why is it dark?");
+  assert.ok($("cook-heard").textContent.indexOf("queued") >= 0);
+  const realCookCommand = cookCommand;
+  let drained = "";
+  cookCommand = (t) => { drained = t; };
+  drainCookVoice();
+  assert.equal(drained, "why is it dark?");
+  assert.equal(cookPendingVoice, "");
+  cookPendingVoice = "stale";
+  cookMode = false;
+  drained = "";
+  drainCookVoice();
+  assert.equal(drained, "");
+  cookCommand = realCookCommand;
+  cookMode = false;
+  busy = false;
+  cookPendingVoice = "";
+  console.log("PASS cook-voice");
+
+  // 11. Flash prompt + quiet auto-listens: a silent board with a step
+  // sketch speaks the upload instruction once per step, and hands-free
+  // silence stays off-screen while manual taps still report it.
+  flashSpokenFor = "";
+  learnSid = "s1";
+  learnStepN = 2;
+  const silentView = { id: "s1", step_code: { n: 2, code: "void setup(){}" },
+    verification: { board_state: "silent:COM3" } };
+  assert.ok(flashSpeech(silentView).indexOf("FLASH ESP32") >= 0);
+  assert.equal(flashSpeech(silentView), ""); // once per step
+  assert.ok(flashSpeech({ id: "s1", step_code: { n: 3, code: "x" },
+    verification: { board_state: "silent:COM3" } }).indexOf("FLASH ESP32") >= 0);
+  assert.equal(flashSpeech({ id: "s1",
+    verification: { board_state: "silent:COM3" } }), ""); // no sketch
+  assert.equal(flashSpeech({ id: "s1", step_code: { n: 4, code: "x" },
+    verification: { board_state: "ok" } }), ""); // board talks
+  cookMode = true;
+  cookListenAuto = true;
+  cookSilentStreak = 0;
+  $("cook-heard").textContent = "";
+  await handleCookTranscript("", "");
+  assert.equal($("cook-heard").textContent, "");
+  cookListenAuto = false;
+  await handleCookTranscript("", "");
+  assert.equal($("cook-heard").textContent, "Heard nothing.");
+  cookMode = false;
+  learnSid = "";
+  console.log("PASS flash-prompt");
+
+  // 12. Wave orb: taps are guarded no-ops without Web Audio, and the
+  // mode/level API stays callable from every speech path.
+  OrbWave.setMode("speak");
+  OrbWave.blip(0.7);
+  OrbWave.tapElement({});
+  OrbWave.tapStream(null);
+  OrbWave.releaseMic();
+  assert.equal(OrbWave.level(), 0); // rAF never fires under stubs
+  OrbWave.setMode("idle");
+  console.log("PASS orb-wave");
+
+  // 13. Speak failure: the server's reason reaches the console and the
+  // utterance still resolves to null for browser fallback.
+  const realFetch = globalThis.fetch;
+  const realConsoleLog = console.log;
+  const logged = [];
+  console.log = (...a) => { logged.push(a.join(" ")); };
+  globalThis.fetch = async () => ({ ok: false,
+    json: async () => ({ detail: "kaboom" }) });
+  assert.equal(await fetchServerSpeech("hi"), null);
+  assert.ok(logged.some((l) => l.indexOf("kaboom") >= 0));
+  globalThis.fetch = async () => { throw new Error("down"); };
+  assert.equal(await fetchServerSpeech("hi"), null);
+  globalThis.fetch = realFetch;
+  console.log = realConsoleLog;
+  console.log("PASS speak-log");
+
+  // 14. Speak retry: a failed attempt retries once before falling back,
+  // healing transient model-file reads.
+  const realFetch2 = globalThis.fetch;
+  const realConsoleLog2 = console.log;
+  const logged2 = [];
+  console.log = (...a) => { logged2.push(a.join(" ")); };
+  let speakCalls = 0;
+  globalThis.fetch = async () => {
+    speakCalls++;
+    if (speakCalls === 1) {
+      return { ok: false, json: async () => ({ detail: "flaky" }) };
+    }
+    return { ok: true, blob: async () => new Blob(["x"]) };
+  };
+  const healed = await fetchServerSpeech("hi");
+  assert.ok(healed && healed.indexOf("blob:") === 0);
+  assert.equal(speakCalls, 2);
+  assert.ok(logged2.some((l) => l.indexOf("flaky") >= 0));
+  globalThis.fetch = realFetch2;
+  console.log = realConsoleLog2;
+  console.log("PASS speak-retry");
 })();
 `;
 
 const appSrc = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
-try {
-  eval(appSrc + probe);
-  console.log("karaoke: all checks passed");
-  process.exit(0);
-} catch (e) {
+const fail = (e) => {
   console.error("karaoke FAILED:", e && e.stack ? e.stack : e);
   process.exit(1);
-}
+};
+let result;
+try {
+  result = eval(appSrc + probe); // async probe: wait for it below
+} catch (e) { fail(e); }
+Promise.resolve(result).then(() => {
+  console.log("karaoke: all checks passed");
+  process.exit(0);
+}, fail);

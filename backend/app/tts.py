@@ -249,6 +249,42 @@ def _frames_slow(samples) -> list:
     return frames
 
 
+_NORM_TARGET = 0.95
+_NORM_MAX_GAIN = 5.0
+
+
+def _peak_normalize(frames):
+    """Scale int16 frames toward full scale for uniform loudness.
+
+    Takes the numpy array or int list from the frame converters and
+    returns a plain int list peaking at _NORM_TARGET of full scale, so
+    every utterance sounds at the same level. Gain is capped so
+    near-silence never becomes a noise burst, and all-silence passes
+    through untouched.
+    """
+    try:
+        vals = [int(v) for v in frames]
+    except (TypeError, ValueError):
+        return frames
+    peak = 0
+    for v in vals:
+        a = -v if v < 0 else v
+        if a > peak:
+            peak = a
+    if peak <= 0:
+        return frames
+    gain = min((32767 * _NORM_TARGET) / peak, _NORM_MAX_GAIN)
+    out = []
+    for v in vals:
+        scaled = int(v * gain)
+        if scaled < -32768:
+            scaled = -32768
+        elif scaled > 32767:
+            scaled = 32767
+        out.append(scaled)
+    return out
+
+
 def _samples_to_wav(samples, sample_rate: int) -> bytes:
     """Mono float samples (-1..1, any sequence) to 16-bit WAV bytes."""
     if samples is None:
@@ -258,6 +294,7 @@ def _samples_to_wav(samples, sample_rate: int) -> bytes:
         frames = _frames_slow(samples)
     if len(frames) == 0:
         raise MetaAPIError("kokoro returned no audio")
+    frames = _peak_normalize(frames)
     try:
         rate = int(sample_rate)
     except (TypeError, ValueError):

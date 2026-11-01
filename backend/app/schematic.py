@@ -135,10 +135,28 @@ def build_netlist(plan: list, step_n: int, pin_map: dict | None) -> dict:
                     needed.add(name)
                     # Steps ascend, so the first sighting is the minimum.
                     first_step.setdefault(name, step["n"])
+    # Allocations are computed over the FULL plan's part set, not just
+    # the parts visible by step_n: a part's GPIO must never move when a
+    # later step adds a part that sorts before it.
+    all_needed: set[str] = set()
+    for step in (plan or []):
+        if not isinstance(step, dict):
+            continue
+        deps = step.get("depends_on_parts") or []
+        if not isinstance(deps, list):
+            continue
+        for dep in deps:
+            name = _norm(dep)
+            if name and name not in MCU_ALIASES and name not in PASSIVE_PARTS:
+                all_needed.add(name)
+    assignments: dict[str, list[int] | None] = {}
+    taken_all: set[int] = set()
+    for name in sorted(all_needed):
+        if name in SIGNAL_PINS:
+            assignments[name] = _allocate(SIGNAL_PINS[name], taken_all)
     wires: list[dict] = []
     unresolved: list[dict] = []
     parts: list[str] = []
-    taken: set[int] = set()
     notes: list[str] = []
     has_i2c = False
     for name in sorted(needed):
@@ -161,7 +179,7 @@ def build_netlist(plan: list, step_n: int, pin_map: dict | None) -> dict:
             wires.append({"part": name, "part_pin": "-",
                           "board_pin": "GND", "signal": "ground"})
         elif name == "rgb_led":
-            pins = _allocate(SIGNAL_PINS[name], taken)
+            pins = assignments.get(name)
             if pins is None:
                 unresolved.append({"part": name, "reason":
                                    "no free GPIO left for the R/G/B signals"})
@@ -173,7 +191,7 @@ def build_netlist(plan: list, step_n: int, pin_map: dict | None) -> dict:
             wires.append({"part": name, "part_pin": "COM",
                           "board_pin": "GND", "signal": "ground"})
         elif name in SIGNAL_PINS:
-            pins = _allocate(SIGNAL_PINS[name], taken)
+            pins = assignments.get(name)
             if pins is None:
                 unresolved.append({"part": name, "reason":
                                    "no free GPIO left for its signal pin(s)"})
@@ -217,6 +235,159 @@ def build_netlist(plan: list, step_n: int, pin_map: dict | None) -> dict:
             "parts": parts, "wires": wires,
             "unresolved": unresolved, "notes": notes,
             "requested": sorted(requested)}
+
+
+_GPIO_MENTION = re.compile(r"(GPIO|pin)\s*(\d+)", re.IGNORECASE)
+
+
+def _gpio_int(board_pin: object) -> int | None:
+    m = re.fullmatch(r"GPIO(\d+)", str(board_pin or ""))
+    return int(m.group(1)) if m else None
+
+
+def _step_pin_facts(plan: list, pin_map: dict | None) -> dict:
+    """Per-step pin facts from the allocator (the board's truth).
+
+    {n: {"added_signal": [GPIO ints introduced by step n, wire order],
+         "cumulative": {every GPIO wired up to and including step n},
+         "pin_by_name": {part-pin name (SDA, DATA, ...) -> GPIO int}}}
+    """
+    steps = [s for s in (plan or [])
+             if isinstance(s, dict) and isinstance(s.get("n"), int)]
+    if not steps:
+        return {}
+    full = build_netlist(plan, max(s["n"] for s in steps), pin_map)
+    facts: dict[int, dict] = {}
+    for step in sorted(steps, key=lambda s: s["n"]):
+        n = step["n"]
+        net = build_netlist(plan, n, pin_map)
+        facts[n] = {
+            "added_signal": [
+                g for w in full["wires"]
+                if w.get("step_added") == n
+                and w.get("part_pin") not in ("SDA", "SCL")
+                and (g := _gpio_int(w.get("board_pin"))) is not None],
+            "cumulative": {
+                g for w in net["wires"]
+                if (g := _gpio_int(w.get("board_pin"))) is not None},
+            "pin_by_name": {
+                str(w.get("part_pin")): g for w in net["wires"]
+                if (g := _gpio_int(w.get("board_pin"))) is not None},
+        }
+    return facts
+
+
+def _repair_text(text: str, fact: dict | None) -> str:
+    """Rewrite pin mentions that contradict the schematic for a step.
+
+    A mention named by its signal ("SDA to GPIO18", "DATA pin to
+    pin 18") follows that signal's wired pin. Bare wrong GPIO mentions
+    are rewritten only when the mapping is unambiguous: one new signal
+    pin this step, or exactly as many wrong mentions (in order) as new
+    signal pins. Mentions already on a wired pin always stay.
+    """
+    if not text or not fact:
+        return text
+    matches = list(_GPIO_MENTION.finditer(text))
+    if not matches:
+        return text
+    by_name = {str(k).upper(): v
+               for k, v in (fact.get("pin_by_name") or {}).items()}
+    tokens = sorted((t for t in by_name if len(t) >= 2),
+                    key=len, reverse=True)
+    fixes: dict[int, int] = {}  # mention index -> correct GPIO
+
+    def _named_before(pos: int) -> int | None:
+        head = text[max(0, pos - 48):pos]
+        cut = max(head.rfind("."), head.rfind(";"), head.rfind("\n"))
+        if cut >= 0:
+            head = head[cut + 1:]
+        head = head.upper()
+        best, best_at = None, -1
+        for token in tokens:
+            at = head.rfind(token)
+            if at > best_at:
+                best, best_at = by_name[token], at
+        return best
+
+    for i, m in enumerate(matches):
+        named = _named_before(m.start())
+        if named is not None and named != int(m.group(2)):
+            fixes[i] = named
+    bare_wrong = [int(m.group(2)) for i, m in enumerate(matches)
+                  if i not in fixes and m.group(1).upper() == "GPIO"
+                  and int(m.group(2)) not in fact["cumulative"]]
+    added = fact["added_signal"]
+    bare_map: dict[int, int] = {}
+    if bare_wrong:
+        distinct = list(dict.fromkeys(bare_wrong))
+        if len(added) == 1:
+            bare_map = {w: added[0] for w in distinct}
+        elif len(distinct) == len(added):
+            bare_map = dict(zip(distinct, added))
+    if not fixes and not bare_map:
+        return text
+
+    out, last = [], 0
+    for i, m in enumerate(matches):
+        new = fixes.get(i, bare_map.get(int(m.group(2))))
+        if new is None:
+            continue
+        out.append(text[last:m.start(2)])
+        out.append(str(new))
+        last = m.end(2)
+    out.append(text[last:])
+    return "".join(out)
+
+
+def repair_text_pins(text: str, plan: list, step_n,
+                     pin_map: dict | None) -> str:
+    """Repair one arbitrary text (hint, answer) against a step's board."""
+    facts = _step_pin_facts(plan, pin_map)
+    try:
+        n = int(step_n)
+    except (TypeError, ValueError):
+        return text
+    return _repair_text(str(text or ""), facts.get(n))
+
+
+def repair_plan_pins(plan: list, pin_map: dict | None) -> list:
+    """Copy of the plan with instruction GPIOs matching the schematic."""
+    facts = _step_pin_facts(plan, pin_map)
+    if not facts:
+        return [dict(s) if isinstance(s, dict) else s for s in (plan or [])]
+    out = []
+    for step in (plan or []):
+        if not isinstance(step, dict):
+            out.append(step)
+            continue
+        fixed = dict(step)
+        if fixed.get("instruction"):
+            fixed["instruction"] = _repair_text(
+                str(fixed["instruction"]), facts.get(fixed.get("n")))
+        out.append(fixed)
+    return out
+
+
+def repair_chapters_pins(chapters: list, plan: list,
+                         pin_map: dict | None) -> list:
+    """Copy of lesson chapters with teach/task GPIOs matching the board."""
+    facts = _step_pin_facts(plan, pin_map)
+    if not facts:
+        return [dict(c) if isinstance(c, dict) else c
+                for c in (chapters or [])]
+    out = []
+    for chapter in (chapters or []):
+        if not isinstance(chapter, dict):
+            out.append(chapter)
+            continue
+        fixed = dict(chapter)
+        for field in ("teach", "task"):
+            if fixed.get(field):
+                fixed[field] = _repair_text(
+                    str(fixed[field]), facts.get(fixed.get("n")))
+        out.append(fixed)
+    return out
 
 
 def svg_id(text: str) -> str:

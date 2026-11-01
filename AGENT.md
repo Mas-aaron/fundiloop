@@ -154,6 +154,19 @@ Guided Assembly and Diagnostic modes are unchanged (still sensor-verified).
 - Log excerpts lead with root errors: toolchains print the cause
   early and the consequence late, so excerpts now surface `error`
   lines first, then the tail (build + flash). 1 test.
+- Build auto-installs sketch libraries: includes map to Library
+  Manager names (Adafruit SSD1306/GFX/BME280/Sensor, DHT,
+  ArduinoJson, PubSubClient, NTPClient); missing ones install via
+  `arduino-cli lib install` before compiling, best-effort (the
+  compile still runs; unknown headers stay for the compile error to
+  name). `ARDUINO_AUTO_LIBS=0` disables. Excerpts strip ANSI color
+  codes. 10 tests.
+- No wedged steps: Learn has the same MOVE ON escape as Cook (it
+  aborts an in-flight check turn first, then advances audit-logged
+  as unverified); every check turn aborts itself at 120s with a
+  spoken timeout message instead of spinning forever; Cook
+  CHECK/PHASE DONE/LOOK say they are still working instead of
+  silently ignoring taps while busy.
 - Browser flash API fix (verified against esptool-js 0.5.7 source):
   `ESPLoader` takes `{transport, baudrate, terminal}`, not a
   positional transport (the old call crashed in `getInfo`); CONNECT
@@ -175,6 +188,96 @@ Guided Assembly and Diagnostic modes are unchanged (still sensor-verified).
   FAIL stay silent while panels update. AUTO ✓ button shows the
   countdown and toggles the loop; EXIT, DONE, or toggling off
   interrupts. Manual checks always speak.
+- Louder tutor voice: Kokoro output peak-normalizes to 0.95 full
+  scale (`_peak_normalize` in `tts.py`, gain capped at 5x so
+  near-silence never bursts, silence untouched), so every utterance
+  plays at a uniform loud level instead of ~30%. 3 pinned
+  conversion tests updated to the new contract + 4 normalization
+  tests. Needs a server restart.
+- Spoken flash prompt + quiet auto-listens: a silent board with a
+  step sketch now speaks "press FLASH IN BROWSER, then CHECK" once
+  per step (even on a quiet repeat), and hands-free "Heard nothing"
+  stays off-screen — only manual TALK taps report it. 1 more check
+  in `frontend/test_karaoke.js`.
+- Plain CONFIRM copy + sticky cook actions: attestation strings now
+  read as a "quick eyeball check" ("I can't see whether GPIO2 is
+  blinking from here…") instead of probe-firmware jargon, and the
+  TALK/CHECK/PHASE DONE/CONFIRM row moved under the header with
+  `position: sticky` so it never needs a scroll to reach.
+- Cook mic feedback mid-check: TALK no longer dies silently while
+  `busy` (with the auto-loop that was most of the time) — it records
+  like the home mic and queues the transcript, answered from
+  `checkNow`'s finally via `drainCookVoice`; exiting clears the
+  queue. 1 more check in `frontend/test_karaoke.js`.
+- Read-timeout retries: "No serial data received" (esptool's read
+  timeout, sync-time or mid-write) joins the `sync` kind so it
+  retries slower and earns the second 115200 shot; sync guidance now
+  covers cable/port persistence, and progress names the file
+  ("Flashing file 2 of 3…"). Harness assert added.
+- Link-break retries: "Packet content transfer stopped" is now a
+  retryable `link` failure kind (slower re-sync, own cable/port/BOOT
+  guidance), 115200 gets a second shot, and packet corruption folds
+  into the `sync` kind so the baud loop retries through one
+  classifier. Harness asserts updated.
+- Browser-flash port release: `POST /api/serial/release` drops both
+  probe handles (same pair the server flash releases) and the page
+  calls it after downloading binaries, fixing "Failed to open serial
+  port" once any check adopts the port; the failure classifier gains
+  a `busy` kind for leftover OS-level holders. 1 backend test + 1
+  harness assert. Needs a server restart (new endpoint).
+- Expired-session flash guidance: a stale page (server restarted,
+  sessions are in-memory) 404s the firmware manifest, so the flash
+  failure classifier (`flashFailureKind`: expired/dead/sync/generic)
+  now tells the user to tap EXIT, start the project fresh, and flash
+  again — spoken too. 1 more check in `frontend/test_karaoke.js`.
+- Speak retry for transient reads: the new logging caught
+  `Overlapped entries: 'af_heart.npy'` (numpy refusing a mid-change
+  voices archive — download/cloud race, valid on recheck), so
+  `fetchServerSpeech` retries once immediately before falling back
+  to browser voice. 1 harness check. Keep model files stable (and
+  OneDrive-pinned) while the server runs.
+- Speak failures self-report: `/api/voice/speak` 502s now log
+  `speak failed: <detail>` server-side and the page mirrors the
+  detail to the console (fallback behavior unchanged), so the next
+  transient-first-utterance failure names itself instead of showing
+  a bare 502. Also fixed `test_confirm_race` (missing `use_mock_env`
+  broke it once the suite loads the real `.env`). 2 tests.
+- Trillion-style wave orb: `OrbWave` drives a new `.orb-wave` ring
+  + orb brightness every animation frame from live levels — mic
+  analyser while listening, speaker analyser while talking, word
+  blips for browser speech, synthetic pulse where no tap exists
+  (recognition path), slow breath at idle. Taps are guarded no-ops
+  without Web Audio; reduced-motion skips the loop. Sync-failure
+  guidance now closes by routing to FLASH ESP32. 1 harness check.
+- Flash path decision (supersedes the removal notes below): an
+  Arduino IDE upload at 921600 baud with full hash verify on the
+  user's own board proved the hardware good and native esptool the
+  working engine, while browser esptool-js 0.5.7 fails on the same
+  link — so the user kept the server COM3/FLASH ESP32 buttons as the
+  recommended path next to browser flash. `flashStep` now shares the
+  abort-and-retap busy guard (the old "wait" text was a dead end
+  under back-to-back checks) and sets the busy guard inside `try`;
+  the spoken flash prompt names FLASH ESP32.
+- Flash-takes-precedence fix: tapping either FLASH button mid-check
+  now stops the check and asks for one more tap (checks can run
+  back-to-back with the auto-loop, so "wait" was a dead end); CHECK
+  tapped mid-flash says so on the active panel; the pre-check port
+  release races a 2s timeout so a wedged port can't stick `busy` on
+  with no cancel. 2 more checks in `frontend/test_karaoke.js`.
+- Flash retry fix: releasing the page port for a check no longer
+  drops the board selection (the auto-loop used to force a fresh
+  CONNECT BOARD after every check); FLASH tapped mid-check now says
+  so on screen instead of dying silently; a truly dead handle
+  (unplugged USB) is the only path that sends the user back to the
+  picker. 1 more check in `frontend/test_karaoke.js`.
+- TTS dead-air fix: `playServerChunks` prefetches two chunks deep
+  (chunk 3 synthesis starts while chunk 1 plays), so a short "You
+  need: ..." chunk never ends before the next long one is ready. 1
+  more check in `frontend/test_karaoke.js` (deferred synthesis + stub
+  audio drive the real player).
+- (Superseded: server-flash rows were removed here, then restored
+  and kept per the flash-path decision above after Arduino IDE
+  proved native esptool on the user's board.)
 - Karaoke wire speech: guide cards and SPEAK WIRES now narrate wire
   by wire, lighting each wire on the diagram exactly as it is named
   (each phrase waits for the previous audio to finish); a check, tap,
@@ -185,10 +288,9 @@ Guided Assembly and Diagnostic modes are unchanged (still sensor-verified).
 - PHASE DONE button (Cook Mode): one tap tells the system the phase
   is wired ("Got it — checking phase N"), then the sensor verifies
   as usual. Voice shares the path: done/finished/complete/ready/
-  move on/next phase|step. Phrases verified by a node probe. The server-side
-  port dropdown + FLASH ESP32 buttons were removed from both panels
-  at the user's request (browser flash is the UI path now); the
-  `POST .../flash` endpoint stays as a tested API fallback.
+  move on/next phase|step. Phrases verified by a node probe. (The
+  server-flash buttons mentioned here were later restored and kept
+  per the flash-path decision above; both flash paths keep UI.)
 - Sketch layout fix: the staged sketch is now
   `step_sketch/step_sketch.ino` (Arduino requires folder and main
   file to share a name); previously `sketch/step_sketch.ino` failed

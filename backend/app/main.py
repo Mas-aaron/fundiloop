@@ -12,11 +12,10 @@ Serves the mobile web UI at / and the session API:
   POST /api/coach/confirm       resolve a pending gated tool (409: none)
   GET  /api/coach/killswitch    kill switch state
   POST /api/coach/killswitch    trip or re-arm the kill switch
-  GET  /api/camera/latest    latest overhead frame (JPEG/PNG)
-  GET  /api/frames/{name}     one saved analysis still (evidence)
   POST /api/voice/transcribe transcribe push-to-talk audio upload
   POST /api/voice/speak       speak text via Meta Voice TTS (browser fallback on failure)
   GET  /api/serial/ports      list serial ports + live probe status
+  POST /api/serial/release    drop probe handles so the browser can open the port
   POST /api/config/serial     point the probes at a port/baud
   POST /api/serial/autodetect adopt the first port answering PING
   WS   /api/live/session     live loop: audio in, clips in, guidance out
@@ -24,7 +23,6 @@ Serves the mobile web UI at / and the session API:
   GET  /api/session/{id}/passport full verifiable log for a session
   POST /discover/parts        scene understanding for a saved frame
   POST /discover/projects     validated generated build plans
-  POST /discover/capture      capture a still for /discover/parts
   POST /discover/upload       save an equipment photo for /discover/parts
   POST /diagnose              start a learning session (mode="learning")
   POST /project/{id}/code     firmware (final when DONE, draft on request)
@@ -45,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import queue
 import threading
@@ -505,6 +504,10 @@ def api_voice_speak(body: dict):
     try:
         audio = get_provider().synthesize(text, (body or {}).get("voice"))
     except MetaAPIError as exc:
+        # 502s are otherwise silent in the access log; name the cause so a
+        # failed utterance (missing models, bad text, synthesis crash) is
+        # diagnosable from the server output alone.
+        logging.getLogger("fundiloop.voice").warning("speak failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc))
     return Response(content=audio, media_type="audio/wav")
 
@@ -885,7 +888,7 @@ def api_step_flash(session_id: str, step_n: int, body: dict | None = None):
     if not port:
         raise HTTPException(
             status_code=400,
-            detail="flash needs an explicit port: pick one, then FLASH ESP32")
+            detail="flash needs an explicit port")
     pre = check_port(port)
     if not pre["ok"]:
         if pre.get("busy", True):
@@ -949,16 +952,6 @@ def api_patient_sketch():
     return {"filename": "patient_board.ino", "code": code}
 
 
-@app.post("/discover/capture")
-def api_discover_capture():
-    """Capture one analysis still and return its frame_path for /discover/parts."""
-    try:
-        _frame, saved = orchestrator.camera.capture_analysis_frame("discover")
-    except CameraError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    return {"frame_path": str(saved)}
-
-
 @app.post("/discover/upload")
 def api_discover_upload(file: bytes = File(...)):
     """Save an uploaded equipment photo for /discover/parts (no camera needed).
@@ -984,30 +977,25 @@ def api_session_passport(session_id: str):
     return data
 
 
-@app.post("/api/config/camera")
-def api_config_camera(body: dict):
-    """Set the overhead camera URLs at runtime and persist them to .env."""
-    stream = str(body.get("stream_url", "") or "").strip()
-    capture = str(body.get("capture_url", "") or "").strip()
-    legacy = str(body.get("frame_url", "") or "").strip()
-    if legacy and not capture:
-        capture = legacy
-    orchestrator.camera.set_urls(stream_url=stream, capture_url=capture)
-    orchestrator.camera.clear_override()
-    orchestrator.settler.reset()
-    _persist_env_var("CAMERA_STREAM_URL", stream)
-    _persist_env_var("CAMERA_CAPTURE_URL", capture)
-    os.environ["CAMERA_STREAM_URL"] = stream
-    os.environ["CAMERA_CAPTURE_URL"] = capture
-    return {"camera_frame_url_set": bool(capture),
-            "camera_source": orchestrator.camera.describe_source()}
-
-
 @app.get("/api/serial/ports")
 def api_serial_ports():
     """List candidate serial ports plus the probe's live port/baud/error."""
     return {"ports": list_serial_ports(),
             "current": orchestrator.probe.serial_status()}
+
+
+@app.post("/api/serial/release")
+def api_serial_release():
+    """Drop both probe serial handles so the browser can open the port.
+
+    Browser flash (Web Serial) needs the port exclusively, and the
+    probes hold it persistently once a check adopts it — the same
+    release the server-side flash does before running esptool. Probes
+    reopen lazily on the next command, so checks are unaffected.
+    """
+    orchestrator.probe.close()
+    live_guide.probe.close()
+    return {"ok": True}
 
 
 @app.post("/api/config/serial")
@@ -1062,61 +1050,4 @@ def _persist_env_var(name: str, value: str) -> None:
         pass
 
 
-@app.post("/api/camera/snap")
-async def api_camera_snap(file: UploadFile | None = File(None)):
-    """Pin one frame for analysis: uploaded photo, else the overhead camera."""
-    if file is not None and file.filename:
-        data = await file.read(6 * 1024 * 1024 + 1)
-        if len(data) > 6 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="image too large (6 MB max)")
-        if not (data[:2] == b"\xff\xd8" or data[:8] == b"\x89PNG\r\n\x1a\n"):
-            raise HTTPException(status_code=400, detail="not a JPEG/PNG image")
-        source = "phone photo"
-    else:
-        try:
-            data = orchestrator.camera.grab_live()
-        except CameraError as exc:
-            raise HTTPException(status_code=502, detail="camera snap failed: %s" % exc)
-        source = "overhead camera"
-    orchestrator.camera.set_override(data)
-    orchestrator.settler.reset()
-    return {"ok": True, "bytes": len(data), "source": source}
 
-
-@app.delete("/api/camera/snap")
-def api_camera_snap_clear():
-    orchestrator.camera.clear_override()
-    orchestrator.settler.reset()
-    return {"ok": True}
-
-
-@app.get("/api/camera/latest")
-def api_camera_latest():
-    from .camera_client import media_type_for_frame
-
-    try:
-        frame = orchestrator.camera.get_latest_preview_frame()
-    except CameraError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    return Response(
-        content=frame,
-        media_type=media_type_for_frame(frame),
-        headers={"X-FundiLoop-Camera-Source": orchestrator.camera.describe_source()},
-    )
-
-
-@app.get("/api/frames/{name}")
-def api_saved_frame(name: str):
-    """Serve one saved analysis still so the UI can show the evidence.
-
-    Basename-only inside the camera debug dir: anything else is a 404.
-    """
-    debug_dir = orchestrator.camera.debug_dir
-    suffix = Path(name).suffix.lower()
-    if Path(name).name != name or suffix not in (".jpg", ".jpeg", ".png"):
-        raise HTTPException(status_code=404, detail="no such frame")
-    path = debug_dir / name
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="no such frame")
-    media = "image/png" if suffix == ".png" else "image/jpeg"
-    return FileResponse(str(path), media_type=media)

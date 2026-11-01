@@ -275,6 +275,11 @@ class AgentOrchestrator:
         for i, step in enumerate(steps):
             if isinstance(step, dict):
                 step["n"] = i + 1
+        # One pin truth: spoken/written GPIOs are corrected to the
+        # schematic allocator's assignment before anything narrates.
+        from .schematic import repair_plan_pins
+
+        steps = repair_plan_pins(steps, pin_map_for(key))
         sid = session_id or uuid.uuid4().hex
         self.sessions.pop(sid, None)
         self.session = {
@@ -340,6 +345,10 @@ class AgentOrchestrator:
         try:
             full = plan_chapters(plan, Muse or MetaClaudeAdapter(),
                                  project_title, board)
+            from .schematic import repair_chapters_pins
+
+            full = repair_chapters_pins(full, plan,
+                                        session.get("pin_map"))
         except Exception:
             return
         try:
@@ -354,7 +363,10 @@ class AgentOrchestrator:
 
         assert self.session is not None
         self.session["turns"] += 1
-        self.session["confirm_pending"] = None  # a fresh turn voids stale asks
+        # A fresh turn voids only a STALE ask (a different step): an
+        # eyeball pending for this step must survive AUTO re-checks so
+        # the learner's CONFIRM tap still lands. A sensor pass clears
+        # it in the pass branch below.
         t0 = time.monotonic()
         timings: dict[str, float] = {"sam_ms": 0.0, "glance_ms": 0.0,
                                      "reason_ms": 0.0}
@@ -381,6 +393,9 @@ class AgentOrchestrator:
                 fundi={"event": "LESSON_DONE", "chapter": None,
                        "chapters_total": len(plan)}))
         step = plan[idx]
+        _pending = self.session.get("confirm_pending")
+        if _pending and _pending.get("n") != step.get("n", idx + 1):
+            self.session["confirm_pending"] = None
         probe_t0 = time.monotonic()
         probe = self.probe.read_all(simulate_fault=req.simulate_fault)
         timings["sense_ms"] = timings["probe_ms"] = \
@@ -410,6 +425,7 @@ class AgentOrchestrator:
         chapters = self.session.get("chapters") or []
         current_ch = chapter_for(chapters, self.session["step_index"]) or {}
         if verification["passed"]:
+            self.session["confirm_pending"] = None  # sensor decided it
             idx += 1
             self.session["step_index"] = idx
             if idx >= len(plan):
@@ -451,6 +467,11 @@ class AgentOrchestrator:
             return done(self._offer_confirmation(step, verification))
         r_t0 = time.monotonic()
         hint = build_hint(step, verification, self.Muse)
+        # Model hints narrate freely: keep their pins on the board's.
+        from .schematic import repair_text_pins
+
+        hint = repair_text_pins(hint, plan, step.get("n"),
+                                self.session["pin_map"])
         timings["reason_ms"] = (time.monotonic() - r_t0) * 1000
         if verification.get("board_state"):
             # Known no-board failure: measured is a port dump for the
@@ -499,8 +520,8 @@ class AgentOrchestrator:
             "n": step.get("n", self.session["step_index"] + 1),
             "test": verification.get("test", ""),
             "measured": verification.get("measured", ""),
-            "question": ("I cannot verify this over serial: %s. "
-                         "If you can see it working, press CONFIRM."
+            "question": ("Quick eyeball check: %s. "
+                         "If it looks right on your board, press CONFIRM."
                          % verification.get("measured", "")),
         }
         self.session["confirm_pending"] = pending

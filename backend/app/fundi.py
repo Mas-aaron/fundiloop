@@ -103,8 +103,7 @@ def speak_start(chapter: dict, project_title: str) -> str:
     teach = str(chapter.get("teach") or "").strip()
     task = str(chapter.get("task") or "").strip()
     if not teach:
-        return "Starting %s. Step %s: %s" % (
-            project_title, chapter.get("n", "?"), task)
+        return "Step %s: %s" % (chapter.get("n", "?"), task)
     return "%s %s" % (teach, task)
 
 

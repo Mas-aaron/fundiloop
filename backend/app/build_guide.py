@@ -113,6 +113,7 @@ def build_guide(session: dict) -> dict:
         steps.append({
             "n": n,
             "title": title,
+            "teach": str(chapter.get("teach") or "").strip(),
             "text": text,
             "wire_ids": [svg_id("wire-%s-%s" % (w.get("part"),
                                                 w.get("part_pin")))

@@ -572,15 +572,14 @@ class DiscoverUploadTest(unittest.TestCase):
             app_main.api_discover_upload(b"\xff\xd8" + b"\x00" * (6 * 1024 * 1024))
         self.assertEqual(ctx.exception.status_code, 400)
 
-    def test_saved_png_frame_serves_with_png_media_type(self):
+    def test_saved_png_frame_stays_on_disk_not_served(self):
+        # /api/frames was removed with the camera surface: the PNG is
+        # still written for analysis, just not served over HTTP.
         name = "frame_test.png"
         with open(os.path.join(self.tmp.name, name), "wb") as fh:
             fh.write(TEST_PNG)
-        resp = app_main.api_saved_frame(name)
-        self.assertEqual(resp.media_type, "image/png")
-        with self.assertRaises(HTTPException) as ctx:
-            app_main.api_saved_frame("frame_test.txt")
-        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp.name, name)))
+        self.assertFalse(hasattr(app_main, "api_saved_frame"))
 
 
 if __name__ == "__main__":

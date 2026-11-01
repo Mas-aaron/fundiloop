@@ -69,8 +69,7 @@ def run_learning_verification(verify: str, expect: object, probe,
     elif test == "CHECK_OLED":
         if probe.oled_ok is None:
             passed = False
-            measured = ("OLED state unknown over serial "
-                        "(probe firmware cannot assess it)")
+            measured = "I can't see the OLED screen from here"
             needs_confirmation = True
         else:
             passed = probe.oled_ok is True
@@ -84,14 +83,13 @@ def run_learning_verification(verify: str, expect: object, probe,
                 pass
         if pin != pin_map.get("led_gpio", 2):
             passed = False
-            measured = ("GPIO%d readback not supported by probe firmware "
-                        "(only GPIO%d LED check)" % (pin, pin_map.get("led_gpio", 2)))
+            measured = ("I can only check the GPIO%d LED from here, not GPIO%d"
+                        % (pin_map.get("led_gpio", 2), pin))
         elif probe.led_ok is None:
             # Unknown, not failed: the probe cannot assess this pin (plain
             # sketch, no patient protocol), so the technician confirms.
             passed = False
-            measured = ("GPIO%d blink unverifiable over serial "
-                        "(probe firmware cannot assess it)" % pin)
+            measured = "I can't see whether GPIO%d is blinking from here" % pin
             needs_confirmation = True
         else:
             passed = probe.led_ok is True

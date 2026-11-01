@@ -13,7 +13,8 @@
 <header class="topbar">
   <h1 class="logo">FundiLoop</h1>
   <div class="topbar-right">
-    <span id="mode-badge" class="mock" title="LIVE only when the real camera and real Meta models are connected">MOCK</span>
+    <button id="wake-toggle" class="small" type="button" aria-pressed="false" title="Listen for the wake word">WAKE OFF</button>
+    <span id="mode-badge" class="mock" title="LIVE only when the real Meta models are connected">MOCK</span>
     <button id="settings-btn" class="icon-btn" type="button" aria-label="Settings">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
@@ -21,10 +22,9 @@
 </header>
 
 <main>
-  <div class="mode-row" role="tablist" aria-label="Mode">
-    <button id="mode-guided" class="mode active" type="button">Guided</button>
-    <button id="mode-diag" class="mode" type="button">Diagnostic</button>
-    <button id="mode-learn" class="mode" type="button">Learning</button>
+  <div class="hero">
+    <h2 class="hero-title">Hi, I'm Fundi</h2>
+    <p class="fine">Tell me what you want to build. I will plan it, wire it with you, and check every step.</p>
   </div>
 
   <div class="orb-container">
@@ -32,6 +32,7 @@
     <div class="orb-ring"></div>
     <div class="orb-ring-2"></div>
     <div class="orb-ring-3"></div>
+    <div class="orb-wave" aria-hidden="true"></div>
     <div id="orb" class="orb" aria-hidden="true"></div>
   </div>
 
@@ -55,32 +56,16 @@
     <p class="mic-hint">Tap to speak</p>
   </div>
 
-  <div class="cam-container">
-    <figure class="cam">
-      <img id="preview" alt="overhead camera view of the circuit">
-      <div id="cam-overlay" hidden></div>
-    </figure>
-    <div id="cam-src" class="fine"></div>
-  </div>
-
-  <div class="btn-grid">
-    <button id="live" class="big live" type="button">Live Guide</button>
-    <button id="snap" class="big snap" type="button">Snap Photo</button>
-  </div>
-  <input id="snap-file" type="file" accept="image/*" capture="environment" hidden>
-  
   <div id="talk-hint" class="fine"></div>
-  <div id="live-hint" class="fine"></div>
 
   <div class="btn-row" style="margin-bottom: 1rem; justify-content: center;">
     <button id="handoff-learn" class="small" type="button" hidden>START LEARNING</button>
   </div>
 
-  <section id="learn-sec" class="panel" hidden>
+  <section id="learn-sec" class="panel">
     <h2>Learn a project</h2>
     <div class="btn-row" style="margin-bottom: 1rem;">
-      <button id="learn-equip" class="small" type="button">EQUIPMENT</button>
-      <button id="learn-upload" class="small" type="button">UPLOAD</button>
+      <button id="learn-upload" class="small" type="button">UPLOAD PARTS PHOTO</button>
     </div>
     <input id="learn-file" type="file" accept="image/*" hidden>
     <ol id="learn-parts" class="list"></ol>
@@ -101,6 +86,9 @@
     <ol id="learn-cards" class="list" style="margin-top: 1rem;"></ol>
   </section>
 
+  <!-- Guided/Diagnostic home panels: implementations kept, unreachable
+       from the Learning-first UI. -->
+  <div id="guided-home" hidden>
   <div class="panel">
     <h2>Verification</h2>
     <div id="verify">No measurements yet. Press CHECK NOW to begin.</div>
@@ -121,16 +109,7 @@
     <button id="describe" class="small" type="button">Describe</button>
     <button id="mute" class="small" type="button">Mute</button>
   </div>
-
-  <!-- Hidden sections that are toggled via JS -->
-  <section id="evidence-sec" class="panel" hidden>
-    <h2>Evidence</h2>
-    <figure class="evidence-cam">
-      <img id="evidence-img" alt="the analyzed frame with vision regions">
-      <svg id="evidence-svg"></svg>
-    </figure>
-    <div id="evidence-cap" class="fine"></div>
-  </section>
+  </div>
 
   <section id="passport-sec" class="panel" hidden>
     <h2>Passport</h2>
@@ -166,6 +145,12 @@
       </div>
       <progress id="webflash-progress" max="100" value="0" hidden style="width: 100%;"></progress>
       <div id="webflash-status" class="fine"></div>
+      <div class="fine" style="margin-top: 0.75rem;">Recommended: FLASH ESP32 uses the server's native esptool at 921600 baud, the same auto-reset upload path as Arduino IDE.</div>
+      <div class="btn-row" style="margin-top: 0.5rem;">
+        <select id="flash-port" aria-label="ESP32 serial port"></select>
+        <button id="flash-esp32" class="small" type="button">FLASH ESP32</button>
+      </div>
+      <div id="flash-status" class="fine"></div>
     </div>
   </section>
 
@@ -174,17 +159,12 @@
 <div class="controls-footer">
   <button id="check" type="button">CHECK NOW</button>
   <button id="cancel" class="big danger" type="button" hidden>CANCEL</button>
+  <button id="move-on" class="big" type="button">MOVE ON</button>
 </div>
 
 <div id="settings-modal" hidden>
   <div class="modal-card" role="dialog" aria-label="Settings">
     <h2>Settings</h2>
-    <label>Overhead Camera URL</label>
-    <input id="cam-stream" type="text" placeholder="Stream URL">
-    <input id="cam-capture" type="text" placeholder="Capture URL">
-    <button id="save-cam" class="small">Save Camera</button>
-    <div id="cam-msg" class="fine"></div>
-    
     <label>Serial Port</label>
     <div class="btn-row">
       <select id="serial-port"></select>
@@ -228,7 +208,6 @@
     <div id="voice-status" class="fine"></div>
 
     <div class="btn-row" style="margin-top: 1rem;">
-      <button id="clear-snap" class="small">Clear Snap</button>
       <button id="rescan" class="small">Rescan</button>
     </div>
 
@@ -247,6 +226,7 @@
       </div>
       <div class="orb-container-small">
         <div class="orb-ring" style="opacity: 0.05;"></div>
+        <div class="orb-wave" aria-hidden="true"></div>
         <div id="cook-orb" class="orb orb-small" aria-hidden="true"></div>
       </div>
       <div class="btn-row">
@@ -256,12 +236,39 @@
     </div>
     
     <div class="cook-progress"><div id="cook-bar"></div></div>
-    
+
+    <div class="btn-row cook-btns cook-actions" style="flex-wrap: wrap;">
+      <button id="cook-talk" class="small" type="button">TALK</button>
+      <button id="cook-check" class="small" type="button">CHECK</button>
+      <button id="cook-phase-done" class="small" type="button">PHASE DONE</button>
+      <button id="cook-auto" class="small" type="button">AUTO ✓</button>
+      <button id="cook-confirm" class="small" type="button" hidden>CONFIRM</button>
+      <button id="cook-repeat" class="small" type="button">REPEAT</button>
+      <button id="cook-look" class="small" type="button">LOOK</button>
+      <button id="cook-move-on" class="small" type="button">MOVE ON</button>
+    </div>
+
+    <div id="cook-eyeball" class="panel" hidden>
+      <div id="cook-eyeball-q" role="status"></div>
+      <div class="btn-row" style="margin-top: 0.5rem;">
+        <button id="cook-eyeball-yes" class="small" type="button">YES - IT WORKS</button>
+        <button id="cook-eyeball-no" class="small" type="button">NOT YET</button>
+      </div>
+      <div class="fine">Your eyes are the sensor for this one. YES moves to the next step; you can also just say "yes" or "not yet".</div>
+    </div>
+
     <div class="cook-split">
       <div class="cook-talk">
         <div id="cook-chapter" class="chapter-title" hidden></div>
         <div id="cook-instruction" role="status" class="panel"></div>
         <div id="cook-heard" class="fine"></div>
+        <div id="cook-stepcode" hidden>
+          <div class="btn-row" style="margin-top: 0.5rem;">
+            <button id="cook-fetch-step" class="small" type="button">STEP CODE</button>
+            <button id="cook-copy-step" class="small" type="button">COPY CODE</button>
+          </div>
+          <pre id="cook-step-out"></pre>
+        </div>
 
         <div id="cook-nudge" class="panel" hidden>
           <span id="cook-nudge-text"></span>
@@ -306,6 +313,12 @@
         </div>
         <progress id="cook-webflash-progress" max="100" value="0" hidden style="width: 100%;"></progress>
         <div id="cook-webflash-status" class="fine"></div>
+        <div class="fine" style="margin-top: 0.75rem;">Recommended: FLASH ESP32 uses the server's native esptool at 921600 baud, the same auto-reset upload path as Arduino IDE.</div>
+        <div class="btn-row" style="margin-top: 0.5rem;">
+          <select id="cook-flash-port" aria-label="ESP32 serial port"></select>
+          <button id="cook-flash-esp32" class="small" type="button">FLASH ESP32</button>
+        </div>
+        <div id="cook-flash-status" class="fine"></div>
       </div>
     </div>
 
@@ -320,25 +333,8 @@
 
     <ol id="cook-parts" class="cook-chips"></ol>
 
-    <div class="cam-container">
-      <figure class="cook-cam">
-        <img id="cook-preview" alt="overhead camera view of the circuit">
-        <svg id="cook-svg" preserveAspectRatio="none"></svg>
-      </figure>
-    </div>
-
     <div id="cook-status" class="panel">No measurements yet.</div>
-    
-    <div class="btn-row cook-btns" style="flex-wrap: wrap;">
-      <button id="cook-talk" class="small" type="button">TALK</button>
-      <button id="cook-check" class="small" type="button">CHECK</button>
-      <button id="cook-phase-done" class="small" type="button">PHASE DONE</button>
-      <button id="cook-auto" class="small" type="button">AUTO ✓</button>
-      <button id="cook-confirm" class="small" type="button" hidden>CONFIRM</button>
-      <button id="cook-repeat" class="small" type="button">REPEAT</button>
-      <button id="cook-look" class="small" type="button">LOOK</button>
-    </div>
-    
+
     <label class="cook-handsfree">
       <input id="cook-handsfree" type="checkbox"> Hands-free mode
     </label>

@@ -23,6 +23,28 @@ ARTIFACTS = [{"offset": "0x1000", "file": "boot.bin"},
              {"offset": "0x10000", "file": "sketch.bin"}]
 
 
+class EsptoolCmdTest(unittest.TestCase):
+    def test_env_override_wins(self):
+        with mock.patch.dict(os.environ, {"ESPTOOL_BIN": "custom-esptool"}):
+            self.assertEqual(ff.esptool_cmd(), ["custom-esptool"])
+
+    def test_path_esptool_used_when_module_missing(self):
+        with mock.patch.dict(os.environ, {"ESPTOOL_BIN": ""}), \
+                mock.patch("importlib.util.find_spec", return_value=None), \
+                mock.patch("shutil.which",
+                           return_value="C:/tools/esptool.exe"):
+            self.assertEqual(ff.esptool_cmd(), ["C:/tools/esptool.exe"])
+
+    def test_module_preferred_when_installed(self):
+        with mock.patch.dict(os.environ, {"ESPTOOL_BIN": ""}), \
+                mock.patch("importlib.util.find_spec",
+                           return_value=object()), \
+                mock.patch("shutil.which",
+                           return_value="C:/tools/esptool.exe"):
+            self.assertEqual(ff.esptool_cmd(),
+                             [sys.executable, "-m", "esptool"])
+
+
 class FlashArtifactsTest(unittest.TestCase):
     def test_success_flashes_offsets_in_order(self):
         calls = []

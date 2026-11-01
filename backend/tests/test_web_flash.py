@@ -224,5 +224,23 @@ class EnsureBundleTest(unittest.TestCase):
             self.assertEqual(fh.read(), VALID_BUNDLE)
 
 
+class SerialReleaseTest(unittest.TestCase):
+    """POST /api/serial/release drops both probe handles for Web Serial."""
+
+    def test_release_closes_both_probes(self):
+        import backend.app.main as app_main
+
+        orc_probe = mock.Mock()
+        live_probe = mock.Mock()
+        with mock.patch.object(app_main, "orchestrator",
+                               SimpleNamespace(probe=orc_probe)), \
+             mock.patch.object(app_main, "live_guide",
+                               SimpleNamespace(probe=live_probe)):
+            out = app_main.api_serial_release()
+        self.assertEqual(out, {"ok": True})
+        orc_probe.close.assert_called_once_with()
+        live_probe.close.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

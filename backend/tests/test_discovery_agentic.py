@@ -110,7 +110,7 @@ class LearningLoopTest(unittest.TestCase):
                     session_id="learn-fast", project_title="Weather station")
         # Zero model calls on the start path: templates answer now.
         self.assertEqual(calls, [])
-        self.assertIn("Starting Weather station", view["speak"])
+        self.assertTrue(view["speak"].startswith("Step 1: "))
         self.assertEqual(len(self.orc.session["chapters"]), 2)
         self.assertEqual(self.orc.session["chapters"][0]["teach"], "")
         self.assertEqual(len(threads), 1)

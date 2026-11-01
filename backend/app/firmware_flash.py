@@ -12,8 +12,10 @@ FLASH_SETTLE_SECONDS (pause before the PING re-probe, default 2.0).
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -37,10 +39,21 @@ _MISSING_PORT_RE = re.compile(
 
 
 def esptool_cmd() -> list[str]:
-    """esptool invocation from env (module run by default)."""
+    """Best available native esptool invocation.
+
+    ESPTOOL_BIN wins. Otherwise prefer the backend interpreter's
+    esptool module, then an esptool executable on PATH: the Windows
+    Arduino/Python install commonly provides the latter even when the
+    backend venv has no esptool module installed.
+    """
     override = os.environ.get("ESPTOOL_BIN", "").strip()
     if override:
         return [override]
+    if importlib.util.find_spec("esptool") is not None:
+        return [sys.executable, "-m", "esptool"]
+    found = shutil.which("esptool")
+    if found:
+        return [found]
     return [sys.executable, "-m", "esptool"]
 
 
@@ -89,7 +102,7 @@ def busy_port_guidance(port: str) -> str:
     """Close-the-Serial-Monitor guidance for a busy port."""
     return ("Port %s is busy or blocked: close Arduino IDE Serial Monitor "
             "and Plotter plus any other program using it, unplug and replug "
-            "the USB cable, then press FLASH ESP32 again."
+            "the USB cable, then retry the flash."
             % (port or "?"))
 
 

@@ -137,7 +137,9 @@ class SpeakBuildersTest(unittest.TestCase):
 
     def test_start_template_falls_back(self):
         text = speak_start(template_chapters(PLAN)[0], "Blink")
-        self.assertEqual(text, "Starting Blink. Step 1: %s" % PLAN[0]["instruction"])
+        # One step announcement, no repeated project title: the UI
+        # opening line already names the project.
+        self.assertEqual(text, "Step 1: %s" % PLAN[0]["instruction"])
 
     def test_passed_celebrates_then_opens_next(self):
         text = speak_passed(CHAPTERS[0], "I2C found [0x76]", CHAPTERS[1],
@@ -194,7 +196,7 @@ class LessonFlowTest(unittest.TestCase):
         self.assertEqual(v["fundi"]["event"], "CHAPTER_START")
         # Templates answer now, with zero model calls on the start path.
         self.assertEqual(v["fundi"]["chapter"]["title"], "Step 1")
-        self.assertIn("Starting Blink", v["speak"])
+        self.assertTrue(v["speak"].startswith("Step 1: "))
         self.assertNotIn("Chapter", v["speak"])
         self.assertEqual(v["step_index"], 0)
         self.assertEqual(len(self.orc.Muse.calls), 0)

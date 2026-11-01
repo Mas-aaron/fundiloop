@@ -324,8 +324,20 @@ def plan_projects(visible_parts: list[str], user_project: str | None = None,
             if reasons:
                 rejected.append({"attempt": attempt, "title": title, "reasons": reasons})
             else:
+                # Spoken pins must match the schematic allocator, so
+                # correct the plan text before anyone reads it aloud.
+                from .boards import pin_map_for
+                from .schematic import repair_plan_pins
+
+                pin_map = pin_map_for(board)
+                proj["steps"] = repair_plan_pins(proj["steps"], pin_map)
                 proj["session_id"] = session_id
                 proj["alternatives"] = sanitize_alternatives(proj, visible)
+                for alt in proj["alternatives"]:
+                    if isinstance(alt, dict) and isinstance(
+                            alt.get("steps"), list):
+                        alt["steps"] = repair_plan_pins(alt["steps"],
+                                                        pin_map)
                 valid.append(proj)
         if valid:
             result = {"projects": valid, "rejected_plans": rejected}

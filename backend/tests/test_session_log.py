@@ -164,11 +164,17 @@ class SessionLogTest(unittest.TestCase):
 
         paths = {(r.path, tuple(sorted(getattr(r, "methods", None) or [])))
                  for r in app.routes}
-        self.assertIn(("/api/camera/snap", ("POST",)), paths)
-        self.assertIn(("/api/camera/snap", ("DELETE",)), paths)
-        self.assertIn(("/api/config/camera", ("POST",)), paths)
+        # Camera surface is gone from the API (UI focus is Learning);
+        # guided/diagnostic implementations stay registered behind it.
+        self.assertNotIn(("/api/camera/snap", ("POST",)), paths)
+        self.assertNotIn(("/api/camera/snap", ("DELETE",)), paths)
+        self.assertNotIn(("/api/camera/latest", ("GET",)), paths)
+        self.assertNotIn(("/api/config/camera", ("POST",)), paths)
+        self.assertNotIn(("/api/frames/{name}", ("GET",)), paths)
+        self.assertNotIn(("/discover/capture", ("POST",)), paths)
+        self.assertIn(("/discover/upload", ("POST",)), paths)
+        self.assertIn(("/api/session/start", ("POST",)), paths)
         self.assertIn(("/api/vision/describe", ("POST",)), paths)
-        self.assertIn(("/api/frames/{name}", ("GET",)), paths)
         self.assertNotIn(("/api/config/demo", ("POST",)), paths)
 
     def test_camera_reads_new_env_vars(self):
@@ -185,7 +191,7 @@ class SessionLogTest(unittest.TestCase):
 
 
 class SavedFrameEndpointTest(unittest.TestCase):
-    """GET /api/frames/{name}: serve the analyzed still, nothing else."""
+    """GET /api/frames/{name} was removed with the camera surface."""
 
     def setUp(self):
         use_mock_env(self)
@@ -201,25 +207,14 @@ class SavedFrameEndpointTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_serves_saved_jpeg(self):
-        resp = self.app_main.api_saved_frame("frame_test.jpg")
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.media_type, "image/jpeg")
-        self.assertTrue(str(resp.path).endswith("frame_test.jpg"))
-
-    def test_missing_frame_is_404(self):
-        from fastapi import HTTPException
-
-        with self.assertRaises(HTTPException) as ctx:
-            self.app_main.api_saved_frame("nope.jpg")
-        self.assertEqual(ctx.exception.status_code, 404)
-
-    def test_traversal_and_suffix_rejected(self):
-        from fastapi import HTTPException
-
-        for bad in ("../app.py", "..", "frame.png", "notes.txt", ".env"):
-            with self.assertRaises(HTTPException, msg=bad):
-                self.app_main.api_saved_frame(bad)
+    def test_frame_endpoint_is_gone(self):
+        # The saved frame still exists on disk for analysis; it is
+        # simply no longer served over HTTP.
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.tmp.name, "frame_test.jpg")))
+        self.assertFalse(hasattr(self.app_main, "api_saved_frame"))
+        paths = {r.path for r in self.app_main.app.routes}
+        self.assertNotIn("/api/frames/{name}", paths)
 
 
 if __name__ == "__main__":

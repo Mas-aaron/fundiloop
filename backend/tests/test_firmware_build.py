@@ -199,5 +199,133 @@ class FirmwareBuildTest(unittest.TestCase):
         self.assertEqual(record["fqbn"], fb.arduino_fqbn())
 
 
+_OLED_SKETCH = "\n".join([
+    "#include <Wire.h>",
+    "#include <Adafruit_GFX.h>",
+    '#include "Adafruit_SSD1306.h"',
+    "#include <Adafruit_GFX.h>",  # duplicate install name
+    "#include <SomeUnknownLib.h>",  # unmapped: compile reports it
+    "void setup(){} void loop(){}",
+])
+
+
+def _lib_list_proc(*names):
+    payload = {"installed_libraries": [{"library": {"name": n}}
+                                       for n in names]}
+    return SimpleNamespace(returncode=0, stdout=json.dumps(payload),
+                           stderr="")
+
+
+class LibraryAutoInstallTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ,
+                                  {"FIRMWARE_BUILD_DIR": self.tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _runner(self, calls, list_proc=None, install_proc=None,
+                compile_proc=None):
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[1:3] == ["lib", "list"]:
+                return list_proc if list_proc is not None \
+                    else _ok_proc(stdout="{}")
+            if cmd[1:3] == ["lib", "install"]:
+                return install_proc if install_proc is not None \
+                    else _ok_proc(stdout="installed")
+            outdir = cmd[cmd.index("--output-dir") + 1]
+            with open(os.path.join(outdir, "step_sketch.ino.bin"),
+                      "wb") as fh:
+                fh.write(b"\x00" * 16)
+            return compile_proc if compile_proc is not None else _ok_proc()
+        return run
+
+    def test_needed_libraries_mapping(self):
+        self.assertEqual(fb.needed_libraries(_OLED_SKETCH),
+                         ["Adafruit GFX Library", "Adafruit SSD1306"])
+
+    def test_needed_libraries_empty_for_bare_sketch(self):
+        self.assertEqual(fb.needed_libraries("void setup(){} void loop(){}"),
+                         [])
+
+    def test_installs_only_missing_before_compile(self):
+        calls = []
+        out = fb.compile_sketch(
+            _OLED_SKETCH,
+            runner=self._runner(
+                calls, list_proc=_lib_list_proc("Adafruit GFX Library")))
+        kinds = [c[1] for c in calls]
+        self.assertEqual(kinds, ["lib", "lib", "compile"])
+        self.assertEqual(calls[1][:3], [calls[1][0], "lib", "install"])
+        self.assertEqual(calls[1][3:], ["Adafruit SSD1306"])
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["libraries"], ["Adafruit SSD1306"])
+
+    def test_skips_install_when_all_present(self):
+        calls = []
+        out = fb.compile_sketch(
+            _OLED_SKETCH,
+            runner=self._runner(
+                calls, list_proc=_lib_list_proc("Adafruit GFX Library",
+                                                "Adafruit SSD1306")))
+        self.assertEqual([c[1] for c in calls], ["lib", "compile"])
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["libraries"], [])
+
+    def test_bad_list_output_installs_everything_needed(self):
+        calls = []
+        fb.compile_sketch(
+            _OLED_SKETCH,
+            runner=self._runner(calls, list_proc=_ok_proc(stdout="garbage")))
+        installs = [c for c in calls if c[1:3] == ["lib", "install"]]
+        self.assertEqual(len(installs), 1)
+        self.assertEqual(installs[0][3:],
+                         ["Adafruit GFX Library", "Adafruit SSD1306"])
+
+    def test_install_failure_still_compiles(self):
+        calls = []
+        out = fb.compile_sketch(
+            _OLED_SKETCH,
+            runner=self._runner(calls, install_proc=_fail_proc("no net")))
+        self.assertIn("compile", [c[1] for c in calls])
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["libraries"], [])
+
+    def test_install_failure_surfaces_in_failing_excerpt(self):
+        out = fb.compile_sketch(
+            _OLED_SKETCH,
+            runner=self._runner([], install_proc=_fail_proc("offline"),
+                                compile_proc=_fail_proc()))
+        self.assertFalse(out["ok"])
+        self.assertIn("offline", out["log_excerpt"])
+        self.assertIn("missing header", out["log_excerpt"])
+
+    def test_bare_sketch_makes_no_lib_calls(self):
+        calls = []
+        fb.compile_sketch("void setup(){} void loop(){}",
+                          runner=self._runner(calls))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("compile", calls[0])
+
+    def test_auto_libs_env_disables(self):
+        calls = []
+        with mock.patch.dict(os.environ, {"ARDUINO_AUTO_LIBS": "0"}):
+            fb.compile_sketch(_OLED_SKETCH, runner=self._runner(calls))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("compile", calls[0])
+
+    def test_excerpt_strips_ansi_codes(self):
+        proc = SimpleNamespace(returncode=1, stdout="",
+                               stderr="\x1b[92mUsed library\x1b[0m\n"
+                                      "\x1b[91merror: boom\x1b[0m")
+        out = fb.compile_sketch("void setup(){} void loop(){}",
+                                runner=lambda *a, **k: proc)
+        self.assertNotIn("\x1b", out["log_excerpt"])
+        self.assertIn("Used library", out["log_excerpt"])
+        self.assertIn("boom", out["log_excerpt"])
+
+
 if __name__ == "__main__":
     unittest.main()
