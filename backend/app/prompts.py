@@ -82,19 +82,37 @@ def plan_system_prompt(available_tests: dict, visible_parts: list[str],
         '{"projects": [{id, title, summary, steps: '
         "[{n, instruction, verify, expect, depends_on_parts}], "
         "missing_parts: [], alternatives: []}]}",
+        "When parts are missing, alternatives holds full backup projects "
+        "built only from visible parts, same step shape: "
+        'alternatives: [{title, summary, steps: '
+        "[{n, instruction, verify, expect, depends_on_parts}]}].",
         "Rules:",
         "- Every step's verify MUST be one of: %s." % ", ".join(available_tests),
-        "- Every depends_on_parts entry MUST be in visible parts, or the part "
-        "MUST be listed in that project's missing_parts.",
+    ]
+    if user_project:
+        lines += [
+            "- depends_on_parts names whatever parts the requested build "
+            "needs (prefer the vocabulary above); the user wires what the "
+            "plan names — visible parts are context, not a limit.",
+            "- missing_parts and alternatives are optional for a requested "
+            "build; include them only for genuinely useful backups.",
+        ]
+    else:
+        lines += [
+            "- Every depends_on_parts entry MUST be in visible parts, or the part "
+            "MUST be listed in that project's missing_parts.",
+            "- Every alternatives entry MUST be an object with title and steps "
+            "(same step shape as above), never a bare string.",
+        ]
+    lines += [
         "- expect states what the verification test should return.",
     ]
     if user_project:
         lines += [
             "The user asked to build: %s." % user_project,
-            "The FIRST project MUST be that requested build — plan it, do "
-            "not substitute a different one. If parts are missing, list them "
-            "in missing_parts and include at least one alternative project "
-            "that uses only visible parts.",
+            "The FIRST project MUST be that requested build — plan it "
+            "exactly as asked, with the parts it needs, whether or not "
+            "they are visible. Do not substitute a different one.",
         ]
     else:
         lines.append("Suggest up to 3 projects buildable with the visible parts.")

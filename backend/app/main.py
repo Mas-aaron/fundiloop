@@ -30,6 +30,10 @@ Serves the mobile web UI at / and the session API:
   POST /project/{id}/code     firmware (final when DONE, draft on request)
   GET  /project/{id}/step/{n}/code one step's sketch (template, patient, model)
   GET  /project/{id}/step/{n}/schematic progressive wiring netlist + SVG
+  GET  /project/{id}/guide   parts table + assembly cards linked to the SVG
+  GET  /project/{id}/step/{n}/firmware manifest of binaries for browser flash
+  GET  /project/{id}/step/{n}/firmware/{i} download one binary (build dir only)
+  GET  /esptool-js/bundle.js vendored browser flasher (one-time download)
   POST /project/{id}/step/{n}/flash flash one step sketch to ESP32 (explicit tap)
   GET  /api/patient-sketch       patient board sketch text for copy-paste flash
 
@@ -122,6 +126,23 @@ def app_js():
 @app.get("/style.css")
 def style_css():
     return FileResponse(str(FRONTEND / "style.css"), media_type="text/css",
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/esptool-js/bundle.js")
+def esptool_js_bundle():
+    """esptool-js ESM bundle for browser-side flashing.
+
+    Fetched once from a pinned release the first time it is asked for,
+    then served from disk; the UI imports these bytes, never a CDN.
+    """
+    from .esptool_js import BundleError, ensure_bundle
+
+    try:
+        bundle = ensure_bundle(FRONTEND / "esptool-js")
+    except BundleError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return FileResponse(str(bundle), media_type="text/javascript",
                         headers={"Cache-Control": "no-store"})
 
 
@@ -239,6 +260,21 @@ def api_session_confirm(body: dict):
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/api/session/advance")
+def api_session_advance(body: dict):
+    """Learner said this learning step is done (voice: done / next).
+
+    Body: {"session_id": ..., "transcript": optional str}. Does not wait
+    for a sensor pass; CHECK NOW still sensor-verifies.
+    """
+    session_id = str(body.get("session_id") or "")
+    try:
+        return orchestrator.advance_learning_step(
+            session_id, str(body.get("transcript") or ""))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 def iter_answer_events(question: str, step_text: str = "",
@@ -688,7 +724,8 @@ def api_step_schematic(session_id: str, step_n: int):
     last step is the full project. Unknown parts render "unresolved"
     with a reason; wiring is never invented.
     """
-    from .schematic import build_netlist, render_svg
+    from .breadboard_schematic import render_breadboard_svg
+    from .schematic import build_netlist
     from .visual_schematic import render_visual_svg
 
     session = orchestrator.sessions.get(session_id)
@@ -705,13 +742,122 @@ def api_step_schematic(session_id: str, step_n: int):
     if step is None:
         raise HTTPException(status_code=404, detail="unknown step %d" % step_n)
     netlist = build_netlist(steps, step_n, session.get("pin_map", {}) or {})
-    
-    # Use the visual schematic if available for the specific project
     svg = render_visual_svg(netlist, step_n)
-    
+    breadboard_svg = render_breadboard_svg(netlist, step_n)
     return {"session_id": session_id, "n": step_n,
             "netlist": netlist, "svg": svg,
+            "breadboard_svg": breadboard_svg,
             "unresolved": netlist["unresolved"]}
+
+
+@app.get("/project/{session_id}/guide")
+def api_project_guide(session_id: str):
+    """Schematik-style build guide: parts table + assembly cards (ESP32 only).
+
+    The parts list covers the whole project; each assembly card names
+    exactly the wires its step adds, with the SVG group ids so the UI
+    can highlight them in the diagram. Steps that add no wiring become
+    explicit check cards.
+    """
+    from .build_guide import build_guide
+
+    session = orchestrator.sessions.get(session_id)
+    if session is None or not session.get("learning"):
+        raise HTTPException(status_code=404, detail="unknown learning session id")
+    if session.get("board") != "esp32_devkit":
+        raise HTTPException(
+            status_code=400,
+            detail="build guide supports ESP32 only (session board: %s)"
+            % (session.get("board") or "?"))
+    guide = build_guide(session)
+    return {"session_id": session_id, **guide}
+
+
+def _resolve_step_build(session_id: str, step_n: int, action: str):
+    """Session + step + code + compiled build for flash-style endpoints.
+
+    Shared by server-side flash and the browser-flash firmware
+    endpoints so all three validate identically (404s, ESP32-only
+    400, code-unavailable 409, Meta 502, compile-failed 500).
+    Returns (session, step, code, source, build).
+    """
+    from .firmware_build import compile_sketch
+
+    session = orchestrator.sessions.get(session_id)
+    if session is None or not session.get("learning"):
+        raise HTTPException(status_code=404, detail="unknown learning session id")
+    if session.get("board") != "esp32_devkit":
+        raise HTTPException(
+            status_code=400,
+            detail="%s supports ESP32 only (session board: %s)"
+            % (action, session.get("board") or "?"))
+    steps = session.get("plan", []) or []
+    step = next((s for s in steps
+                 if isinstance(s, dict) and s.get("n") == step_n), None)
+    if step is None:
+        raise HTTPException(status_code=404, detail="unknown step %d" % step_n)
+    try:
+        code, source = generate_step_code(session, step, orchestrator.Muse)
+    except MetaAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    if not code:
+        raise HTTPException(
+            status_code=409,
+            detail="step %d code unavailable: nothing to %s" % (step_n, action))
+    build = compile_sketch(code)
+    if not build["ok"]:
+        raise HTTPException(
+            status_code=500,
+            detail="compile failed: %s" % build["log_excerpt"])
+    return session, step, code, source, build
+
+
+@app.get("/project/{session_id}/step/{step_n}/firmware")
+def api_step_firmware(session_id: str, step_n: int):
+    """Firmware manifest for browser-side flashing (Web Serial).
+
+    Compiles the step sketch on demand (cached by code hash) and
+    returns each binary's flash offset, size, and download URL so the
+    page can fetch them and drive esptool-js. Browser flashes run
+    outside the server's audit trail — the browser owns the port.
+    """
+    _, _, _, source, build = _resolve_step_build(session_id, step_n, "flash")
+    files = []
+    for index, artifact in enumerate(build["artifacts"]):
+        try:
+            size = os.path.getsize(artifact.get("file", ""))
+        except OSError:
+            size = 0
+        files.append({
+            "index": index,
+            "offset": artifact.get("offset"),
+            "size": size,
+            "url": "/project/%s/step/%d/firmware/%d"
+            % (session_id, step_n, index),
+        })
+    return {"session_id": session_id, "n": step_n,
+            "build_hash": build["build_hash"], "cached": build["cached"],
+            "source": source, "files": files}
+
+
+@app.get("/project/{session_id}/step/{step_n}/firmware/{index}")
+def api_step_firmware_file(session_id: str, step_n: int, index: int):
+    """Download one compiled firmware binary (see the manifest above).
+
+    Only files inside the step's own build directory are served;
+    anything else is a 404, never a path escape.
+    """
+    _, _, _, _, build = _resolve_step_build(session_id, step_n, "flash")
+    artifacts = build["artifacts"] or []
+    if index < 0 or index >= len(artifacts):
+        raise HTTPException(status_code=404, detail="unknown firmware file")
+    path = os.path.abspath(str(artifacts[index].get("file", "")))
+    root = os.path.abspath(build["build_dir"])
+    if not path.startswith(root + os.sep) or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="unknown firmware file")
+    return FileResponse(path, media_type="application/octet-stream",
+                        filename=os.path.basename(path),
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.post("/project/{session_id}/step/{step_n}/flash")
@@ -724,9 +870,9 @@ def api_step_flash(session_id: str, step_n: int, body: dict | None = None):
     not patient firmware, so a silent PING re-probe is reported, not a
     failure.
     """
-    from .firmware_build import compile_sketch
     from .firmware_flash import (
         audit_flash,
+        available_ports,
         busy_port_guidance,
         check_port,
         flash_artifacts,
@@ -735,19 +881,6 @@ def api_step_flash(session_id: str, step_n: int, body: dict | None = None):
         verify_ping,
     )
 
-    session = orchestrator.sessions.get(session_id)
-    if session is None or not session.get("learning"):
-        raise HTTPException(status_code=404, detail="unknown learning session id")
-    if session.get("board") != "esp32_devkit":
-        raise HTTPException(
-            status_code=400,
-            detail="flash supports ESP32 only (session board: %s)"
-            % (session.get("board") or "?"))
-    steps = session.get("plan", []) or []
-    step = next((s for s in steps
-                 if isinstance(s, dict) and s.get("n") == step_n), None)
-    if step is None:
-        raise HTTPException(status_code=404, detail="unknown step %d" % step_n)
     port = str((body or {}).get("port") or "").strip()
     if not port:
         raise HTTPException(
@@ -755,26 +888,29 @@ def api_step_flash(session_id: str, step_n: int, body: dict | None = None):
             detail="flash needs an explicit port: pick one, then FLASH ESP32")
     pre = check_port(port)
     if not pre["ok"]:
+        if pre.get("busy", True):
+            detail = "%s\n(%s)" % (busy_port_guidance(port), pre["detail"])
+            reason = "port_busy"
+        else:
+            found = available_ports()
+            where = ("Available ports: %s." % ", ".join(found)) if found \
+                else ("No serial ports found — plug the board in over USB "
+                      "and install its driver.")
+            detail = ("Port %s does not exist on this computer. %s Pick the "
+                      "board's port from the dropdown (or press AUTO-DETECT "
+                      "in Settings), then FLASH again." % (port, where))
+            reason = "port_missing"
         audit_flash(session_id, step_n, port, "", False,
-                    "port_busy", pre["detail"])
-        raise HTTPException(
-            status_code=409,
-            detail="%s\n(%s)" % (busy_port_guidance(port), pre["detail"]))
+                    reason, pre["detail"])
+        raise HTTPException(status_code=409, detail=detail)
     try:
-        code, source = generate_step_code(session, step, orchestrator.Muse)
-    except MetaAPIError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    if not code:
-        raise HTTPException(
-            status_code=409,
-            detail="step %d code unavailable: nothing to flash" % step_n)
-    build = compile_sketch(code)
-    if not build["ok"]:
-        audit_flash(session_id, step_n, port, build["build_hash"], False,
-                    "compile_failed", build["log_excerpt"])
-        raise HTTPException(
-            status_code=500,
-            detail="compile failed: %s" % build["log_excerpt"])
+        _, _, _, source, build = _resolve_step_build(
+            session_id, step_n, "flash")
+    except HTTPException as exc:
+        if exc.status_code == 500:
+            audit_flash(session_id, step_n, port, "", False,
+                        "compile_failed", str(exc.detail))
+        raise
     # esptool needs the port exclusively: drop both probe handles first.
     orchestrator.probe.close()
     live_guide.probe.close()

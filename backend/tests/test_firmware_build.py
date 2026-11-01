@@ -95,6 +95,19 @@ class FirmwareBuildTest(unittest.TestCase):
         self.assertIn("missing header", out["log_excerpt"])
         self.assertEqual(out["artifacts"], [])
 
+    def test_excerpt_leads_with_root_errors(self):
+        log = "\n".join(
+            ["Error loading hardware platform: bad json"]
+            + ["filler %d" % i for i in range(40)]
+            + ["Error during build: instance no longer valid"])
+        proc = SimpleNamespace(returncode=1, stdout=log, stderr="")
+        out = fb.compile_sketch("void setup(){} void loop(){}",
+                                runner=lambda *a, **k: proc)
+        self.assertIn("Error loading hardware platform", out["log_excerpt"])
+        self.assertIn("instance no longer valid", out["log_excerpt"])
+        self.assertLess(out["log_excerpt"].index("Error loading"),
+                        out["log_excerpt"].index("instance no longer"))
+
     def test_missing_cli_is_honest(self):
         def run(*args, **kwargs):
             raise FileNotFoundError("no arduino-cli")
@@ -110,6 +123,22 @@ class FirmwareBuildTest(unittest.TestCase):
                                 runner=run)
         self.assertFalse(out["ok"])
         self.assertIn("timed out", out["log_excerpt"])
+
+    def test_sketch_dir_matches_ino_name(self):
+        def run(cmd, **kwargs):
+            outdir = cmd[cmd.index("--output-dir") + 1]
+            sketchdir = cmd[-1]
+            ino = os.path.join(sketchdir,
+                               os.path.basename(sketchdir) + ".ino")
+            assert os.path.isfile(ino), "arduino needs <dir>/<dir>.ino"
+            with open(os.path.join(outdir, "step_sketch.ino.bin"),
+                      "wb") as fh:
+                fh.write(b"\x00" * 16)
+            return _ok_proc()
+
+        out = fb.compile_sketch("void setup(){} void loop(){}",
+                                runner=run)
+        self.assertTrue(out["ok"])
 
     def test_success_without_bins_is_honest(self):
         out = fb.compile_sketch("void setup(){} void loop(){}",

@@ -173,48 +173,88 @@ def detect_parts(frame_path: str) -> dict:
     return {"visible_parts": understand_scene(frame_path)["visible_parts"]}
 
 
-def validate_project(proj: dict, visible: list[str]) -> list[str]:
-    """Return rejection reasons ([] == valid). Pure function of the plan."""
+def _check_steps(steps: list, tag: str, allow_missing: bool,
+                 visible: list[str], missing: list[str],
+                 out: list[str], check_visible: bool = True) -> None:
+    """Append step problems to `out` (shared by plans and alternatives).
+
+    With check_visible=False the part-availability rule is skipped: a
+    user-requested build names whatever parts it needs. Test names,
+    instructions, and list shapes are always checked — the backend can
+    only run real tests.
+    """
+    for i, step in enumerate(steps):
+        label = "%sstep %s" % (tag, step.get("n", i + 1) if isinstance(step, dict) else i + 1)
+        if not isinstance(step, dict):
+            out.append("%s is not an object" % label)
+            continue
+        if step.get("verify") not in AVAILABLE_TESTS:
+            out.append("%s: unknown verify %r (must be one of %s)"
+                       % (label, step.get("verify"), ", ".join(AVAILABLE_TESTS)))
+        if not step.get("instruction"):
+            out.append("%s: missing instruction" % label)
+        deps = step.get("depends_on_parts") or []
+        if not isinstance(deps, list):
+            out.append("%s: depends_on_parts is not a list" % label)
+            continue
+        if check_visible:
+            for dep in deps:
+                if dep not in visible and (not allow_missing or dep not in missing):
+                    out.append("%s: part %r not in visible_parts%s"
+                               % (label, dep, " and not in missing_parts" if allow_missing else ""))
+        unverified = [d for d in deps if d not in KNOWN_PARTS]
+        if unverified and step.get("verify") not in ("CHECK_SERIAL", "CHECK_GPIO"):
+            out.append("%s: unverified part(s) %s require CHECK_SERIAL or CHECK_GPIO"
+                       % (label, ", ".join(unverified)))
+
+
+def alternative_reasons(alt: object, visible: list[str]) -> list[str]:
+    """Problems with one backup plan ([] == usable). Alternatives must be
+    objects with visible-only steps; anything else is dropped, not fatal."""
+    if not isinstance(alt, dict):
+        return ["alternative is not an object"]
+    if not isinstance(alt.get("steps"), list) or not alt["steps"]:
+        return ["alternative %r has no steps" % (alt.get("title", "?"))]
+    out: list[str] = []
+    _check_steps(alt["steps"], "alternative %r " % alt.get("title", "?"),
+                 False, visible, [], out)
+    return out
+
+
+def sanitize_alternatives(proj: dict, visible: list[str]) -> list:
+    """Backup plans that are actually usable (objects, visible-only steps)."""
+    alts = proj.get("alternatives") or []
+    if not isinstance(alts, list):
+        return []
+    return [a for a in alts if not alternative_reasons(a, visible)]
+
+
+def validate_project(proj: dict, visible: list[str],
+                     enforce_visible: bool = True) -> list[str]:
+    """Return rejection reasons ([] == valid). Pure function of the plan.
+
+    With enforce_visible=False (a user-requested build) the bench does
+    not gate the plan: any parts are accepted and no alternatives are
+    required. Real test names and instructions are always required.
+    """
     reasons: list[str] = []
     if not isinstance(proj, dict) or not isinstance(proj.get("steps"), list) or not proj["steps"]:
         return ["project has no steps"]
     missing = [str(m) for m in (proj.get("missing_parts") or [])]
-
-    def check_steps(steps: list, tag: str, allow_missing: bool) -> None:
-        for i, step in enumerate(steps):
-            label = "%sstep %s" % (tag, step.get("n", i + 1) if isinstance(step, dict) else i + 1)
-            if not isinstance(step, dict):
-                reasons.append("%s is not an object" % label)
-                continue
-            if step.get("verify") not in AVAILABLE_TESTS:
-                reasons.append("%s: unknown verify %r (must be one of %s)"
-                               % (label, step.get("verify"), ", ".join(AVAILABLE_TESTS)))
-            if not step.get("instruction"):
-                reasons.append("%s: missing instruction" % label)
-            deps = step.get("depends_on_parts") or []
-            if not isinstance(deps, list):
-                reasons.append("%s: depends_on_parts is not a list" % label)
-                continue
-            for dep in deps:
-                if dep not in visible and (not allow_missing or dep not in missing):
-                    reasons.append("%s: part %r not in visible_parts%s"
-                                   % (label, dep, " and not in missing_parts" if allow_missing else ""))
-            unverified = [d for d in deps if d not in KNOWN_PARTS]
-            if unverified and step.get("verify") not in ("CHECK_SERIAL", "CHECK_GPIO"):
-                reasons.append("%s: unverified part(s) %s require CHECK_SERIAL or CHECK_GPIO"
-                               % (label, ", ".join(unverified)))
-
-    check_steps(proj["steps"], "", True)
-    required = {d for s in proj["steps"] if isinstance(s, dict) for d in (s.get("depends_on_parts") or [])}
+    _check_steps(proj["steps"], "", True, visible, missing, reasons,
+                 check_visible=enforce_visible)
+    required = {d for s in proj["steps"] if isinstance(s, dict)
+                for d in (s.get("depends_on_parts") or [])
+                if isinstance(s.get("depends_on_parts"), list)}
     lacking = sorted(required - set(visible))
-    if lacking and not proj.get("alternatives"):
+    usable_alts = sanitize_alternatives(proj, visible)
+    if enforce_visible and lacking and not usable_alts:
         reasons.append("parts %s not visible: list them in missing_parts and include an alternative"
                        % ", ".join(lacking))
-    for alt in proj.get("alternatives") or []:
-        if not isinstance(alt, dict):
-            reasons.append("alternative is not an object")
-            continue
-        check_steps(alt.get("steps") or [], "alternative %r " % alt.get("title", "?"), False)
+        alts = proj.get("alternatives") or []
+        if isinstance(alts, list):
+            for alt in alts:
+                reasons.extend(alternative_reasons(alt, visible))
     return reasons
 
 
@@ -260,6 +300,7 @@ def plan_projects(visible_parts: list[str], user_project: str | None = None,
                                 board)
     base_user = ("Plan this build: %s." % user_project) if user_project \
         else "Suggest up to 3 buildable projects."
+    requested = bool(user_project and str(user_project).strip())
     user_msg, rejected, session_id = base_user, [], uuid.uuid4().hex
     Muse = MetaClaudeAdapter()
     for attempt in (1, 2):
@@ -276,12 +317,15 @@ def plan_projects(visible_parts: list[str], user_project: str | None = None,
         valid: list[dict] = []
         for proj in projects:
             title = proj.get("title", "?") if isinstance(proj, dict) else "?"
-            reasons = validate_project(proj, visible) if isinstance(proj, dict) \
+            reasons = validate_project(proj, visible,
+                                       enforce_visible=not requested) \
+                if isinstance(proj, dict) \
                 else ["project is not an object"]
             if reasons:
                 rejected.append({"attempt": attempt, "title": title, "reasons": reasons})
             else:
                 proj["session_id"] = session_id
+                proj["alternatives"] = sanitize_alternatives(proj, visible)
                 valid.append(proj)
         if valid:
             result = {"projects": valid, "rejected_plans": rejected}

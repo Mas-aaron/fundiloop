@@ -219,7 +219,7 @@ def build_netlist(plan: list, step_n: int, pin_map: dict | None) -> dict:
             "requested": sorted(requested)}
 
 
-def _svg_id(text: str) -> str:
+def svg_id(text: str) -> str:
     """Stable SVG group id: word chars kept, everything else collapses."""
     return re.sub(r"[^A-Za-z0-9_-]+", "_", str(text or "").strip()) or "id"
 
@@ -279,6 +279,7 @@ def render_svg(netlist: dict, step_n: int | None = None) -> str:
         '<text x="16" y="46" font-family="sans-serif" font-size="12" '
         'fill="#555555">%s</text>' % escape(sub),
         '<g id="esp32-board">',
+        "<title>%s</title>" % escape("%s — the main board" % board),
         '<rect x="16" y="%d" width="200" height="%d" fill="#eaf2f8" '
         'stroke="#2471a3" stroke-width="2"/>'
         % (header_h - 8, span * row_h + 8),
@@ -291,6 +292,7 @@ def render_svg(netlist: dict, step_n: int | None = None) -> str:
         rails_bottom = header_h + len(wires) * row_h
         out += [
             '<g id="breadboard">',
+            "<title>Breadboard power rails: red = power, dark = ground</title>",
             '<rect x="%d" y="%d" width="%d" height="%d" fill="#f8f9fa" '
             'stroke="#aab2bd"/>' % (_BB_X, header_h - 4, _BB_W,
                                     len(wires) * row_h + 8),
@@ -307,16 +309,29 @@ def render_svg(netlist: dict, step_n: int | None = None) -> str:
         by_part.setdefault(str(wire.get("part")), []).append(wire)
     y = header_h
     for part in sorted(by_part):
-        out.append('<g id="%s">' % _svg_id("part-" + part))
+        part_step = by_part[part][0].get("step_added", n)
+        out.append('<g id="%s" class="schematic-part" data-step="%s">'
+                   % (svg_id("part-" + part), part_step))
+        out.append("<title>%s</title>"
+                   % escape("%s (added step %s)"
+                            % (part, part_step)))
         for wire in by_part[part]:
             fresh = wire.get("step_added", n) == n
             color = _WIRE_COLORS.get(str(wire.get("signal")),
                                      _DEFAULT_WIRE_COLOR)
             rail = {_WIRE_POWER: _BB_PWR_X,
                     _WIRE_GROUND: _BB_GND_X}.get(str(wire.get("signal")))
-            out.append('<g id="%s" opacity="%s">'
-                       % (_svg_id("wire-%s-%s" % (part, wire.get("part_pin"))),
-                          "1" if fresh else "0.35"))
+            cls = ("schematic-wire schematic-new" if fresh
+                   else "schematic-wire schematic-prior")
+            out.append('<g id="%s" opacity="%s" class="%s" data-step="%s">'
+                       % (svg_id("wire-%s-%s" % (part, wire.get("part_pin"))),
+                          "1" if fresh else "0.35", cls,
+                          wire.get("step_added", n)))
+            out.append("<title>%s</title>"
+                       % escape("%s %s → %s (added step %s)"
+                                % (part, wire.get("part_pin"),
+                                   wire.get("board_pin"),
+                                   wire.get("step_added", n))))
             out.append(
                 '<line x1="216" y1="%d" x2="420" y2="%d" stroke="%s" '
                 'stroke-width="2"/>' % (y + 15, y + 15, color))
@@ -341,7 +356,10 @@ def render_svg(netlist: dict, step_n: int | None = None) -> str:
         out.append("</g>")
     for item in unresolved:
         out.append('<g id="%s">'
-                   % _svg_id("unresolved-%s" % item.get("part")))
+                   % svg_id("unresolved-%s" % item.get("part")))
+        out.append("<title>%s</title>"
+                   % escape("unresolved: %s — %s"
+                            % (item.get("part"), item.get("reason"))))
         out.append(
             '<rect x="16" y="%d" width="628" height="24" fill="#fef9e7" '
             'stroke="#b7950b" stroke-dasharray="6,3"/>' % (y + 3))

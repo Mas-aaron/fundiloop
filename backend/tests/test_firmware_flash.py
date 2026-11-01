@@ -106,13 +106,38 @@ class CheckPortTest(unittest.TestCase):
             pass
 
         def raiser(*args, **kwargs):
-            raise Busy("could not open port 'COM3'")
+            raise Busy("could not open port 'COM3': PermissionError(13)")
 
         fake = SimpleNamespace(Serial=raiser, SerialException=Busy)
         with mock.patch.dict(sys.modules, {"serial": fake}):
             out = ff.check_port("COM3")
         self.assertFalse(out["ok"])
+        self.assertTrue(out["busy"])
         self.assertIn("COM3", out["detail"])
+
+    def test_missing_port_is_not_busy(self):
+        def raiser(*args, **kwargs):
+            raise Exception("could not open port 'COM3': "
+                            "FileNotFoundError(2, 'The system cannot find "
+                            "the file specified.', None, 2)")
+
+        fake = SimpleNamespace(Serial=raiser)
+        with mock.patch.dict(sys.modules, {"serial": fake}):
+            out = ff.check_port("COM3")
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["busy"])
+
+    def test_available_ports_lists_names(self):
+        with mock.patch("backend.app.serial_probe.list_serial_ports",
+                        return_value=[{"port": "COM4"},
+                                      {"port": ""},
+                                      {"description": "no name"}]):
+            self.assertEqual(ff.available_ports(), ["COM4"])
+
+    def test_available_ports_never_raises(self):
+        with mock.patch("backend.app.serial_probe.list_serial_ports",
+                        side_effect=RuntimeError("boom")):
+            self.assertEqual(ff.available_ports(), [])
 
     def test_missing_pyserial_defers_to_esptool(self):
         with mock.patch.dict(sys.modules, {"serial": None}):
@@ -284,7 +309,7 @@ class FlashEndpointTest(unittest.TestCase):
 
         self._stub_pipeline()
         with mock.patch("backend.app.firmware_flash.check_port",
-                        return_value={"ok": False,
+                        return_value={"ok": False, "busy": True,
                                       "detail": "Access denied"}):
             with mock.patch(
                     "backend.app.firmware_build.compile_sketch") as comp:
@@ -296,6 +321,45 @@ class FlashEndpointTest(unittest.TestCase):
         flashes = self._audit_events()
         self.assertEqual(len(flashes), 1)
         self.assertEqual(flashes[0]["reason"], "port_busy")
+
+    def test_missing_port_names_available_ports(self):
+        from fastapi import HTTPException
+
+        self._stub_pipeline()
+        with mock.patch("backend.app.firmware_flash.check_port",
+                        return_value={"ok": False, "busy": False,
+                                      "detail": "FileNotFoundError"}):
+            with mock.patch(
+                    "backend.app.firmware_flash.available_ports",
+                    return_value=["COM4", "COM5"]):
+                with mock.patch(
+                        "backend.app.firmware_build.compile_sketch") as comp:
+                    with self.assertRaises(HTTPException) as ctx:
+                        self.app_main.api_step_flash(
+                            "s1", 1, {"port": "COM3"})
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn("does not exist", ctx.exception.detail)
+        self.assertIn("COM4, COM5", ctx.exception.detail)
+        self.assertNotIn("Serial Monitor", ctx.exception.detail)
+        comp.assert_not_called()
+        flashes = self._audit_events()
+        self.assertEqual(len(flashes), 1)
+        self.assertEqual(flashes[0]["reason"], "port_missing")
+
+    def test_missing_port_with_no_ports_found(self):
+        from fastapi import HTTPException
+
+        self._stub_pipeline()
+        with mock.patch("backend.app.firmware_flash.check_port",
+                        return_value={"ok": False, "busy": False,
+                                      "detail": "FileNotFoundError"}):
+            with mock.patch(
+                    "backend.app.firmware_flash.available_ports",
+                    return_value=[]):
+                with self.assertRaises(HTTPException) as ctx:
+                    self.app_main.api_step_flash("s1", 1, {"port": "COM3"})
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn("No serial ports found", ctx.exception.detail)
 
 
 if __name__ == "__main__":

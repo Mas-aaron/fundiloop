@@ -10,3 +10,5 @@ backend/data/coach_memory/
 backend/data/kokoro/
 backend/data/firmware_builds/
 backend/logs/
+# Auto-fetched on first browser flash; never hand-edit.
+frontend/esptool-js/bundle.js

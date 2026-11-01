@@ -62,8 +62,17 @@ def code_hash(code: str) -> str:
 
 
 def _excerpt(text: str, lines: int = 20, width: int = 2000) -> str:
-    tail = "\n".join((text or "").splitlines()[-lines:])
-    return tail[-width:] if len(tail) > width else tail
+    """Failure context: root error lines first, then the tail.
+
+    Toolchains print the cause early ("Error loading hardware
+    platform…") and the consequence late ("instance no longer
+    valid"), so a tail-only excerpt hides the diagnosis.
+    """
+    all_lines = (text or "").splitlines()
+    errs = [line for line in all_lines if "error" in line.lower()][:8]
+    out = errs + ["…"] + all_lines[-lines:] if errs else all_lines[-lines:]
+    joined = "\n".join(out)
+    return joined[-width:] if len(joined) > width else joined
 
 
 def _find_artifacts(outdir: str) -> list[dict]:
@@ -141,7 +150,8 @@ def compile_sketch(code: str, board: str = "esp32_devkit",
     if hit is not None:
         return hit
     run = runner or subprocess.run
-    sketch_dir = os.path.join(outdir, "sketch")
+    # Arduino requires <dir>/<dir>.ino: folder and main file share a name.
+    sketch_dir = os.path.join(outdir, SKETCH_NAME)
     try:
         os.makedirs(sketch_dir, exist_ok=True)
         with open(os.path.join(sketch_dir, SKETCH_NAME + ".ino"),

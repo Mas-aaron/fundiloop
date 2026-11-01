@@ -190,10 +190,12 @@ There is no fixed project catalog. Discovery is generative:
 - The `AVAILABLE_TESTS` registry (`backend/app/capabilities.py`) lists the
   only verification tests plans may use: `RUN_I2C_SCAN`, `READ_SENSOR`,
   `CHECK_OLED`, `CHECK_GPIO`, `CHECK_SERIAL`.
-- Rule: every plan step must map to a real test in `AVAILABLE_TESTS` and
-  every `depends_on_parts` entry must be visible or listed in
-  `missing_parts`, or the plan is rejected and the model is retried once
-  with the reasons. Rejections land in `rejected_plans` for debugging.
+- Rule: every plan step must map to a real test in `AVAILABLE_TESTS`
+  (bad test names are rejected and the model is retried once with the
+  reasons; rejections land in `rejected_plans` for debugging). Open
+  suggestions must also use visible parts (or `missing_parts` plus an
+  alternative); a user-requested build is planned exactly as asked —
+  the bench never gates what the user asked to build.
 
 ### Scene understanding
 
@@ -217,7 +219,9 @@ validated and executed by the backend against the real verification module:
    PHOTO in the Learning tab) runs the same pass on a photo file.
 2. Name a project by text or voice, or let the system suggest one:
    `POST /discover/projects` returns up to 3 plans, each step mapped to
-   an `AVAILABLE_TESTS` key, plus `missing_parts`/`alternatives`.
+   an `AVAILABLE_TESTS` key, plus `missing_parts`/`alternatives`. A
+   named request is planned exactly as asked with the parts it needs;
+   open suggestions stick to visible parts.
 3. Start a plan with `POST /diagnose` (`mode: "learning"`), then loop
    CHECK NOW: the current step's sensor test runs, and the step advances
    only when the sensor confirms. Failures stay put with a targeted hint.
@@ -241,6 +245,14 @@ disposes: it alone advances steps, declares DONE, and gates firmware.
 Each learning step shows its wiring beside its code, and one tap
 pushes the step sketch to the board. ESP32 only (Uno out of scope).
 
+- `GET /project/{id}/guide` returns the build guide: a parts table
+  (qty + what each part is, jumpers counted from the wiring) and one
+  numbered assembly card per step, each naming exactly the wires it
+  adds plus the SVG ids to highlight them. The Cook Mode "Build
+  guide" panel renders both: tap a card to light up its wires in the
+  diagram and hear it read aloud; the current step's card stays
+  marked as the build advances.
+
 - `GET /project/{id}/step/{n}/schematic` returns the progressive
   netlist (`{netlist, svg, unresolved[]}`): wiring for every part the
   plan needs up to step N, so the last step is the full project.
@@ -262,6 +274,21 @@ pushes the step sketch to the board. ESP32 only (Uno out of scope).
      `arduino-cli core install esp32:esp32` (adds the ESP32 core).
   3. Paths live in `.env`, never hardcoded: `ARDUINO_CLI_BIN`,
      `ARDUINO_FQBN`, `ESPTOOL_BIN`, timeouts (see `.env.example`).
+- Browser flash (Web Serial, Chrome/Edge): CONNECT BOARD opens the
+  browser's own port picker — select the ESP32 entry (CP2102 /
+  USB-to-UART, not Bluetooth). FLASH IN BROWSER then compiles on
+  the server, downloads the binaries, and flashes locally with a
+  progress bar; the page releases the port after, so CHECK NOW
+  works immediately. No setup: the server fetches the esptool-js
+  ESM bundle once from a pinned release the first time it is used,
+  then serves it locally (override with `ESPTOOL_JS_URL`;
+  `ESPTOOL_JS_TIMEOUT` sets the fetch timeout). Fully offline
+  machines can drop the file at `frontend/esptool-js/bundle.js` by
+  hand instead — it must export `Transport` + `ESPLoader`.
+  (The server-side flash endpoint stays available as an API
+  fallback, but the UI only offers browser flash.)
+  Note: browser flashes run outside the server audit trail — the
+  browser owns the port.
 
 Manual ESP32 flash checklist (run against real hardware before
 trusting a new toolchain install):

@@ -367,11 +367,79 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(len(res["projects"]), 1)
         self.assertNotIn("hint", res)
 
+    # -- alternatives are backup plans, never deal-breakers -----------
+    def test_validate_ignores_bad_alternatives_when_nothing_lacking(self):
+        proj = {"id": "p1", "title": "Blink", "summary": "s",
+                "steps": [{"n": 1, "instruction": "blink",
+                           "verify": "CHECK_GPIO", "expect": {},
+                           "depends_on_parts": ["led"]}],
+                "missing_parts": [],
+                "alternatives": ["just buy one", {"title": "Shapeless"}]}
+        self.assertEqual(discovery.validate_project(proj, ["esp32", "led"]),
+                         [])
+
+    def test_validate_rejects_lacking_with_unusable_alternatives(self):
+        proj = {"id": "p1", "title": "Servo arm", "summary": "s",
+                "steps": [{"n": 1, "instruction": "wire servo",
+                           "verify": "CHECK_GPIO", "expect": {},
+                           "depends_on_parts": ["servo"]}],
+                "missing_parts": ["servo"],
+                "alternatives": ["just buy one"]}
+        reasons = discovery.validate_project(proj, ["esp32", "led"])
+        self.assertTrue(any("not visible" in r for r in reasons))
+        self.assertTrue(any("not an object" in r for r in reasons))
+
+    def test_validate_accepts_lacking_with_valid_alternative(self):
+        proj = {"id": "p1", "title": "Servo arm", "summary": "s",
+                "steps": [{"n": 1, "instruction": "wire servo",
+                           "verify": "CHECK_GPIO", "expect": {},
+                           "depends_on_parts": ["servo"]}],
+                "missing_parts": ["servo"],
+                "alternatives": [{
+                    "title": "Blink", "summary": "s",
+                    "steps": [{"n": 1, "instruction": "blink",
+                               "verify": "CHECK_GPIO", "expect": {},
+                               "depends_on_parts": ["led"]}]}]}
+        self.assertEqual(discovery.validate_project(proj, ["esp32", "led"]),
+                         [])
+
+    def test_plan_strips_unusable_alternatives(self):
+        plan = {"projects": [{
+            "id": "p1", "title": "Blink", "summary": "s",
+            "steps": [{"n": 1, "instruction": "blink",
+                       "verify": "CHECK_GPIO", "expect": {},
+                       "depends_on_parts": ["led"]}],
+            "missing_parts": [],
+            "alternatives": [
+                {"title": "Also blink", "summary": "s",
+                 "steps": [{"n": 1, "instruction": "blink again",
+                            "verify": "CHECK_GPIO", "expect": {},
+                            "depends_on_parts": ["led"]}]},
+                "just buy one"]}]}
+        Muse = FakeClaude([json.dumps(plan)])
+        self.patch_clients(FakeSAM([]), Muse)
+        res = discovery.plan_projects(["esp32", "led"], None, None)
+        self.assertEqual(len(res["projects"]), 1)
+        alts = res["projects"][0]["alternatives"]
+        self.assertEqual(len(alts), 1)
+        self.assertEqual(alts[0]["title"], "Also blink")
+
+    def test_plan_prompt_specifies_alternative_shape(self):
+        from backend.app.capabilities import AVAILABLE_TESTS
+        from backend.app.prompts import plan_system_prompt
+
+        system = plan_system_prompt(AVAILABLE_TESTS, ["esp32"], [], [],
+                                    None, None, None)
+        self.assertIn("alternatives: [{title", system)
+        self.assertIn("never a bare string", system)
+
     def test_plan_hint_carries_rejection_reasons(self):
+        # Requested builds bypass part-availability gating, so this
+        # rejection comes from a real rule (unknown test name).
         bad = json.dumps({"projects": [{
             "id": "p1", "title": "Servo arm", "summary": "s",
             "steps": [{"n": 1, "instruction": "wire servo",
-                       "verify": "CHECK_GPIO", "expect": {},
+                       "verify": "MAGIC_TEST", "expect": {},
                        "depends_on_parts": ["servo"]}],
             "missing_parts": [], "alternatives": []}]})
         good = json.dumps({"projects": [{
@@ -384,8 +452,89 @@ class DiscoveryTest(unittest.TestCase):
         self.patch_clients(FakeSAM([]), Muse)
         res = discovery.plan_projects(["esp32", "led"], "servo arm", None)
         self.assertEqual(len(res["projects"]), 1)
-        self.assertIn("servo", res["hint"])
-        self.assertIn("visible parts", res["hint"])
+        self.assertIn("servo arm", res["hint"])
+        self.assertIn("MAGIC_TEST", res["hint"])
+
+    # -- requested builds ignore the bench ---------------------------
+    def test_validate_permissive_ignores_visibility(self):
+        proj = {"id": "p1", "title": "Servo arm", "summary": "s",
+                "steps": [{"n": 1, "instruction": "wire servo",
+                           "verify": "CHECK_GPIO", "expect": {},
+                           "depends_on_parts": ["servo"]}],
+                "missing_parts": [], "alternatives": []}
+        self.assertEqual(
+            discovery.validate_project(proj, ["esp32"],
+                                       enforce_visible=False), [])
+        self.assertTrue(discovery.validate_project(proj, ["esp32"]))
+
+    def test_validate_permissive_still_checks_tests(self):
+        proj = {"id": "p1", "title": "Magic", "summary": "s",
+                "steps": [{"n": 1, "instruction": "wave wand",
+                           "verify": "MAGIC_TEST", "expect": {},
+                           "depends_on_parts": ["servo"]}],
+                "missing_parts": [], "alternatives": []}
+        reasons = discovery.validate_project(proj, ["esp32"],
+                                             enforce_visible=False)
+        self.assertTrue(any("MAGIC_TEST" in r for r in reasons))
+
+    def test_plan_request_accepts_nonvisible_parts(self):
+        plan = json.dumps({"projects": [{
+            "id": "p1", "title": "Servo arm", "summary": "s",
+            "steps": [{"n": 1, "instruction": "wire servo",
+                       "verify": "CHECK_GPIO", "expect": {},
+                       "depends_on_parts": ["servo"]}],
+            "missing_parts": [], "alternatives": []}]})
+        Muse = FakeClaude([plan])
+        self.patch_clients(FakeSAM([]), Muse)
+        res = discovery.plan_projects(["esp32"], "servo arm", None)
+        self.assertEqual(len(res["projects"]), 1)
+        self.assertEqual(len(Muse.calls), 1)
+        self.assertNotIn("hint", res)
+
+    def test_prompt_request_mode_drops_visibility_rule(self):
+        from backend.app.capabilities import AVAILABLE_TESTS
+        from backend.app.prompts import plan_system_prompt
+
+        asked = plan_system_prompt(AVAILABLE_TESTS, ["esp32"], [], [],
+                                   "servo arm", None, None)
+        self.assertIn("context, not a limit", asked)
+        self.assertNotIn("MUST be in visible parts", asked)
+        free = plan_system_prompt(AVAILABLE_TESTS, ["esp32"], [], [],
+                                  None, None, None)
+        self.assertIn("MUST be in visible parts", free)
+
+    def test_start_accepts_nonvisible_plan(self):
+        from backend.app.agent_orchestrator import AgentOrchestrator
+
+        orc = AgentOrchestrator()
+        view = orc.start_learning_session(
+            "servo", [{"n": 1, "instruction": "wire servo",
+                       "verify": "CHECK_GPIO", "expect": {},
+                       "depends_on_parts": ["servo"]}],
+            visible_parts=[], session_id="req-1",
+            project_title="Servo arm", board="esp32_devkit")
+        self.assertEqual(view["project_title"], "Servo arm")
+        self.assertEqual(view["step"]["depends_on_parts"], ["servo"])
+
+    def test_start_renumbers_steps_canonically(self):
+        from backend.app.agent_orchestrator import AgentOrchestrator
+
+        orc = AgentOrchestrator()
+        plan = [{"n": 5, "instruction": "first",
+                 "verify": "CHECK_GPIO", "expect": {},
+                 "depends_on_parts": ["led"]},
+                {"n": 9, "instruction": "second",
+                 "verify": "CHECK_GPIO", "expect": {},
+                 "depends_on_parts": ["led"]}]
+        view = orc.start_learning_session(
+            "renum", plan, visible_parts=[], session_id="req-2",
+            project_title="Renum", board="esp32_devkit")
+        stored = orc.sessions["req-2"]["plan"]
+        self.assertEqual([s["n"] for s in stored], [1, 2])
+        self.assertEqual([c["n"] for c in orc.sessions["req-2"]["chapters"]],
+                         [1, 2])
+        self.assertEqual(view["step"]["n"], 1)
+        self.assertEqual([s["n"] for s in plan], [5, 9])
 
 
 TEST_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 128

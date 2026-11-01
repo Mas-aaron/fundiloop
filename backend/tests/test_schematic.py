@@ -14,6 +14,8 @@ from unittest import mock
 
 from backend.app.boards import pin_map_for
 from backend.app.schematic import _allocate, build_netlist, render_svg
+from backend.app.breadboard_schematic import render_breadboard_svg
+from backend.app.visual_schematic import render_visual_svg
 
 
 PLAN = [
@@ -193,6 +195,14 @@ class SvgTest(unittest.TestCase):
         self.assertIn("<circle", svg)  # power/ground tap the rails
         self.assertIn("red rail = power", svg)
 
+    def test_svg_hover_titles(self):
+        net = build_netlist(PLAN, 2, pin_map_for("esp32_devkit"))
+        svg = render_svg(net, 2)
+        self.assertIn("<title>bme280 SDA", svg)
+        self.assertIn("(added step 1)", svg)
+        self.assertIn("<title>Breadboard power rails", svg)
+        self.assertIn("<title>esp32_devkit", svg)
+
     def test_svg_group_ids_sanitized(self):
         net = build_netlist(
             [{"n": 1, "instruction": "x", "verify": "CHECK_GPIO",
@@ -201,6 +211,71 @@ class SvgTest(unittest.TestCase):
         svg = render_svg(net, 1)
         self.assertIn('id="unresolved-_b_evil"', svg)
         self.assertNotIn("<b>evil", svg)
+
+
+class VisualSchematicTest(unittest.TestCase):
+    def test_visual_draws_netlist_wires_and_step_marks(self):
+        net = build_netlist(PLAN, 1, pin_map_for("esp32_devkit"))
+        svg = render_visual_svg(net, 1)
+        self.assertIn('id="wire-bme280-SDA"', svg)
+        self.assertIn('id="part-bme280"', svg)
+        self.assertIn('id="part-esp32"', svg)
+        self.assertIn('id="part-usb_c"', svg)
+        self.assertIn('data-step="1"', svg)
+        self.assertIn("ESP32 DevKit v1", svg)
+        self.assertNotIn('id="part-led"', svg)
+
+    def test_visual_grows_with_later_steps(self):
+        pins = pin_map_for("esp32_devkit")
+        svg1 = render_visual_svg(build_netlist(PLAN, 1, pins), 1)
+        svg2 = render_visual_svg(build_netlist(PLAN, 2, pins), 2)
+        self.assertNotIn('id="part-led"', svg1)
+        self.assertIn('id="part-led"', svg2)
+        self.assertIn('id="wire-led-_"', svg2)
+        self.assertIn('data-step="2"', svg2)
+        self.assertIn("schematic-prior", svg2)
+        self.assertIn("schematic-new", svg2)
+
+    def test_visual_servo_and_ultrasonic_use_signal_colors(self):
+        plan = [{"n": 1, "instruction": "Power.", "verify": "CHECK_SERIAL",
+                 "expect": {}, "depends_on_parts": ["esp32"]},
+                {"n": 2, "instruction": "Eyes.", "verify": "CHECK_GPIO",
+                 "expect": {}, "depends_on_parts": ["hc_sr04"]},
+                {"n": 3, "instruction": "Arm.", "verify": "CHECK_GPIO",
+                 "expect": {}, "depends_on_parts": ["servo"]}]
+        pins = pin_map_for("esp32_devkit")
+        svg = render_visual_svg(build_netlist(plan, 3, pins), 3)
+        self.assertIn("HC-SR04P Ultrasonic", svg)
+        self.assertIn("SG90 Servo", svg)
+        self.assertIn("#a855f7", svg)  # servo signal
+        self.assertIn("#3b82f6", svg)  # TRIG
+        self.assertIn("#22c55e", svg)  # ECHO
+        self.assertIn('id="wire-servo-SIG"', svg)
+        self.assertIn('id="wire-hc_sr04-TRIG"', svg)
+
+
+class BreadboardSchematicTest(unittest.TestCase):
+    def test_breadboard_has_holes_and_same_wire_ids(self):
+        net = build_netlist(PLAN, 1, pin_map_for("esp32_devkit"))
+        svg = render_breadboard_svg(net, 1)
+        self.assertEqual(svg, render_breadboard_svg(net, 1))
+        self.assertIn('id="breadboard-board"', svg)
+        self.assertIn('id="wire-bme280-SDA"', svg)
+        self.assertIn('id="part-esp32"', svg)
+        self.assertIn('id="part-usb_c"', svg)
+        for letter in "ABCDEFGHIJ":
+            self.assertIn(">%s</text>" % letter, svg)
+        self.assertIn("breadboard layout", svg)
+        self.assertNotIn("<b>", svg)
+
+    def test_breadboard_grows_with_later_steps(self):
+        pins = pin_map_for("esp32_devkit")
+        svg1 = render_breadboard_svg(build_netlist(PLAN, 1, pins), 1)
+        svg2 = render_breadboard_svg(build_netlist(PLAN, 2, pins), 2)
+        self.assertNotIn('id="part-led"', svg1)
+        self.assertIn('id="part-led"', svg2)
+        self.assertIn('id="wire-led-_"', svg2)
+        self.assertIn("schematic-new", svg2)
 
 
 class SchematicEndpointTest(unittest.TestCase):
@@ -220,6 +295,8 @@ class SchematicEndpointTest(unittest.TestCase):
         self.assertEqual(out["n"], 2)
         self.assertEqual(out["netlist"]["parts"], ["bme280", "led"])
         self.assertIn("<svg", out["svg"])
+        self.assertIn("<svg", out["breadboard_svg"])
+        self.assertIn('id="breadboard-board"', out["breadboard_svg"])
         self.assertEqual(out["unresolved"], [])
 
     def test_unknown_session_is_404(self):

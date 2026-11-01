@@ -254,7 +254,9 @@ class AgentOrchestrator:
         """Start (or restart) a learning session on a validated plan.
 
         Raises ValueError listing validator reasons when the plan is bad,
-        or naming an unknown board.
+        or naming an unknown board. Part availability never blocks the
+        start: the user wires what the plan names, and the sensor
+        decides each step honestly.
         """
         from .boards import board_key, pin_map_for
         from .discovery import validate_project
@@ -262,9 +264,17 @@ class AgentOrchestrator:
         key = board_key(board)
         visible = [str(v) for v in (visible_parts or [])]
         steps = list(plan) if isinstance(plan, list) else []
-        reasons = validate_project({"steps": steps}, visible) if steps else ["plan has no steps"]
+        reasons = validate_project({"steps": steps}, visible,
+                                   enforce_visible=False) if steps else ["plan has no steps"]
         if reasons:
             raise ValueError("; ".join(reasons))
+        # Canonical numbering: every consumer (speech, chapters,
+        # schematic, guide, flash) keys steps by n, so the model never
+        # gets to number them 0-based, gapped, or out of order.
+        steps = [dict(s) if isinstance(s, dict) else s for s in steps]
+        for i, step in enumerate(steps):
+            if isinstance(step, dict):
+                step["n"] = i + 1
         sid = session_id or uuid.uuid4().hex
         self.sessions.pop(sid, None)
         self.session = {
@@ -531,54 +541,97 @@ class AgentOrchestrator:
                 verification=s.get("last_verification"),
                 fundi={"event": "CHAPTER_HINT", "chapter": current_ch,
                        "hint": speak})
-        s["confirm_pending"] = None
         verification = dict(s.get("last_verification") or {})
         verification["technician_confirmed"] = True
+        return self._commit_learner_advance(
+            s, step, verification, current_ch, "Confirmed.", "technician")
+
+    def advance_learning_step(self, session_id: str,
+                              transcript: str = "") -> dict:
+        """Advance because the learner said they finished this step.
+
+        Learning is learner-paced: saying done / next does not wait for
+        a sensor pass. CHECK NOW still sensor-verifies. Raises KeyError
+        for an unknown or non-learning session.
+        """
+        s = self.sessions.get(session_id)
+        if s is None or not s.get("learning"):
+            raise KeyError("unknown learning session id")
+        self.session = s
+        self.current_id = session_id
+        idx = s["step_index"]
+        if idx >= len(s["plan"]):
+            return self._learning_status_view()
+        if s.get("confirm_pending"):
+            return self.confirm_learning_step(session_id, True)
+        step = s["plan"][idx]
+        chapters = s.get("chapters") or []
+        current_ch = chapter_for(chapters, idx) or {}
+        heard = str(transcript or "").strip()
+        verification = {
+            "test": "LEARNER_DONE",
+            "passed": True,
+            "measured": heard or "you said this step is done",
+            "technician_confirmed": True,
+        }
+        praise = ["Nice work.", "Boom.", "Spot on.", "Well done.",
+                  "Nailed it.", "Great.", "Let's go."][s["turns"] % 7]
+        s["turns"] += 1
+        return self._commit_learner_advance(
+            s, step, verification, current_ch, praise, "learner")
+
+    def _commit_learner_advance(self, s: dict, step: dict, verification: dict,
+                                current_ch: dict, celebration: str,
+                                confirmed_by: str) -> dict:
+        """Shared tail: log the attestation, bump the step, speak the next."""
+        s["confirm_pending"] = None
         s["last_verification"] = verification
         s["verified"]["steps"].append({
-            "n": step.get("n", idx + 1),
+            "n": step.get("n", s["step_index"] + 1),
             "test": verification.get("test", ""),
             "passed": True,
             "measured": verification.get("measured", ""),
-            "confirmed_by": "technician"})
-        self._log_learning_confirmation(s, step, verification)
-        idx += 1
+            "confirmed_by": confirmed_by})
+        self._log_learning_confirmation(s, step, verification, confirmed_by)
+        idx = s["step_index"] + 1
         s["step_index"] = idx
         if idx >= len(s["plan"]):
             s["completed_at"] = _now()
             s["code_ready"] = True
-            speak = ("Boom, you finished it! Project verified: all "
-                     "%d steps passed (%d confirmed "
-                     "by you). Your project code is shown below."
-                     % (len(s["plan"]), self._confirmed_count(s)))
+            speak = ("Boom, you finished it! All "
+                     "%d steps are done. Your project code is shown below."
+                     % len(s["plan"]))
             self.voice.speak(speak)
             return self._learning_view(
                 state="DONE",
-                instruction="Project verified. Your project code is below.",
+                instruction="Lesson complete. Your project code is below.",
                 speak=speak, verification=verification,
                 fundi={"event": "LESSON_DONE", "chapter": None,
                        "chapters_total": len(s["plan"])})
-        next_ch = chapter_for(chapters, idx)
-        text = "Confirmed. Next: %s" % speak_start(
-            next_ch or {}, s.get("project_title", ""))
+        next_ch = chapter_for(s.get("chapters") or [], idx)
+        text = "%s Next: %s" % (
+            celebration, speak_start(next_ch or {}, s.get("project_title", "")))
         if next_ch is not None and not str(next_ch.get("teach") or "").strip():
-            text = "Confirmed. Next step %s: %s" % (
-                next_ch.get("n", idx + 1),
+            text = "%s Next step %s: %s" % (
+                celebration, next_ch.get("n", idx + 1),
                 str(next_ch.get("task") or "").strip())
         self.voice.speak(text)
-        return self._learning_view(
+        view = self._learning_view(
             state="INSTRUCTING", instruction=text, speak=text,
             verification=verification,
             fundi={"event": "CHAPTER_PASSED", "chapter": current_ch,
                    "next_chapter": next_ch,
-                   "celebration": str(current_ch.get("celebration") or "Confirmed.")})
+                   "celebration": str(current_ch.get("celebration") or celebration)})
+        self._attach_step_code(view, s["plan"][idx])
+        return view
 
     @staticmethod
     def _confirmed_count(s: dict) -> int:
         return sum(1 for a in s.get("attempts", []) if a.get("confirmed_by"))
 
     def _log_learning_confirmation(self, s: dict, step: dict,
-                                   verification: dict) -> None:
+                                   verification: dict,
+                                   confirmed_by: str = "technician") -> None:
         """Hash-chained audit entry for a technician-confirmed step."""
         entry = {
             "seq": len(s["attempts"]) + 1,
@@ -590,7 +643,7 @@ class AgentOrchestrator:
             "test": verification.get("test", ""),
             "passed": True,
             "measured": verification.get("measured", ""),
-            "confirmed_by": "technician",
+            "confirmed_by": confirmed_by,
             "transcript": "",
         }
         entry["hash"] = _event_hash(entry)

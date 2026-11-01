@@ -553,10 +553,86 @@ input:focus { outline: 1px solid var(--purple); border-color: var(--purple); }
   width: 100%;
   height: auto;
   display: block;
+  background: #0a0a0c;
+  border-radius: 1rem;
+}
+@keyframes schematic-wire-draw {
+  to { stroke-dashoffset: 0; }
+}
+@keyframes schematic-part-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+#schematic-svg .schematic-drawing path,
+#schematic-svg .schematic-drawing line,
+#cook-schematic-svg .schematic-drawing path,
+#cook-schematic-svg .schematic-drawing line {
+  animation: schematic-wire-draw var(--wire-dur, 1.6s) ease-out forwards;
+}
+.schematic-view-toggle { margin: 0.5rem 0; }
+.schematic-view-btn.active {
+  border-color: var(--cyan);
+  background: var(--panel-hover);
+}
+#schematic-svg .schematic-enter,
+#cook-schematic-svg .schematic-enter {
+  animation: schematic-part-in 0.45s ease-out both;
 }
 #schematic-wires, #cook-schematic-wires {
   text-align: left;
   white-space: pre-line;
+}
+#schematic-svg g[id^="wire-"], #cook-schematic-svg g[id^="wire-"] {
+  cursor: pointer;
+}
+#schematic-sel, #cook-schematic-sel {
+  text-align: left;
+  min-height: 1em;
+}
+#schematic-sel:empty, #cook-schematic-sel:empty {
+  display: none;
+}
+#webflash-status, #cook-webflash-status {
+  text-align: left;
+  white-space: pre-line;
+}
+#webflash-progress, #cook-webflash-progress {
+  height: 1.25rem;
+  margin: 0.5rem 0;
+}
+.guide-part {
+  padding: 0.2rem 0;
+  font-size: 0.875rem;
+}
+.guide-qty {
+  display: inline-block;
+  min-width: 2.5rem;
+  font-weight: bold;
+}
+#cook-guide-steps {
+  list-style: none;
+  padding: 0;
+}
+#cook-guide-steps li {
+  cursor: pointer;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 0.5rem;
+}
+#cook-guide-steps li.active {
+  border-color: var(--cyan);
+}
+.guide-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 50%;
+  background: var(--panel-hover);
+  font-weight: bold;
+  margin-right: 0.5rem;
 }
 @media (min-width: 900px) {
   .cook-container { max-width: 1100px; }

@@ -148,17 +148,24 @@
     <pre id="code-out"></pre>
     <div id="schematic-panel">
       <h3>Wiring schematic</h3>
+      <div class="fine">Wires draw in with the tutor. Toggle breadboard to see the holes.</div>
+      <div class="btn-row schematic-view-toggle">
+        <button type="button" class="small schematic-view-btn active" data-view="cards">Pin cards</button>
+        <button type="button" class="small schematic-view-btn" data-view="breadboard">Breadboard</button>
+      </div>
       <div id="schematic-svg"></div>
+      <div id="schematic-sel" class="fine"></div>
       <div id="schematic-wires" class="fine"></div>
       <div class="btn-row" style="margin-top: 0.5rem;">
         <button id="schematic-download" class="small" type="button">Download SVG</button>
         <button id="schematic-speak" class="small" type="button">Speak wires</button>
       </div>
       <div class="btn-row" style="margin-top: 0.5rem;">
-        <select id="flash-port"></select>
-        <button id="flash-esp32" class="small" type="button">FLASH ESP32</button>
+        <button id="web-connect" class="small" type="button">CONNECT BOARD</button>
+        <button id="web-flash" class="small" type="button">FLASH IN BROWSER</button>
       </div>
-      <div id="flash-status" class="fine"></div>
+      <progress id="webflash-progress" max="100" value="0" hidden style="width: 100%;"></progress>
+      <div id="webflash-status" class="fine"></div>
     </div>
   </section>
 
@@ -281,18 +288,34 @@
       </div>
       <div class="panel">
         <h2>Wiring schematic</h2>
+        <div class="fine">Wires draw in with the tutor. Toggle breadboard to see the holes.</div>
+        <div class="btn-row schematic-view-toggle">
+          <button type="button" class="small schematic-view-btn active" data-view="cards">Pin cards</button>
+          <button type="button" class="small schematic-view-btn" data-view="breadboard">Breadboard</button>
+        </div>
         <div id="cook-schematic-svg"></div>
+        <div id="cook-schematic-sel" class="fine"></div>
         <div id="cook-schematic-wires" class="fine"></div>
         <div class="btn-row" style="margin-top: 0.5rem;">
           <button id="cook-schematic-download" class="small" type="button">DOWNLOAD SVG</button>
           <button id="cook-schematic-speak" class="small" type="button">SPEAK WIRES</button>
         </div>
         <div class="btn-row" style="margin-top: 0.5rem;">
-          <select id="cook-flash-port"></select>
-          <button id="cook-flash-esp32" class="small" type="button">FLASH ESP32</button>
+          <button id="cook-web-connect" class="small" type="button">CONNECT BOARD</button>
+          <button id="cook-web-flash" class="small" type="button">FLASH IN BROWSER</button>
         </div>
-        <div id="cook-flash-status" class="fine"></div>
+        <progress id="cook-webflash-progress" max="100" value="0" hidden style="width: 100%;"></progress>
+        <div id="cook-webflash-status" class="fine"></div>
       </div>
+    </div>
+
+    <div class="panel" id="cook-guide-panel" hidden>
+      <h2>Build guide</h2>
+      <h3>Gather all the parts</h3>
+      <div id="cook-guide-parts"></div>
+      <h3>Assembly, step by step</h3>
+      <ol id="cook-guide-steps" class="guide-steps"></ol>
+      <div class="fine">Tap a step to hear each wire as it lights up in the diagram.</div>
     </div>
 
     <ol id="cook-parts" class="cook-chips"></ol>
@@ -309,6 +332,8 @@
     <div class="btn-row cook-btns" style="flex-wrap: wrap;">
       <button id="cook-talk" class="small" type="button">TALK</button>
       <button id="cook-check" class="small" type="button">CHECK</button>
+      <button id="cook-phase-done" class="small" type="button">PHASE DONE</button>
+      <button id="cook-auto" class="small" type="button">AUTO ✓</button>
       <button id="cook-confirm" class="small" type="button" hidden>CONFIRM</button>
       <button id="cook-repeat" class="small" type="button">REPEAT</button>
       <button id="cook-look" class="small" type="button">LOOK</button>

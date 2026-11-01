@@ -30,6 +30,11 @@ _BUSY_RE = re.compile(
     r"serialexception",
     re.IGNORECASE)
 
+_MISSING_PORT_RE = re.compile(
+    r"filenotfounderror|cannot find the file|does not exist|"
+    r"no such file|not found",
+    re.IGNORECASE)
+
 
 def esptool_cmd() -> list[str]:
     """esptool invocation from env (module run by default)."""
@@ -67,8 +72,12 @@ def flash_settle_seconds() -> float:
 
 
 def _excerpt(text: str, lines: int = 20, width: int = 2000) -> str:
-    tail = "\n".join((text or "").splitlines()[-lines:])
-    return tail[-width:] if len(tail) > width else tail
+    """Failure context: root error lines first, then the tail."""
+    all_lines = (text or "").splitlines()
+    errs = [line for line in all_lines if "error" in line.lower()][:8]
+    out = errs + ["…"] + all_lines[-lines:] if errs else all_lines[-lines:]
+    joined = "\n".join(out)
+    return joined[-width:] if len(joined) > width else joined
 
 
 def is_busy_port(log: str) -> bool:
@@ -84,16 +93,27 @@ def busy_port_guidance(port: str) -> str:
             % (port or "?"))
 
 
+def available_ports() -> list[str]:
+    """Serial port names on this machine ([] when unknown). Never raises."""
+    try:
+        from .serial_probe import list_serial_ports
+        return [str(p.get("port")) for p in list_serial_ports()
+                if p.get("port")]
+    except Exception:
+        return []
+
+
 def check_port(port: str) -> dict:
     """Pre-flight: can this process open `port` right now?
 
     Returns {"ok": True} when the port opens (closing the handle
     immediately), or when pyserial is missing — esptool remains the
-    judge then. A held port returns {"ok": False, "detail": reason}
-    so the caller can fail fast with Serial-Monitor guidance instead
-    of compiling first. Never raises. Note: opening the port resets
-    the board (DTR toggle), which is harmless here — flashing
-    reboots it anyway.
+    judge then. Otherwise {"ok": False, "busy": bool, "detail":
+    reason}: busy=True means another program holds the port (close
+    Serial Monitor), busy=False means the port does not exist (plug
+    the board in, pick the right port). Never raises. Note: opening
+    the port resets the board (DTR toggle), which is harmless here —
+    flashing reboots it anyway.
     """
     try:
         import serial
@@ -104,7 +124,9 @@ def check_port(port: str) -> dict:
         handle = serial.Serial(port, esptool_baud(), timeout=0.5)
         return {"ok": True, "detail": ""}
     except Exception as exc:
-        return {"ok": False, "detail": str(exc) or "cannot open port"}
+        msg = str(exc) or "cannot open port"
+        return {"ok": False, "busy": not bool(_MISSING_PORT_RE.search(msg)),
+                "detail": msg}
     finally:
         if handle is not None:
             try:

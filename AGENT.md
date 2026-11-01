@@ -149,14 +149,99 @@ Guided Assembly and Diagnostic modes are unchanged (still sensor-verified).
   as a one-time external install (README); manual ESP32 flash
   checklist in README (needs real hardware — run before trusting a
   new toolchain install).
-- Full suite: 415 tests OK, `node --check frontend/app.js` clean —
+- Full suite: 460 tests OK, `node --check frontend/app.js` clean —
   verified after the final edit.
+- Log excerpts lead with root errors: toolchains print the cause
+  early and the consequence late, so excerpts now surface `error`
+  lines first, then the tail (build + flash). 1 test.
+- Browser flash API fix (verified against esptool-js 0.5.7 source):
+  `ESPLoader` takes `{transport, baudrate, terminal}`, not a
+  positional transport (the old call crashed in `getInfo`); CONNECT
+  only picks the port while `main()` opens it; no `hardReset`
+  exists — port release reboots the board. Loader chatter streams
+  into the staged log, and CHECK vs FLASH now block each other both
+  ways instead of fighting over the port. Sync failures print the
+  hold-BOOT-and-retry recovery inline, and the picked port survives
+  a failed attempt (closed, so CHECK still works) for instant retry.
+  Progress you can actually see: the bar animates while connecting,
+  shows % while writing, keeps its final state after failure, parks
+  empty when no bytes flowed, and the panel scrolls into view at
+  flash start. Baud fallback: corruption/timeout at 921600 retries
+  automatically at 460800 then 115200 on the same open port.
+  strings (it calls `.charCodeAt`), so downloads convert via a
+  chunked `u8ToBstr` instead of passing Uint8Arrays.
+- Auto-continue build loop (Cook Mode): CHECK refires every 20s so a
+  PASS flows into the next phase untapped; repeats of an identical
+  FAIL stay silent while panels update. AUTO ✓ button shows the
+  countdown and toggles the loop; EXIT, DONE, or toggling off
+  interrupts. Manual checks always speak.
+- Karaoke wire speech: guide cards and SPEAK WIRES now narrate wire
+  by wire, lighting each wire on the diagram exactly as it is named
+  (each phrase waits for the previous audio to finish); a check, tap,
+  look, exit, or any newer speech retires the rest silently, and
+  hands-free listening stays off mid-sequence. Sequencing, cancel,
+  supersede, and guide paths verified by `node
+  frontend/test_karaoke.js` (5 checks, loads the real app.js).
+- PHASE DONE button (Cook Mode): one tap tells the system the phase
+  is wired ("Got it — checking phase N"), then the sensor verifies
+  as usual. Voice shares the path: done/finished/complete/ready/
+  move on/next phase|step. Phrases verified by a node probe. The server-side
+  port dropdown + FLASH ESP32 buttons were removed from both panels
+  at the user's request (browser flash is the UI path now); the
+  `POST .../flash` endpoint stays as a tested API fallback.
+- Sketch layout fix: the staged sketch is now
+  `step_sketch/step_sketch.ino` (Arduino requires folder and main
+  file to share a name); previously `sketch/step_sketch.ino` failed
+  real compiles with "main file missing". 1 test.
+- Sequential-step fix: session start renumbers plan steps 1..N in
+  list order (the model can no longer number them 0-based/gapped),
+  so speech, chapters, schematic, guide, and flash always agree on
+  the current step; the guide pairs chapters positionally and the UI
+  tracks `step.n` directly. 3 tests.
+- Bundle auto-fetch: `/esptool-js/bundle.js` downloads the pinned
+  esptool-js release once on first use (`backend/app/esptool_js.py`,
+  `ESPTOOL_JS_URL`/`ESPTOOL_JS_TIMEOUT` envs) and serves it locally;
+  no manual copy step. Invalid/offline fetches 404 with manual
+  fallback instructions. 5 more tests in `test_web_flash.py`.
+- Browser flash (Web Serial, user-approved): CONNECT BOARD opens the
+  browser's own port picker (Chrome/Edge; localhost is a secure
+  context); FLASH IN BROWSER downloads the server-compiled binaries
+  (`GET .../firmware` manifest + per-file downloads, build dir only)
+  and flashes via the vendored esptool-js bundle
+  (`/esptool-js/bundle.js`, one-time operator download, never a CDN)
+  with progress bar, staged log, speech, and port release so CHECK
+  NOW works right after. Server-side FLASH stays as the any-browser
+  fallback; both share one busy guard. Browser flashes run outside
+  the server audit trail. 9 tests in `test_web_flash.py`.
+- Schematik-style build guide: `GET /project/{id}/guide` (parts
+  table with qty/blurbs + numbered assembly cards naming exactly
+  each step's new wires, with SVG ids); Cook Mode panel renders
+  both, tapping a card highlights its wires and speaks it, current
+  card stays marked. 10 tests in `test_build_guide.py`.
+- Port UX fix: pre-flight distinguishes a missing port from a busy
+  one (`port_missing` names available ports / says to plug the board
+  in; `port_busy` keeps the Serial-Monitor guidance); the flash
+  dropdown prefers a real enumerated port over a stale COM3.
+- Schematic interactivity: hover tooltips on every group plus
+  click-to-isolate (rest dim, selection described under the drawing,
+  click again to restore). 6 flash tests + 1 schematic test.
+- Requested builds ignore the bench: naming a project plans it
+  exactly as asked (`validate_project(..., enforce_visible=False)`,
+  prompt drops the visibility rule, session start never gates on
+  parts). Open suggestions still use visible parts; sensor
+  verification per step is unchanged. 5 tests.
+- Alternatives-shape fix ("smart gate" case): the prompt now specifies
+  the backup-plan object shape; the validator no longer rejects a
+  buildable project over malformed backup plans (they only matter
+  when parts are lacking, and then the reasons say so); accepted
+  projects ship with unusable alternatives stripped. 5 tests.
 - Flash pre-flight port check: the endpoint opens the picked port
   before compiling; a held port fails fast with 409 + Serial-Monitor
   guidance (audited as `port_busy`) instead of compiling first.
   4 tests in `test_firmware_flash.py`.
-- Scope boundary (unchanged): Uno flash, Web Serial path, breadboard
-  layout view still need their own approval.
+- Scope boundary: Uno flash and breadboard layout view still need
+  their own approval. (The Web Serial browser-flash path was approved
+  by the user and built — see below.)
 - Empty-schematic UX fix: steps needing no hookup wires (built-in LED
   + USB serial) now draw the board box with an explicit "No external
   wiring — on-board only" message plus involved parts; netlist gains
