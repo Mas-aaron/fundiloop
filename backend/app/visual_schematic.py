@@ -38,6 +38,33 @@ COLORS = {
 }
 _DEFAULT = "#64748b"
 
+# Spoken name per wire color, mirroring COLORS above: the tutor says
+# "use a red wire" for exactly the wire drawn in red.
+COLOR_NAMES = {
+    "power": "red",
+    "ground": "gray",
+    "SIG": "purple",
+    "signal": "purple",
+    "TRIG": "blue",
+    "ECHO": "green",
+    "SDA": "blue",
+    "SCL": "green",
+    "DATA": "amber",
+    "DQ": "amber",
+    "OUT": "amber",
+    "AO": "orange",
+    "VOUT": "orange",
+    "WIPER": "orange",
+    "IN": "purple",
+    "R": "red",
+    "G": "green",
+    "B": "blue",
+    "+": "amber",
+    "-": "gray",
+    "COM": "gray",
+}
+_DEFAULT_NAME = "gray"
+
 TITLES = {
     "hc_sr04": "HC-SR04P Ultrasonic",
     "servo": "SG90 Servo",
@@ -83,6 +110,25 @@ GAP = 56
 def _color(signal: object) -> str:
     key = str(signal or "")
     return COLORS.get(key, COLORS.get(key.lower(), _DEFAULT))
+
+
+def wire_color_name(signal: object) -> str:
+    """Spoken wire color for a netlist signal (unknown signals are gray)."""
+    key = str(signal or "")
+    return COLOR_NAMES.get(key, COLOR_NAMES.get(key.lower(),
+                                                _DEFAULT_NAME))
+
+
+def annotate_wires(wires: list) -> list:
+    """Add presentation keys in place: the drawn hex color, its spoken
+    name, and the part's display title. Skips non-dicts."""
+    for wire in wires or []:
+        if not isinstance(wire, dict):
+            continue
+        wire["color"] = _color(wire.get("signal"))
+        wire["color_name"] = wire_color_name(wire.get("signal"))
+        wire["part_title"] = _title(str(wire.get("part") or ""))
+    return wires
 
 
 def _title(part: str) -> str:

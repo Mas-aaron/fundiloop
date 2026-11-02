@@ -1,17 +1,15 @@
-"""Agentic learning: validator gates, sensor-gated steps, code gating.
+"""Agentic learning: validator gates, tap-paced steps, code gating.
 
 Run from the repo root:
   backend\\.venv\\Scripts\\python.exe -m unittest backend.tests.test_discovery_agentic -v
 
 No hardware, no network: mock probe + mock Muse adapters. The validator
-rejects bad plans, the probe alone advances steps, and firmware is gated
-until every step passes.
+rejects bad plans, taps advance steps, telemetry proves the build, and
+firmware is served any time with an honest verified flag.
 """
 import tempfile
 import unittest
 from unittest import mock
-
-from fastapi import HTTPException
 
 from backend.app import discovery
 from backend.app import main as app_main
@@ -21,7 +19,6 @@ from backend.app.adapters.voice_adapter import MetaVoiceAdapter
 from backend.app.agent_orchestrator import AgentOrchestrator
 from backend.app.change_detector import MotionSettler
 from backend.app.circuit_graph import load_circuit_graph
-from backend.app.models import CheckNowRequest
 from backend.app.serial_probe import SerialProbe
 from backend.tests.helpers import make_camera, use_mock_env
 
@@ -108,17 +105,24 @@ class LearningLoopTest(unittest.TestCase):
                 view = self.orc.start_learning_session(
                     "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
                     session_id="learn-fast", project_title="Weather station")
-        # Zero model calls on the start path: templates answer now.
+        # Zero model calls on the start path: the roll call answers
+        # now, chapters warm in the background.
         self.assertEqual(calls, [])
-        self.assertTrue(view["speak"].startswith("Step 1: "))
+        self.assertEqual(view["state"], "ROLLCALL")
+        self.assertIn("READY", view["speak"])
+        answered = self.orc.answer_rollcall("learn-fast", "ready")
+        self.assertTrue(answered["speak"].startswith("Step 1: "))
         self.assertEqual(len(self.orc.session["chapters"]), 2)
         self.assertEqual(self.orc.session["chapters"][0]["teach"], "")
-        self.assertEqual(len(threads), 1)
-        self.assertTrue(threads[0]["daemon"])
+        self.assertEqual({t["name"] for t in threads},
+                         {"fundiloop-chapters"})
+        self.assertTrue(all(t["daemon"] for t in threads))
+        fill = next(t for t in threads
+                    if t["name"] == "fundiloop-chapters")
         # Explicit fill step: the background worker swaps the full set.
         with mock.patch("backend.app.agent_orchestrator.plan_chapters",
                         side_effect=fake_plan):
-            threads[0]["target"](*threads[0]["args"])
+            fill["target"](*fill["args"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(calls[0]), 2)
         self.assertEqual(self.orc.session["chapters"][0]["teach"], "do it")
@@ -148,91 +152,85 @@ class LearningLoopTest(unittest.TestCase):
                                 "Weather station", "esp32_devkit")
         self.assertEqual(self.orc.session["chapters"], [{"marker": True}])
 
-    def test_advances_one_step_per_pass_and_refuses_early_done(self):
+    def test_advance_moves_one_step_and_holds_at_final(self):
         self.orc.start_learning_session(
             "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
             session_id="learn-1", project_title="Weather station")
-        v = self.orc.check_now(CheckNowRequest())
-        self.assertTrue(v["verification"]["passed"], v["verification"])
+        self.orc.answer_rollcall("learn-1", "ready")
+        v = self.orc.advance_learning_step("learn-1", "done")
         self.assertEqual(v["step_index"], 1)
         self.assertEqual(v["state"], "INSTRUCTING")
         self.assertNotEqual(v["state"], "DONE")
         self.assertFalse(v["code_ready"])
+        # Final step: a plain tap holds with deploy guidance.
+        hold = self.orc.advance_learning_step("learn-1", "next")
+        self.assertEqual(hold["step_index"], 1)
+        self.assertEqual(hold["state"], "INSTRUCTING")
+        self.assertIn("Deploy", hold["speak"])
 
-    def test_fail_does_not_advance_and_includes_evidence(self):
-        bad = [dict(PLAN_2STEP[0], expect={"addresses": ["0x99"]})]
-        self.orc.start_learning_session(
-            "weather", bad, visible_parts=["esp32", "bme280"],
-            session_id="learn-fail")
-        v = self.orc.check_now(CheckNowRequest())
-        self.assertFalse(v["verification"]["passed"])
-        self.assertEqual(v["step_index"], 0)
-        self.assertEqual(v["state"], "VERIFYING")
-        self.assertIn("MISSING", v["verification"]["measured"])
-        self.assertIn("0x99", v["verification"]["measured"])
-        self.assertIn(v["verification"]["measured"], v["instruction"])
-
-    def test_code_409_before_done_200_after(self):
+    def test_code_available_any_time_verified_only_when_done(self):
         self.orc.start_learning_session(
             "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
             session_id="learn-code", project_title="Weather station")
+        self.orc.answer_rollcall("learn-code", "ready")
         with mock.patch.object(app_main, "orchestrator", self.orc):
-            with self.assertRaises(HTTPException) as before:
-                app_main.api_project_code("learn-code")
-            self.assertEqual(before.exception.status_code, 409)
-            self.orc.check_now(CheckNowRequest())
-            v = self.orc.check_now(CheckNowRequest())
+            before = app_main.api_project_code("learn-code")
+            self.assertFalse(before["verified"])
+            lines = ["Distance: %dcm" % n for n in (45, 44, 43, 42, 41)]
+            v = self.orc.telemetry_verify("learn-code", lines)
             self.assertEqual(v["state"], "DONE")
             self.assertTrue(v["code_ready"])
-            self.assertIn("code", v["speak"].lower())  # DONE promises the .ino
+            self.assertIn("It works!", v["speak"])
             self.assertIn("code", v["instruction"].lower())
             out = app_main.api_project_code("learn-code")
+        self.assertTrue(out["verified"])
         self.assertEqual(out["session_id"], "learn-code")
         self.assertIn("#define SDA_PIN 21", out["code"])
         self.assertIn("#define SCL_PIN 22", out["code"])
-        self.assertIn("0x76", out["code"])
 
-    def test_draft_code_available_before_done(self):
+    def test_legacy_draft_body_ignored(self):
         self.orc.start_learning_session(
             "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
             session_id="learn-draft", project_title="Weather station")
         with mock.patch.object(app_main, "orchestrator", self.orc):
             out = app_main.api_project_code("learn-draft", {"draft": True})
+            plain = app_main.api_project_code("learn-draft")
         self.assertFalse(out["verified"])
         self.assertEqual(
             (out["steps_passed"], out["steps_total"]), (0, 2))
-        self.assertIn("// DRAFT", out["code"])
-        self.assertIn("0 of 2 steps", out["code"])
+        self.assertEqual(out["code"], plain["code"])
+        self.assertNotIn("// DRAFT", out["code"])
         self.assertIn("#define LED_PIN", out["code"])
 
-    def test_draft_counts_verified_steps(self):
+    def test_code_counts_verified_steps(self):
         self.orc.start_learning_session(
             "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
             session_id="learn-draft2", project_title="Weather station")
-        self.orc.check_now(CheckNowRequest())
+        self.orc.answer_rollcall("learn-draft2", "ready")
+        self.orc.advance_learning_step("learn-draft2", "done")
         with mock.patch.object(app_main, "orchestrator", self.orc):
-            out = app_main.api_project_code("learn-draft2", {"draft": True})
+            out = app_main.api_project_code("learn-draft2")
         self.assertFalse(out["verified"])
         self.assertEqual(
             (out["steps_passed"], out["steps_total"]), (1, 2))
-        self.assertIn("1 of 2 steps", out["code"])
 
-    def test_draft_prompt_marks_unverified_build(self):
+    def test_code_prompt_requires_telemetry_contract(self):
         from backend.app.prompts import learning_code_prompt
 
-        text = learning_code_prompt("t", [], [], {}, {}, draft=True)
-        self.assertIn("NOT fully verified", text)
-        final = learning_code_prompt("t", [], [], {}, {})
-        self.assertIn("VERIFIED", final)
+        text = learning_code_prompt("t", [], [], {}, {})
+        self.assertIn("Serial", text)
+        self.assertIn("115200", text)
+        self.assertIn("STATUS", text)
 
-    def test_check_now_past_done_stays_done(self):
+    def test_done_stays_done(self):
         self.orc.start_learning_session(
             "blink", [step(1, "CHECK_GPIO", depends=["led"],
                             instruction="Wire the LED to GPIO2.")],
             visible_parts=["esp32", "led"], session_id="learn-gpio")
-        v = self.orc.check_now(CheckNowRequest())
+        self.orc.answer_rollcall("learn-gpio", "ready")
+        v = self.orc.advance_learning_step("learn-gpio", "mark complete anyway")
         self.assertEqual(v["state"], "DONE")
-        v2 = self.orc.check_now(CheckNowRequest())
+        v2 = self.orc.advance_learning_step("learn-gpio", "done")
         self.assertEqual(v2["state"], "DONE")
         self.assertEqual(v2["step_index"], 1)
 

@@ -133,10 +133,9 @@ class BoardAwareLearningTest(unittest.TestCase):
                        "depends_on_parts": ["led"]}],
             visible_parts=["arduino_uno", "led"], session_id="uno-1",
             project_title="Uno blink", board="arduino_uno")
+        orc.answer_rollcall("uno-1", "ready")
         self.assertEqual(v["board"], "arduino_uno")
         self.assertEqual(orc.session["pin_map"]["led_gpio"], 13)
-        done = orc.check_now(CheckNowRequest())
-        self.assertEqual(done["state"], "DONE")
         from backend.app.learning import generate_code
 
         code = generate_code(orc.session, orc.Muse)

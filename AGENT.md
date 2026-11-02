@@ -167,6 +167,10 @@ Guided Assembly and Diagnostic modes are unchanged (still sensor-verified).
   spoken timeout message instead of spinning forever; Cook
   CHECK/PHASE DONE/LOOK say they are still working instead of
   silently ignoring taps while busy.
+- Firmware model calls retry once: project and step codegen wrap
+  `complete_text` in `_complete_with_retry`, so a transient API
+  blip yields firmware instead of a 502 (second failure, and any
+  non-API error, still propagates honestly). 4 tests.
 - Browser flash API fix (verified against esptool-js 0.5.7 source):
   `ESPLoader` takes `{transport, baudrate, terminal}`, not a
   positional transport (the old call crashed in `getInfo`); CONNECT
@@ -366,6 +370,31 @@ Guided Assembly and Diagnostic modes are unchanged (still sensor-verified).
   shipped-space boxes failed against the correct source-pixel
   rescale. Expectations now map through the same
   `prepare_frame`/`scale_box` contract (`expect_box` helper).
+- Learning flow rework (tap-paced, telemetry-proven): per-step sensor
+  checks, eyeball confirm, and step sketches are gone — taps advance
+  steps, one Deploy flashes the finished firmware, and the monitor's
+  telemetry streak marks DONE (escape: "mark complete anyway").
+  Deleted `_learning_turn`, `confirm_learning_step`,
+  `generate_step_code`, and the step endpoints (`/step/{n}/code`,
+  `/step/{n}/flash`, `/step/{n}/firmware`, `/api/session/confirm`,
+  `/api/patient-sketch`); `check-now` 400s for learning sessions
+  (guided/diagnostic unchanged). Firmware carries a telemetry
+  contract (Serial + STATUS heartbeat, enforced at generation).
+  Full suite green.
+- Deploy bar + browser flash restored: cook mode has a bottom
+  "Deploy firmware" bar (port pick, CONNECT BOARD, DEPLOY) instead
+  of drawer-buried flash; DEPLOY uses the browser port when
+  connected, else the server dialog. New final-firmware manifest
+  endpoints (`/project/{id}/firmware…`) feed Web Serial flashing;
+  the monitor starts after a browser flash via the last port or
+  autodetect. Port pick is explicit (no phantom COM3 default).
+  Post-step tutor check-in question removed. Karaoke + suite green.
+- Kokoro 502 fixed (race): concurrent synthesis raced the shared
+  npz voice reads ("Overlapped entries ... possible zip bomb").
+  Reproduced with 8 threads (7 ok/1 err), fixed with single-flight
+  synthesis lock (8/8), regression test pins max engine overlap 1.
+  Cook code panel now shows with the session (drafts anytime,
+  "Project Code" title); fetched drafts survive re-renders.
 
 ## SUPERSEDED (built above): Learning-mode SVG schematic + ESP32 flash plan
 - Goal: Schematik-style project page in Learning mode — per-step wiring

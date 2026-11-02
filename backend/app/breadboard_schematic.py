@@ -4,6 +4,14 @@ Same netlist as the pin-card schematic, drawn as a mini breadboard:
 numbered rows, A–J hole columns, power rails, and jumper paths that
 cross the center trench. Parts sit around the board so a student can
 toggle between pin cards and this view without changing the wiring.
+
+Wiring is orthogonal (horizontal/vertical segments only, like a tidy
+Fritzing layout): each card pin runs a short stub to a vertical lane
+in the gap beside the board, then into its hole or rail tap. Power
+that must cross the board (5V to the right rail, 3V3 to the left
+rail) rides a highway above/below the board instead of cutting
+across the holes, and each side taps its near ground rail with one
+tie jumper joining them under the board.
 """
 from __future__ import annotations
 
@@ -13,12 +21,16 @@ from .schematic import svg_id
 from .visual_schematic import (
     COLORS, CARD_W, HEADER_H, PAD, PIN_H,
     _board_pin_key, _card, _color, _display_board_pin, _icon, _kind,
-    _title, _wire_group, _wire_path,
+    _title,
 )
 
 PITCH = 13
 ROWS_N = 30
 COL_LETTERS = "ABCDEFGHIJ"
+
+LANE_DX = 8      # spacing between vertical lanes in a card/board gap
+LANE_MARGIN = 10  # nearest lane's clearance from the board edge
+GAP_MIN = 48
 
 
 def _is_power(pin: str) -> bool:
@@ -62,33 +74,117 @@ def _geom():
     }
 
 
-def _assign_rows(board_pins: list[str]) -> dict[str, int]:
-    """Stable row numbers for GPIOs; rails handle power/ground."""
+def _assign_rows(board_pins: list[str], start: int = 22,
+                 reserved: frozenset | set = frozenset(),
+                 preferred: frozenset | set | None = None
+                 ) -> dict[str, int]:
+    """Stable row numbers for GPIOs; rails handle power/ground.
+
+    `start` keeps signal rows clear of rail-tap rows so same-gap
+    horizontal stubs never share a row across nets; `reserved`
+    skips those rows if allocation wraps around the board.
+    `preferred` (pin-clear rows) is a soft wish: allocation takes
+    a clear row when one is free and any free row otherwise, so it
+    always terminates — GPIO pools bound signals well under 30.
+    """
     rows: dict[str, int] = {}
-    used = {16, 18, 21}
-    next_row = 22
+    used = {16, 18, 21} | set(reserved)
+    cursor = start
     for pin in board_pins:
         if _is_power(pin) or _is_gnd(pin) or _is_3v3(pin):
             continue
-        while next_row in used or next_row > ROWS_N:
-            next_row += 1
-            if next_row > ROWS_N:
-                next_row = 4
-        rows[pin] = next_row
-        used.add(next_row)
-        next_row += 2
+        pick = None
+        for want_clear in (True, False):
+            r = cursor
+            for _ in range(ROWS_N + 2):
+                if r > ROWS_N:
+                    r = 4
+                if r not in used and (
+                        not want_clear or preferred is None
+                        or r in preferred):
+                    pick = r
+                    break
+                r += 1
+            if pick is not None:
+                break
+        if pick is None:  # absurd overflow: reuse, stay finite
+            pick = cursor if cursor <= ROWS_N else 4
+        rows[pin] = pick
+        used.add(pick)
+        cursor = pick + 2
     return rows
 
 
-def _rail_xy(g: dict, pin: str, row: int) -> tuple[float, float]:
-    y = g["row_y"].get(row, g["row_y"][1])
-    if _is_power(pin):
-        return (g["plus_r"], y)
-    if _is_gnd(pin):
-        return (g["minus_l"], y)
-    if _is_3v3(pin):
-        return (g["plus_l"], y)
-    return (g["cols"]["A"], y)
+def _ortho_d(points: list[tuple[float, float]]) -> str:
+    """Path through points using H/V where axis-aligned, L otherwise."""
+    pts: list[tuple[float, float]] = []
+    for p in points:
+        if not pts or (abs(p[0] - pts[-1][0]) > 0.05
+                       or abs(p[1] - pts[-1][1]) > 0.05):
+            pts.append((float(p[0]), float(p[1])))
+    if not pts:
+        return ""
+    out = ["M %.1f %.1f" % pts[0]]
+    px, py = pts[0]
+    for x, y in pts[1:]:
+        if abs(y - py) <= 0.05:
+            out.append("H %.1f" % x)
+        elif abs(x - px) <= 0.05:
+            out.append("V %.1f" % y)
+        else:
+            out.append("L %.1f %.1f" % (x, y))
+        px, py = x, y
+    return " ".join(out)
+
+
+def _assign_lanes(spans: list) -> tuple[dict, int]:
+    """Greedy vertical-lane assignment within one card/board gap.
+
+    spans: iterable of (top, bottom, group, key) with top <= bottom.
+    Returns ({key: lane}, lane_count). Spans of the same wire group
+    may share a lane (same color, invisible overlap); other groups
+    keep 5px clearance. Sorted input keeps it deterministic.
+    """
+    lanes: list[list[tuple]] = []
+    out: dict = {}
+    for top, bottom, group, key in sorted(spans):
+        lane = None
+        for i, occ in enumerate(lanes):
+            if all(g == group or b + 5 <= top or bottom + 5 <= t
+                   for t, b, g in occ):
+                lane = i
+                occ.append((top, bottom, group))
+                break
+        if lane is None:
+            lanes.append([(top, bottom, group)])
+            lane = len(lanes) - 1
+        out[key] = lane
+    return out, len(lanes)
+
+
+def _bb_wire_group(wire_id: str, step: int, fresh: bool, title: str,
+                   color: str, paths: list[str],
+                   dots: list[tuple[float, float]]) -> list[str]:
+    """One wire group holding every orthogonal leg of that net."""
+    width = "3.2" if fresh else "2.2"
+    cls = "schematic-wire schematic-new" if fresh else "schematic-wire schematic-prior"
+    opacity = "1" if fresh else "0.42"
+    rows = [
+        '<g id="%s" class="%s" data-step="%d" opacity="%s">'
+        % (svg_id(wire_id), cls, step, opacity),
+        "<title>%s</title>" % escape(title),
+    ]
+    for d in paths:
+        rows.append(
+            '<path d="%s" fill="none" stroke="%s" stroke-width="%s" '
+            'stroke-linecap="round" stroke-linejoin="round"/>'
+            % (d, color, width))
+    for x, y in dots:
+        rows.append(
+            '<circle cx="%.1f" cy="%.1f" r="3.4" fill="%s"/>'
+            % (x, y, color))
+    rows.append("</g>")
+    return rows
 
 
 def _draw_board(g: dict) -> list[str]:
@@ -166,14 +262,29 @@ def render_breadboard_svg(netlist: dict, step_n: int) -> str:
             seen_pins.add(shown)
             board_pins.append(shown)
     board_pins.sort(key=_board_pin_key)
-    gpio_rows = _assign_rows(board_pins)
 
     left_parts = [p for p in parts if _kind(p) in ("Actuator", "Output")]
     right_parts = [p for p in parts if p not in left_parts]
+    left_set = set(left_parts)
 
     def _part_h(name: str) -> int:
         n = 2 if name == "usb_c" else max(1, len(by_part.get(name, [])))
         return HEADER_H + n * PIN_H + PAD
+
+    # Highways crossing the board: left-side 5V rides over the top
+    # to the right rail, right-side 3V3 under the bottom to the
+    # left rail. The census here must match the specs collected
+    # below so every highway gets its own y.
+    top_hw = 1  # ESP 5V always feeds the right rail from the left
+    bot_hw = 0
+    for name in sorted(by_part):
+        from_left = name in left_set
+        for wire in by_part[name]:
+            shown = _display_board_pin(wire.get("board_pin"))
+            if from_left and _is_power(shown):
+                top_hw += 1
+            elif not from_left and _is_3v3(shown):
+                bot_hw += 1
 
     g = _geom()
     bb_h, bb_w = g["height"], g["width"]
@@ -181,42 +292,357 @@ def render_breadboard_svg(netlist: dict, step_n: int) -> str:
     esp_h = HEADER_H + max(3, len(board_pins)) * PIN_H + PAD
     right_h = _part_h("usb_c") + 16
     right_h += sum(_part_h(p) + 16 for p in right_parts)
+    top = 40 + top_hw * 10
     height = max(left_h + esp_h + 24, bb_h, right_h) + 72
-    gap = 48
-    left_x = 24
-    bb_x = left_x + CARD_W + gap
-    esp_x = left_x
-    right_x = bb_x + bb_w + gap
-    width = right_x + CARD_W + 24
-    top = 36
     bb_y = top + max(0, (height - 72 - bb_h) // 2)
     esp_y = bb_y + max(0, (bb_h - esp_h) // 2)
     if left_parts:
         esp_y = max(esp_y, top + left_h)
 
+    # Pin y positions (x follows once lanes size the gaps). These
+    # formulas must match _stack below, which draws the cards.
+    def _stack_ys(names: list[str], y0: int) -> dict:
+        ys: dict = {}
+        y = y0
+        for name in names:
+            if name == "usb_c":
+                ys[name] = {"+5V": y + HEADER_H,
+                            "GND": y + HEADER_H + PIN_H}
+            else:
+                pin_map = {}
+                for i, wire in enumerate(by_part.get(name, [])):
+                    pin_map[str(wire.get("part_pin") or "")] = (
+                        y + HEADER_H + i * PIN_H)
+                ys[name] = pin_map
+            y += _part_h(name) + 16
+        return ys
+
+    left_ys = _stack_ys(left_parts, top)
+    # The ESP shares the left cards' column, so its pins must not
+    # share a y with theirs: same-y exit stubs would overlap.
+    left_pin_ys = [y for m in left_ys.values() for y in m.values()]
+    if left_pin_ys:
+        for _ in range(40):
+            esp_try = [esp_y + HEADER_H + i * PIN_H
+                       for i in range(len(board_pins))]
+            if all(abs(a - b) >= 5
+                   for a in esp_try for b in left_pin_ys):
+                break
+            esp_y += 1
+    right_ys = _stack_ys(["usb_c"] + right_parts, top)
     pin_y = {
         pin: esp_y + HEADER_H + i * PIN_H
         for i, pin in enumerate(board_pins)
     }
+    pin_ys_all = (
+        [y for m in left_ys.values() for y in m.values()]
+        + [y for m in right_ys.values() for y in m.values()]
+        + list(pin_y.values()))
 
-    def hole(pin: str, prefer_row: int, side: str) -> tuple[float, float]:
-        row = gpio_rows.get(pin, prefer_row)
-        if _is_power(pin) or _is_gnd(pin) or _is_3v3(pin):
-            x, y = _rail_xy(g, pin, row if row <= ROWS_N else prefer_row)
-            return (bb_x + x, bb_y + y)
-        letter = "B" if side == "left" else "I"
-        y = g["row_y"].get(row, g["row_y"][4])
-        return (bb_x + g["cols"][letter], bb_y + y)
+    def _ry(row: int) -> float:
+        return bb_y + g["row_y"][row]
 
-    def jumper_points(pin: str, prefer_row: int) -> list[tuple[float, float]]:
-        if _is_power(pin) or _is_gnd(pin) or _is_3v3(pin):
-            return []
-        row = gpio_rows.get(pin, prefer_row)
-        y = bb_y + g["row_y"].get(row, g["row_y"][4])
-        return [
-            (bb_x + g["cols"]["E"], y),
-            (bb_x + g["cols"]["F"], y),
-        ]
+    def _row_clear(row: int) -> bool:
+        return all(abs(_ry(row) - py) >= 5 for py in pin_ys_all)
+
+    # Rail taps: one shared row per rail, so every same-net tap
+    # lands on one bus-like point (overlaps are same-color, hence
+    # invisible) and the board can never run out of rows. 5V lives
+    # on the right +rail, 3V3 on the left +rail, and each side
+    # taps its near ground rail (one tie joins them under the
+    # board). Tap rows stay clear of card-pin rows when possible
+    # so no two nets share a horizontal run.
+    def _rail_row(start: int, avoid: set[int]) -> int:
+        row = start
+        for _ in range(12):
+            r = row if row <= ROWS_N else 4 + (row - ROWS_N - 1)
+            if r not in avoid and _row_clear(r):
+                return r
+            row += 1
+        return start if start not in avoid else start + 1
+
+    p5_row = _rail_row(5, set())
+    gndR_row = _rail_row(8, {p5_row})
+    gndL_row = _rail_row(8, set())
+    p3_row = _rail_row(16, {gndL_row})
+    tap_rows = [p5_row, gndR_row, gndL_row, p3_row]
+    usb_5v_row = esp_5v_row = p5_row
+    usb_gnd_row = gndR_row
+    esp_gnd_row = gndL_row
+    esp_3v3_row = p3_row
+    part_tap: dict[int, int] = {}
+    for name in sorted(by_part):
+        from_left = name in left_set
+        for wire in by_part[name]:
+            shown = _display_board_pin(wire.get("board_pin"))
+            if _is_power(shown):
+                part_tap[id(wire)] = p5_row
+            elif _is_3v3(shown):
+                part_tap[id(wire)] = p3_row
+            elif _is_gnd(shown):
+                part_tap[id(wire)] = gndL_row if from_left else gndR_row
+
+    clear_rows = frozenset(r for r in range(1, ROWS_N + 1)
+                           if _row_clear(r))
+    gpio_rows = _assign_rows(
+        board_pins, start=max(22, max(tap_rows) + 2),
+        reserved=set(tap_rows), preferred=clear_rows)
+
+    bb_bot = bb_y + bb_h
+    hole_ys = ([_ry(r) for r in tap_rows]
+               + [_ry(r) for r in gpio_rows.values()])
+
+    def _hwy_clear(y: float) -> bool:
+        return all(abs(y - z) >= 5 for z in pin_ys_all + hole_ys)
+
+    def _hwy_bump(y: float, step: int) -> float:
+        for _ in range(40):
+            if _hwy_clear(y):
+                return y
+            y += step
+        return y
+
+    tie_y = _hwy_bump(bb_bot + 12, 1)
+    top_y = []
+    y = bb_y - 14
+    for _ in range(top_hw):
+        y = _hwy_bump(y, -1)
+        top_y.append(y)
+        y -= 9
+    bot_y = []
+    y = tie_y + 9
+    for _ in range(bot_hw):
+        y = _hwy_bump(y, 1)
+        bot_y.append(y)
+        y += 9
+    if min(top_y) < 30:
+        # Uniform shift: relative clearances are preserved.
+        shift = 30 - min(top_y)
+        top += shift
+        bb_y += shift
+        bb_bot += shift
+        esp_y += shift
+        height += shift
+        top_y = [v + shift for v in top_y]
+        bot_y = [v + shift for v in bot_y]
+        tie_y += shift
+        left_ys = _stack_ys(left_parts, top)
+        right_ys = _stack_ys(["usb_c"] + right_parts, top)
+        pin_y = {
+            pin: esp_y + HEADER_H + i * PIN_H
+            for i, pin in enumerate(board_pins)
+        }
+    need_below = max([tie_y] + bot_y) - bb_bot + 16
+    min_bottom = need_below + 20 + 18 * len(unresolved)
+    if height - (bb_y + bb_h) < min_bottom:
+        height = bb_y + bb_h + min_bottom
+
+    # Collect wire legs: ("stub", gap, y_card, x_side, y_hole, hole,
+    # key), ("highway", y_card, x_side, why, y_hole, hole, kleft,
+    # kright, direction), ("jumper", row), ("tie",). Lane spans only
+    # need y, so lanes are assigned before x positions exist.
+    groups: dict = {}
+
+    def _group(gid: str, step: int, fresh: bool, title: str,
+               color: str) -> dict:
+        return groups.setdefault(gid, {"step": step, "fresh": fresh,
+                                       "title": title, "color": color,
+                                       "legs": []})
+
+    spans_left: list = []
+    spans_right: list = []
+    key_seq = 0
+
+    def _span(spans: list, group: str, y1: float, y2: float):
+        nonlocal key_seq
+        if abs(y2 - y1) < 0.5:
+            return None  # pure horizontal stub needs no lane
+        key = key_seq
+        key_seq += 1
+        spans.append((min(y1, y2), max(y1, y2), group, key))
+        return key
+
+    usb_ys = right_ys["usb_c"]
+    _group("wire-usb_c-VCC", 1, step_n == 1,
+           "USB-C +5V → 5V rail (added step 1)", COLORS["power"])
+    _group("wire-usb_c-GND", 1, step_n == 1,
+           "USB-C GND → ground rail (added step 1)", COLORS["ground"])
+    groups["wire-usb_c-VCC"]["legs"].append(
+        ("stub", "right", usb_ys["+5V"], "right_cards",
+         _ry(usb_5v_row), ("rail", "plus_r"),
+         _span(spans_right, "wire-usb_c-VCC",
+               usb_ys["+5V"], _ry(usb_5v_row))))
+    groups["wire-usb_c-GND"]["legs"].append(
+        ("stub", "right", usb_ys["GND"], "right_cards",
+         _ry(usb_gnd_row), ("rail", "minus_r"),
+         _span(spans_right, "wire-usb_c-GND",
+               usb_ys["GND"], _ry(usb_gnd_row))))
+    top_specs = [("wire-usb_c-VCC", pin_y["5V"], "esp",
+                  _ry(esp_5v_row), ("rail", "plus_r"))]
+    groups["wire-usb_c-GND"]["legs"].append(
+        ("stub", "left", pin_y["GND"], "esp",
+         _ry(esp_gnd_row), ("rail", "minus_l"),
+         _span(spans_left, "wire-usb_c-GND",
+               pin_y["GND"], _ry(esp_gnd_row))))
+    _group("wire-esp32-3V3", 1, step_n == 1,
+           "ESP32 3V3 → 3V3 rail (added step 1)", COLORS["power"])
+    groups["wire-esp32-3V3"]["legs"].append(
+        ("stub", "left", pin_y["3V3"], "esp",
+         _ry(esp_3v3_row), ("rail", "plus_l"),
+         _span(spans_left, "wire-esp32-3V3",
+               pin_y["3V3"], _ry(esp_3v3_row))))
+    _group("wire-gnd-rail-tie", 1, step_n == 1,
+           "GND rails tied (added step 1)", COLORS["ground"])
+    groups["wire-gnd-rail-tie"]["legs"].append(("tie",))
+    bot_specs: list = []
+
+    for name in sorted(by_part):
+        from_left = name in left_set
+        card_ys = left_ys if from_left else right_ys
+        x_side = "left_cards" if from_left else "right_cards"
+        for wire in by_part[name]:
+            part_pin = str(wire.get("part_pin") or "")
+            shown = _display_board_pin(wire.get("board_pin"))
+            gid = "wire-%s-%s" % (name, part_pin)
+            added = int(wire.get("step_added", step_n))
+            title = "%s %s → %s (added step %s)" % (
+                name, part_pin, wire.get("board_pin"), added)
+            grp = _group(gid, added, added == step_n, title,
+                         _color(wire.get("signal")))
+            py = card_ys[name].get(part_pin)
+            by = pin_y.get(shown)
+            if py is None or by is None:
+                continue
+            if _is_power(shown):
+                row = part_tap[id(wire)]
+                if from_left:
+                    top_specs.append((gid, py, x_side, _ry(row),
+                                      ("rail", "plus_r")))
+                else:  # defensive: 5V parts sit left; tap the near rail
+                    grp["legs"].append(
+                        ("stub", "right", py, x_side, _ry(row),
+                         ("rail", "plus_r"),
+                         _span(spans_right, gid, py, _ry(row))))
+            elif _is_3v3(shown):
+                row = part_tap[id(wire)]
+                if from_left:  # defensive: 3V3 parts sit right
+                    grp["legs"].append(
+                        ("stub", "left", py, x_side, _ry(row),
+                         ("rail", "plus_l"),
+                         _span(spans_left, gid, py, _ry(row))))
+                else:
+                    bot_specs.append((gid, py, x_side, _ry(row),
+                                      ("rail", "plus_l")))
+            elif _is_gnd(shown):
+                row = part_tap[id(wire)]
+                if from_left:
+                    grp["legs"].append(
+                        ("stub", "left", py, x_side, _ry(row),
+                         ("rail", "minus_l"),
+                         _span(spans_left, gid, py, _ry(row))))
+                else:
+                    grp["legs"].append(
+                        ("stub", "right", py, x_side, _ry(row),
+                         ("rail", "minus_r"),
+                         _span(spans_right, gid, py, _ry(row))))
+            else:
+                row = gpio_rows.get(shown, 10)
+                hy = _ry(row)
+                if from_left:
+                    grp["legs"].append(
+                        ("stub", "left", py, x_side, hy, ("col", "D"),
+                         _span(spans_left, gid, py, hy)))
+                else:
+                    grp["legs"].append(
+                        ("stub", "right", py, x_side, hy, ("col", "H"),
+                         _span(spans_right, gid, py, hy)))
+                    grp["legs"].append(("jumper", row))
+                grp["legs"].append(
+                    ("stub", "left", by, "esp", hy, ("col", "B"),
+                     _span(spans_left, gid, by, hy)))
+
+    for k, (gid, y_card, x_side, y_hole, hole) in enumerate(
+            sorted(top_specs, key=lambda s: s[0])):
+        why = top_y[k]
+        kl = _span(spans_left, gid, y_card, why)
+        kr = _span(spans_right, gid, why, y_hole)
+        groups[gid]["legs"].append(
+            ("highway", y_card, x_side, why, y_hole, hole, kl, kr, "LR"))
+    for j, (gid, y_card, x_side, y_hole, hole) in enumerate(
+            sorted(bot_specs, key=lambda s: s[0])):
+        why = bot_y[j]
+        kr = _span(spans_right, gid, y_card, why)
+        kl = _span(spans_left, gid, why, y_hole)
+        groups[gid]["legs"].append(
+            ("highway", y_card, x_side, why, y_hole, hole, kl, kr, "RL"))
+
+    lanes_left, n_lane_left = _assign_lanes(spans_left)
+    lanes_right, n_lane_right = _assign_lanes(spans_right)
+    gap_left = max(GAP_MIN, 26 + LANE_DX * max(0, n_lane_left - 1))
+    gap_right = max(GAP_MIN, 26 + LANE_DX * max(0, n_lane_right - 1))
+    left_x = 24
+    bb_x = left_x + CARD_W + gap_left
+    esp_x = left_x
+    right_x = bb_x + bb_w + gap_right
+    width = right_x + CARD_W + 24
+    bb_right = bb_x + bb_w
+
+    def _lane_x(gap: str, key) -> float:
+        if gap == "left":
+            return bb_x - LANE_MARGIN - lanes_left[key] * LANE_DX
+        return bb_right + LANE_MARGIN + lanes_right[key] * LANE_DX
+
+    def _hole_x(hole: tuple[str, str]) -> float:
+        kind, val = hole
+        if kind == "col":
+            return bb_x + g["cols"][val]
+        return bb_x + g[val]
+
+    def _card_x(side: str) -> float:
+        if side == "right_cards":
+            return right_x + 10
+        return esp_x + CARD_W - 10  # left cards and ESP share a column
+
+    def _emit_stub(gap: str, y_card: float, x_side: str, y_hole: float,
+                   hole: tuple[str, str], key) -> tuple[str, list]:
+        x1 = _card_x(x_side)
+        x2 = _hole_x(hole)
+        if key is None:
+            d = _ortho_d([(x1, y_card), (x2, y_hole)])
+        else:
+            lx = _lane_x(gap, key)
+            d = _ortho_d([(x1, y_card), (lx, y_card),
+                          (lx, y_hole), (x2, y_hole)])
+        return d, [(x1, y_card), (x2, y_hole)]
+
+    def _emit_highway(y_card: float, x_side: str, why: float,
+                      y_hole: float, hole: tuple[str, str],
+                      kl, kr, direction: str) -> tuple[str, list]:
+        x1 = _card_x(x_side)
+        x2 = _hole_x(hole)
+        if direction == "LR":  # card left → rail right, over the top
+            lx1 = _lane_x("left", kl) if kl is not None else x1
+            lx2 = _lane_x("right", kr) if kr is not None else x2
+        else:  # card right → rail left, under the bottom
+            lx1 = _lane_x("right", kr) if kr is not None else x1
+            lx2 = _lane_x("left", kl) if kl is not None else x2
+        d = _ortho_d([(x1, y_card), (lx1, y_card), (lx1, why),
+                      (lx2, why), (lx2, y_hole), (x2, y_hole)])
+        return d, [(x1, y_card), (x2, y_hole)]
+
+    def _emit_jumper(row: int) -> str:
+        y = _ry(row)
+        ex = bb_x + g["cols"]["E"]
+        fx = bb_x + g["cols"]["F"]
+        return "M %.1f %.1f Q %.1f %.1f %.1f %.1f" % (
+            ex, y, (ex + fx) / 2.0, y - 9, fx, y)
+
+    def _emit_tie() -> tuple[str, list]:
+        y = _ry(ROWS_N)
+        xl = bb_x + g["minus_l"]
+        xr = bb_x + g["minus_r"]
+        d = _ortho_d([(xl, y), (xl, tie_y), (xr, tie_y), (xr, y)])
+        return d, [(xl, y), (xr, y)]
 
     out = [
         '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
@@ -288,68 +714,36 @@ def render_breadboard_svg(netlist: dict, step_n: int) -> str:
             y += h + 16
         return placed
 
-    left_at = _stack(left_parts, left_x, top, "right")
-    right_names = ["usb_c"] + right_parts
-    right_at = _stack(right_names, right_x, top, "left")
+    _stack(left_parts, left_x, top, "right")
+    _stack(["usb_c"] + right_parts, right_x, top, "left")
 
-    rail_row = {"5V": 5, "VIN": 5, "+5V": 5, "GND": 8, "3V3": 16}
-    usb = right_at["usb_c"]
-    usb_5v = (usb["x"] + 10, usb["pins"]["+5V"])
-    usb_gnd = (usb["x"] + 10, usb["pins"]["GND"])
-    esp_5v = (esp_x + CARD_W - 10, pin_y.get("5V", pin_y["GND"]))
-    esp_gnd = (esp_x + CARD_W - 10, pin_y["GND"])
-    h5 = hole("5V", 5, "right")
-    hg = hole("GND", 8, "left")
-    out += _wire_group(
-        "wire-usb_c-VCC", 1, step_n == 1,
-        "USB-C +5V → 5V rail (added step 1)",
-        _wire_path(usb_5v[0], usb_5v[1], h5[0], h5[1]) +
-        " L %.1f %.1f" % esp_5v,
-        COLORS["power"], usb_5v[0], usb_5v[1], esp_5v[0], esp_5v[1])
-    out += _wire_group(
-        "wire-usb_c-GND", 1, step_n == 1,
-        "USB-C GND → ground rail (added step 1)",
-        _wire_path(usb_gnd[0], usb_gnd[1], hg[0], hg[1]) +
-        " L %.1f %.1f" % esp_gnd,
-        COLORS["ground"], usb_gnd[0], usb_gnd[1], esp_gnd[0], esp_gnd[1])
-
-    tap_row = dict(rail_row)
-    for name, rows in by_part.items():
-        side = left_at if name in left_at else right_at
-        if name not in side:
+    for gid in sorted(groups):
+        info = groups[gid]
+        paths: list[str] = []
+        dots: list[tuple[float, float]] = []
+        for leg in info["legs"]:
+            if leg[0] == "stub":
+                _, gap, y1, xs, y2, hole, key = leg
+                d, dd = _emit_stub(gap, y1, xs, y2, hole, key)
+                paths.append(d)
+                dots.extend(dd)
+            elif leg[0] == "highway":
+                (_, y1, xs, why, y2, hole, kl, kr,
+                 direction) = leg
+                d, dd = _emit_highway(y1, xs, why, y2, hole, kl, kr,
+                                      direction)
+                paths.append(d)
+                dots.extend(dd)
+            elif leg[0] == "jumper":
+                paths.append(_emit_jumper(leg[1]))
+            elif leg[0] == "tie":
+                d, dd = _emit_tie()
+                paths.append(d)
+                dots.extend(dd)
+        if not paths:
             continue
-        card = side[name]
-        from_left = name in left_at
-        for wire in rows:
-            part_pin = str(wire.get("part_pin") or "")
-            shown = _display_board_pin(wire.get("board_pin"))
-            py = card["pins"].get(part_pin)
-            by = pin_y.get(shown)
-            if py is None or by is None:
-                continue
-            if from_left:
-                x1, y1 = card["x"] + CARD_W - 10, py
-            else:
-                x1, y1 = card["x"] + 10, py
-            x2, y2 = esp_x + CARD_W - 10, by
-            prefer = tap_row.get(shown, gpio_rows.get(shown, 10))
-            if shown in tap_row:
-                tap_row[shown] = min(ROWS_N, tap_row[shown] + 3)
-            part_hole = hole(shown, prefer, "left" if from_left else "right")
-            board_hole = hole(shown, prefer, "left")
-            d = _wire_path(x1, y1, part_hole[0], part_hole[1])
-            if not from_left:
-                for jx, jy in jumper_points(shown, prefer):
-                    d += " L %.1f %.1f" % (jx, jy)
-            if board_hole != part_hole:
-                d += " L %.1f %.1f" % board_hole
-            d += " L %.1f %.1f" % (x2, y2)
-            added = int(wire.get("step_added", step_n))
-            title = "%s %s → %s (added step %s)" % (
-                name, part_pin, wire.get("board_pin"), added)
-            out += _wire_group(
-                "wire-%s-%s" % (name, part_pin), added, added == step_n,
-                title, d, _color(wire.get("signal")), x1, y1, x2, y2)
+        out += _bb_wire_group(gid, info["step"], info["fresh"],
+                              info["title"], info["color"], paths, dots)
 
     y_u = height - 18 - 18 * len(unresolved)
     for i, item in enumerate(unresolved):

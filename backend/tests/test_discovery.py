@@ -477,6 +477,43 @@ class DiscoveryTest(unittest.TestCase):
                                              enforce_visible=False)
         self.assertTrue(any("MAGIC_TEST" in r for r in reasons))
 
+    def test_validate_rejects_conversational_titles(self):
+        # Mic transcripts ("where do you live?") reach the planner raw and
+        # get echoed as titles; the validator must refuse question- and
+        # sentence-shaped titles so they are never announced as projects.
+        base = {"id": "p1", "summary": "s",
+                "steps": [{"n": 1, "instruction": "wire it",
+                           "verify": "CHECK_GPIO", "expect": {},
+                           "depends_on_parts": ["led"]}],
+                "missing_parts": [], "alternatives": []}
+        for bad in ("when does before you started",
+                    "In the UK, Where Do You Live? - ESP32 Region Selector",
+                    "You Cannot Run Away From This - Motion Chase Alarm"):
+            proj = dict(base, title=bad)
+            reasons = discovery.validate_project(proj, ["esp32", "led"],
+                                                 enforce_visible=False)
+            self.assertTrue(any("title" in r for r in reasons), bad)
+        proj = dict(base, title="Ultrasonic Distance Alert")
+        self.assertEqual(discovery.validate_project(proj, ["esp32", "led"],
+                                                    enforce_visible=False),
+                         [])
+
+    def test_plan_request_garbage_title_returns_hinted_empty(self):
+        # A request the planner cannot turn into a clean-titled build ends
+        # with no projects and a hint naming the request, not silence.
+        plan = json.dumps({"projects": [{
+            "id": "p1", "title": "when does before you started", "summary": "s",
+            "steps": [{"n": 1, "instruction": "wire it",
+                       "verify": "CHECK_GPIO", "expect": {},
+                       "depends_on_parts": ["led"]}],
+            "missing_parts": [], "alternatives": []}]})
+        Muse = FakeClaude([plan, plan])
+        self.patch_clients(FakeSAM([]), Muse)
+        res = discovery.plan_projects(["esp32", "led"],
+                                      "when does before you started", None)
+        self.assertEqual(res["projects"], [])
+        self.assertIn("when does before you started", res.get("hint", ""))
+
     def test_plan_request_accepts_nonvisible_parts(self):
         plan = json.dumps({"projects": [{
             "id": "p1", "title": "Servo arm", "summary": "s",

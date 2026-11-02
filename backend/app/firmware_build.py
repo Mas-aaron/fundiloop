@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 DEFAULT_FQBN = "esp32:esp32:esp32"
@@ -316,6 +317,130 @@ def compile_sketch(code: str, board: str = "esp32_devkit",
     except OSError:
         pass  # the binaries stand even when the record cannot persist
     return record
+
+
+def compile_sketch_stream(code: str, board: str = "esp32_devkit",
+                          runner=None, popen=None):
+    """Streaming compile: yields log lines, then the build record.
+
+    Yields {"event": "log", "line": str} for staging, library, and
+    compiler lines, then exactly one {"event": "result",
+    "build": <compile_sketch record>}. Same record shape, cache, and
+    error semantics as compile_sketch; only `popen`
+    (subprocess.Popen-compatible) is injectable for hermetic tests,
+    plus `runner` for the library-install step.
+    """
+    if (board or "").strip().lower() != "esp32_devkit":
+        raise ValueError("firmware builds support ESP32 only (board: %s)"
+                         % (board or "?"))
+    if not (code or "").strip():
+        yield {"event": "result", "build": {
+            "ok": False, "build_hash": "", "build_dir": "",
+            "artifacts": [], "fqbn": arduino_fqbn(),
+            "log_excerpt": "empty sketch: nothing to compile",
+            "cached": False}}
+        return
+    digest = code_hash(code)
+    outdir = build_dir_for(digest)
+    hit = _cached_build(outdir, digest)
+    if hit is not None:
+        yield {"event": "log", "line": "cached build %s" % digest}
+        yield {"event": "result", "build": hit}
+        return
+    run = runner or subprocess.run
+    sketch_dir = os.path.join(outdir, SKETCH_NAME)
+    try:
+        os.makedirs(sketch_dir, exist_ok=True)
+        with open(os.path.join(sketch_dir, SKETCH_NAME + ".ino"),
+                  "w", encoding="utf-8") as fh:
+            fh.write(code)
+    except OSError as exc:
+        yield {"event": "result", "build": {
+            "ok": False, "build_hash": digest, "build_dir": outdir,
+            "artifacts": [], "fqbn": arduino_fqbn(),
+            "log_excerpt": "cannot stage sketch: %s" % exc,
+            "cached": False}}
+        return
+    yield {"event": "log", "line": "staged sketch %s" % digest}
+    try:
+        libs = ensure_libraries(code, run)
+    except FileNotFoundError:
+        libs = {"ok": True, "installed": [], "log": ""}
+    if libs["log"]:
+        yield {"event": "log", "line": libs["log"]}
+    if libs["installed"]:
+        yield {"event": "log",
+               "line": "installed libraries: %s"
+                       % ", ".join(libs["installed"])}
+    cmd = [arduino_cli_bin(), "compile", "--fqbn", arduino_fqbn(),
+           "--output-dir", outdir, sketch_dir]
+    spawn = popen or subprocess.Popen
+    try:
+        proc = spawn(cmd, stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT, text=True)
+    except FileNotFoundError:
+        yield {"event": "result", "build": {
+            "ok": False, "build_hash": digest, "build_dir": outdir,
+            "artifacts": [], "fqbn": arduino_fqbn(),
+            "log_excerpt": "arduino-cli not found at %r: install it "
+            "once (see README) or set ARDUINO_CLI_BIN" % cmd[0],
+            "cached": False}}
+        return
+    log_lines: list[str] = []
+    deadline = time.monotonic() + compile_timeout()
+    timed_out = False
+    while True:
+        line = proc.stdout.readline()
+        if line:
+            log_lines.append(line)
+            yield {"event": "log", "line": line.rstrip("\n")}
+        elif proc.poll() is not None:
+            break
+        elif time.monotonic() > deadline:
+            try:
+                proc.kill()
+            except Exception:
+                pass  # already gone; the timeout below still reports
+            timed_out = True
+            break
+        else:
+            time.sleep(0.01)
+    if timed_out:
+        yield {"event": "result", "build": {
+            "ok": False, "build_hash": digest, "build_dir": outdir,
+            "artifacts": [], "fqbn": arduino_fqbn(),
+            "log_excerpt": "arduino-cli compile timed out after %ss"
+            % compile_timeout(), "cached": False}}
+        return
+    log = "".join(log_lines)
+    if proc.returncode != 0:
+        excerpt = _excerpt(log) or "arduino-cli failed"
+        if libs["log"]:
+            excerpt = libs["log"] + "\n" + excerpt
+        yield {"event": "result", "build": {
+            "ok": False, "build_hash": digest, "build_dir": outdir,
+            "artifacts": [], "fqbn": arduino_fqbn(),
+            "log_excerpt": excerpt, "cached": False}}
+        return
+    artifacts = _find_artifacts(outdir)
+    if not artifacts:
+        yield {"event": "result", "build": {
+            "ok": False, "build_hash": digest, "build_dir": outdir,
+            "artifacts": [], "fqbn": arduino_fqbn(),
+            "log_excerpt": (_excerpt(log) + "\nno .bin outputs found"
+                            ).strip(), "cached": False}}
+        return
+    record = {"ok": True, "build_hash": digest, "build_dir": outdir,
+              "artifacts": artifacts, "fqbn": arduino_fqbn(),
+              "log_excerpt": _excerpt(log), "cached": False,
+              "libraries": libs["installed"]}
+    try:
+        with open(os.path.join(outdir, "build.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(record, fh)
+    except OSError:
+        pass
+    yield {"event": "result", "build": record}
 
 
 def python_exe() -> str:

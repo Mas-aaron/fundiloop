@@ -206,20 +206,16 @@ const probe = `
   fetchServerSpeech = realFetchSpeech;
   console.log("PASS prefetch");
 
-  // 7. Flash retry: a running check is stopped (never a silent tap),
-  // an empty selection routes to the picker, and releasing the port
-  // for a check keeps the selection for next time.
+  // 7. Flash retry: a busy turn asks for another tap (never a
+  // silent drop), an empty selection routes to the picker, and
+  // releasing the port keeps the selection for next time.
   learnSid = "test-sid";
   flashBusy = false;
   busy = true;
-  let aborted = false;
-  checkAbort = { abort: () => { aborted = true; } };
   webPort = { readable: null, writable: null };
   await webFlash("retry-status", "retry-prog");
-  assert.equal(aborted, true);
   assert.ok($("retry-status").textContent.indexOf("press FLASH IN BROWSER again") >= 0);
   busy = false;
-  checkAbort = null;
   webPort = null;
   $("retry-status").textContent = "";
   await webFlash("retry-status", "retry-prog");
@@ -295,22 +291,8 @@ const probe = `
   cookPendingVoice = "";
   console.log("PASS cook-voice");
 
-  // 11. Flash prompt + quiet auto-listens: a silent board with a step
-  // sketch speaks the upload instruction once per step, and hands-free
-  // silence stays off-screen while manual taps still report it.
-  flashSpokenFor = "";
-  learnSid = "s1";
-  learnStepN = 2;
-  const silentView = { id: "s1", step_code: { n: 2, code: "void setup(){}" },
-    verification: { board_state: "silent:COM3" } };
-  assert.ok(flashSpeech(silentView).indexOf("FLASH ESP32") >= 0);
-  assert.equal(flashSpeech(silentView), ""); // once per step
-  assert.ok(flashSpeech({ id: "s1", step_code: { n: 3, code: "x" },
-    verification: { board_state: "silent:COM3" } }).indexOf("FLASH ESP32") >= 0);
-  assert.equal(flashSpeech({ id: "s1",
-    verification: { board_state: "silent:COM3" } }), ""); // no sketch
-  assert.equal(flashSpeech({ id: "s1", step_code: { n: 4, code: "x" },
-    verification: { board_state: "ok" } }), ""); // board talks
+  // 11. Quiet auto-listens: hands-free silence stays off-screen
+  // while manual taps still report it.
   cookMode = true;
   cookListenAuto = true;
   cookSilentStreak = 0;
@@ -322,7 +304,7 @@ const probe = `
   assert.equal($("cook-heard").textContent, "Heard nothing.");
   cookMode = false;
   learnSid = "";
-  console.log("PASS flash-prompt");
+  console.log("PASS cook-quiet");
 
   // 12. Wave orb: taps are guarded no-ops without Web Audio, and the
   // mode/level API stays callable from every speech path.

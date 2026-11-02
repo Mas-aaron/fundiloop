@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -23,6 +24,7 @@ from pathlib import Path
 
 DEFAULT_ATTEMPT_LOG = Path(__file__).resolve().parent.parent / "logs" / "attempts.jsonl"
 GENESIS_HASH = "0" * 64
+_log = logging.getLogger(__name__)
 
 from .adapters.muse_adapter import MetaClaudeAdapter
 from .adapters.sam_adapter import MetaSAMAdapter
@@ -33,9 +35,13 @@ from .circuit_graph import CircuitGraph, load_circuit_graph
 from .fault_ranker import RANK_THRESHOLD, rank_faults
 from .fundi import (
     chapter_for,
+    complete_rollcall,
+    next_step_opening,
     plan_chapters,
-    speak_passed,
+    plan_stretch,
+    rollcall_accepts,
     speak_start,
+    stretch_fallback,
     template_chapters,
 )
 from .models import (
@@ -282,6 +288,17 @@ class AgentOrchestrator:
         steps = repair_plan_pins(steps, pin_map_for(key))
         sid = session_id or uuid.uuid4().hex
         self.sessions.pop(sid, None)
+        # Parts the plan names that the bench never resolved: the roll
+        # call reads them aloud, ordered, before chapter 1 begins.
+        wanted: list[str] = []
+        for st in steps:
+            if not isinstance(st, dict):
+                continue
+            for dep in (st.get("depends_on_parts") or []):
+                dep = str(dep).strip()
+                if dep and dep not in wanted:
+                    wanted.append(dep)
+        missing = [d for d in wanted if d not in visible]
         self.session = {
             "id": sid,
             "mode": "LEARNING",
@@ -291,6 +308,8 @@ class AgentOrchestrator:
             "plan": [dict(s) for s in steps],
             "step_index": 0,
             "visible_parts": visible,
+            "missing_parts": missing,
+            "rollcall_done": False,
             "verified": {"i2c": [], "steps": []},
             "board": key,
             "pin_map": pin_map_for(key),
@@ -306,16 +325,19 @@ class AgentOrchestrator:
             "current_hypothesis": None,
             "code_ready": False,
             "last_verification": None,
-            "confirm_pending": None,
             "last_event_hash": GENESIS_HASH,
         }
         self.sessions[sid] = self.session
         self.current_id = sid
-        # Instant start: templates answer now with zero model calls on
-        # the critical path; a proven-real adapter enriches every chapter
-        # in the background and swaps the full set when it lands (the
-        # step code attached below is template/patient either way).
+        # Instant start: the parts roll call answers now with zero
+        # model calls on the critical path, while a proven-real adapter
+        # enriches every chapter in the background and swaps the full
+        # set when it lands. READY begins chapter 1 (answer_rollcall).
         self.session["chapters"] = template_chapters(self.session["plan"])
+        self.session["rollcall"] = complete_rollcall(
+            None, visible, self.session["missing_parts"])
+        self.session["stretch"] = stretch_fallback(
+            self.session["project_title"], self.session["plan"])
         if not getattr(self.Muse, "mock", True):
             worker = threading.Thread(
                 target=self._fill_chapters,
@@ -323,13 +345,55 @@ class AgentOrchestrator:
                       self.session["project_title"], key),
                 name="fundiloop-chapters", daemon=True)
             worker.start()
-        first = chapter_for(self.session["chapters"], 0) or {}
-        speak = speak_start(first, self.session["project_title"])
-        view = self._learning_view(
+            if len(self.session["plan"]) == 1:
+                # Single-step builds never arrive anywhere else: warm
+                # the DONE stretch goals now.
+                self._start_stretch_prefetch()
+        return self._rollcall_view(self.session)
+
+    def _rollcall_view(self, s: dict) -> dict:
+        """The parts roll call: read the bench aloud, wait for READY."""
+        self.session = s
+        rc = s.get("rollcall") or {}
+        say = str(rc.get("say") or
+                  "Say READY when your parts are on the bench.")
+        return self._learning_view(
+            state="ROLLCALL", instruction=say, speak=say,
+            verification=None,
+            fundi={"event": "ROLLCALL", "rollcall": {
+                "say": say, "question": str(rc.get("question") or ""),
+                "answers": [list(a) for a in (rc.get("answers") or [])]}})
+
+    def _begin_chapters(self, s: dict) -> dict:
+        """CHAPTER_START for the current step (after the READY gate)."""
+        self.session = s
+        idx = s["step_index"]
+        first = chapter_for(s.get("chapters") or [], idx) or {}
+        speak = speak_start(first, s.get("project_title", ""))
+        return self._learning_view(
             state="INSTRUCTING", instruction=speak, speak=speak,
             verification=None,
             fundi={"event": "CHAPTER_START", "chapter": first})
-        self._attach_step_code(view, self.session["plan"][0])
+
+    def answer_rollcall(self, session_id: str, transcript: str = "") -> dict:
+        """Answer the parts roll call: READY begins chapter 1, anything
+        else re-prompts without advancing. Raises KeyError for an
+        unknown or non-learning session."""
+        s = self.sessions.get(session_id)
+        if s is None or not s.get("learning"):
+            raise KeyError("unknown learning session id")
+        self.session = s
+        self.current_id = session_id
+        if s.get("rollcall_done"):
+            return self._learning_status_view()
+        rc = s.get("rollcall") or {}
+        if rollcall_accepts(transcript or "", rc.get("answers") or []):
+            s["rollcall_done"] = True
+            return self._begin_chapters(s)
+        say = ("Take your time — say READY when everything is on the "
+               "bench.")
+        view = self._rollcall_view(s)
+        view["instruction"] = view["speak"] = say
         return view
 
     def _fill_chapters(self, sid: str, session: dict, plan: list,
@@ -350,6 +414,7 @@ class AgentOrchestrator:
             full = repair_chapters_pins(full, plan,
                                         session.get("pin_map"))
         except Exception:
+            _log.exception("fundi chapter fill failed; templates stand")
             return
         try:
             if self.sessions.get(sid) is session:
@@ -357,238 +422,66 @@ class AgentOrchestrator:
         except Exception:
             pass
 
-    def _learning_turn(self, req, progress=None) -> dict:
-        """One sensor-gated learning step. The sensor alone advances."""
-        from .learning import build_hint, run_learning_verification
+    def _prefetch_stretch(self) -> None:
+        """Model-author the DONE stretch goals ahead of need.
 
-        assert self.session is not None
-        self.session["turns"] += 1
-        # A fresh turn voids only a STALE ask (a different step): an
-        # eyeball pending for this step must survive AUTO re-checks so
-        # the learner's CONFIRM tap still lands. A sensor pass clears
-        # it in the pass branch below.
-        t0 = time.monotonic()
-        timings: dict[str, float] = {"sam_ms": 0.0, "glance_ms": 0.0,
-                                     "reason_ms": 0.0}
-        if progress is not None:
-            progress("sense", {})
-
-        def done(view: dict) -> dict:
-            timings["total_ms"] = (time.monotonic() - t0) * 1000
-            view["timings"] = {k: round(v, 1) for k, v in timings.items()}
-            if progress is not None:
-                progress("reason", {})
-                progress("verify", {})
-                progress("done", {"timings": view["timings"]})
-            return view
-
-        plan = self.session["plan"]
-        idx = self.session["step_index"]
-        if idx >= len(plan):
-            return done(self._learning_view(
-                state="DONE",
-                instruction="Project verified. Your project code is below.",
-                speak="Project verified. Your project code is shown below.",
-                verification=self.session.get("last_verification"),
-                fundi={"event": "LESSON_DONE", "chapter": None,
-                       "chapters_total": len(plan)}))
-        step = plan[idx]
-        _pending = self.session.get("confirm_pending")
-        if _pending and _pending.get("n") != step.get("n", idx + 1):
-            self.session["confirm_pending"] = None
-        probe_t0 = time.monotonic()
-        probe = self.probe.read_all(simulate_fault=req.simulate_fault)
-        timings["sense_ms"] = timings["probe_ms"] = \
-            (time.monotonic() - probe_t0) * 1000
-        summary = _probe_summary(probe)
-        self.session["measurements_after"] = summary
-        if not self.session["measurements_before"]:
-            self.session["measurements_before"] = summary
-        verification = run_learning_verification(
-            step.get("verify", ""), step.get("expect", {}), probe,
-            self.session["pin_map"])
-        self.session["last_verification"] = verification
-        seen = self.session["verified"]
-        for addr in summary.get("i2c_devices", []):
-            if addr not in seen["i2c"]:
-                seen["i2c"].append(addr)
-        if summary.get("temperature_c") is not None:
-            seen["last_reading"] = {
-                "temperature_c": summary.get("temperature_c"),
-                "humidity_pct": summary.get("humidity_pct"),
-                "pressure_hpa": summary.get("pressure_hpa"),
-            }
-        seen["steps"].append({"n": step.get("n", idx + 1),
-                              "test": verification["test"],
-                              "passed": verification["passed"],
-                              "measured": verification["measured"]})
-        chapters = self.session.get("chapters") or []
-        current_ch = chapter_for(chapters, self.session["step_index"]) or {}
-        if verification["passed"]:
-            self.session["confirm_pending"] = None  # sensor decided it
-            idx += 1
-            self.session["step_index"] = idx
-            if idx >= len(plan):
-                self.session["completed_at"] = _now()
-                self.session["code_ready"] = True
-                speak = ("Boom, you finished it! Project verified: all "
-                         "%d steps passed sensor checks. "
-                         "Your project code is shown below." % len(plan))
-                self.voice.speak(speak)
-                if progress is not None:
-                    progress("CHAPTER_PASSED", {"chapter": current_ch,
-                                                "celebration": speak})
-                return done(self._learning_view(
-                    state="DONE",
-                    instruction="Project verified. Your project code is below.",
-                    speak=speak, verification=verification,
-                    fundi={"event": "LESSON_DONE", "chapter": None,
-                           "chapters_total": len(plan)}))
-            praise = ["Nice work.", "Boom.", "Spot on.", "Well done.",
-                        "Nailed it.", "Great.", "Let's go."][
-                            self.session["turns"] % 7]
-            next_ch = chapter_for(chapters, idx)
-            text = speak_passed(current_ch, verification["measured"], next_ch,
-                                self.session["project_title"], praise)
-            self.voice.speak(text)
-            if progress is not None:
-                progress("CHAPTER_PASSED", {
-                    "chapter": current_ch, "next_chapter": next_ch,
-                    "celebration": str(current_ch.get("celebration") or praise)})
-            view = self._learning_view(
-                state="INSTRUCTING", instruction=text, speak=text,
-                verification=verification,
-                fundi={"event": "CHAPTER_PASSED", "chapter": current_ch,
-                       "next_chapter": next_ch,
-                       "celebration": str(current_ch.get("celebration") or praise)})
-            self._attach_step_code(view, plan[idx])
-            return done(view)
-        if verification.get("needs_confirmation"):
-            return done(self._offer_confirmation(step, verification))
-        r_t0 = time.monotonic()
-        hint = build_hint(step, verification, self.Muse)
-        # Model hints narrate freely: keep their pins on the board's.
-        from .schematic import repair_text_pins
-
-        hint = repair_text_pins(hint, plan, step.get("n"),
-                                self.session["pin_map"])
-        timings["reason_ms"] = (time.monotonic() - r_t0) * 1000
-        if verification.get("board_state"):
-            # Known no-board failure: measured is a port dump for the
-            # screen, not for speech — say the guidance only.
-            speak = hint
-        else:
-            speak = "%s. %s" % (verification["measured"], hint)
-        self.voice.speak(speak)
-        if progress is not None:
-            progress("CHAPTER_HINT", {"chapter": current_ch, "hint": hint})
-        view = self._learning_view(
-            state="VERIFYING", instruction=speak, speak=speak,
-            verification=verification,
-            fundi={"event": "CHAPTER_HINT", "chapter": current_ch,
-                   "hint": hint})
-        self._attach_step_code(view, step)
-        return done(view)
-
-    def _attach_step_code(self, view: dict, step: dict) -> None:
-        """Attach the current step's runnable sketch to a learn view.
-
-        The code is shown from the moment the step starts — never held
-        back until a failure. Instant sources only (template, patient,
-        cached model output): nothing here may burn a model call or
-        raise; any miss leaves the view unchanged.
+        Overwrites the fallback stretch computed at start. Never
+        raises; mock brains skip (the fallback already stands).
         """
         try:
-            from .learning import generate_step_code
-            code, source = generate_step_code(
-                self.session, step, self.Muse, allow_model=False)
+            s = self.session
+            if s is None or getattr(self.Muse, "mock", True):
+                return
+            s["stretch"] = plan_stretch(
+                s.get("project_title", ""), s.get("plan") or [],
+                s.get("visible_parts") or [], s.get("missing_parts") or [],
+                self.Muse, s.get("board"))
         except Exception:
-            return
-        if not code:
-            return
-        view["step_code"] = {"n": step.get("n"), "code": code,
-                             "source": source}
+            pass
 
-    def _offer_confirmation(self, step: dict, verification: dict) -> dict:
-        """Ask the technician to confirm what the probe cannot assess.
-
-        The step does NOT advance here; confirm_learning_step advances it
-        with a hash-chained audit entry recording the attestation.
-        """
-        assert self.session is not None
-        pending = {
-            "n": step.get("n", self.session["step_index"] + 1),
-            "test": verification.get("test", ""),
-            "measured": verification.get("measured", ""),
-            "question": ("Quick eyeball check: %s. "
-                         "If it looks right on your board, press CONFIRM."
-                         % verification.get("measured", "")),
-        }
-        self.session["confirm_pending"] = pending
-        self.voice.speak(pending["question"])
-        current_ch = chapter_for(self.session.get("chapters") or [],
-                                 self.session["step_index"]) or {}
-        return self._learning_view(
-            state="VERIFYING", instruction=pending["question"],
-            speak=pending["question"], verification=verification,
-            fundi={"event": "CHAPTER_HINT", "chapter": current_ch,
-                   "hint": pending["question"]})
-
-    def confirm_learning_step(self, session_id: str, confirmed: bool) -> dict:
-        """Advance a learning step on technician attestation.
-
-        Only valid while confirm_pending is set (the probe reported the
-        step unverifiable, not failed). Raises KeyError for an unknown or
-        non-learning session, ValueError when nothing is pending.
-        """
-        s = self.sessions.get(session_id)
-        if s is None or not s.get("learning"):
-            raise KeyError("unknown learning session id")
-        self.session = s
-        self.current_id = session_id
-        pending = s.get("confirm_pending")
-        idx = s["step_index"]
-        if not pending or idx >= len(s["plan"]):
-            raise ValueError("no confirmation pending")
-        step = s["plan"][idx]
-        chapters = s.get("chapters") or []
-        current_ch = chapter_for(chapters, idx) or {}
-        if not confirmed:
-            s["confirm_pending"] = None
-            speak = "OK, not confirmed. Fix it up and press CHECK NOW."
-            self.voice.speak(speak)
-            return self._learning_view(
-                state="VERIFYING", instruction=speak, speak=speak,
-                verification=s.get("last_verification"),
-                fundi={"event": "CHAPTER_HINT", "chapter": current_ch,
-                       "hint": speak})
-        verification = dict(s.get("last_verification") or {})
-        verification["technician_confirmed"] = True
-        return self._commit_learner_advance(
-            s, step, verification, current_ch, "Confirmed.", "technician")
+    def _start_stretch_prefetch(self) -> None:
+        """Fire _prefetch_stretch on a daemon thread (off the request)."""
+        worker = threading.Thread(
+            target=self._prefetch_stretch,
+            name="fundiloop-stretch", daemon=True)
+        worker.start()
 
     def advance_learning_step(self, session_id: str,
                               transcript: str = "") -> dict:
         """Advance because the learner said they finished this step.
 
-        Learning is learner-paced: saying done / next does not wait for
-        a sensor pass. CHECK NOW still sensor-verifies. Raises KeyError
-        for an unknown or non-learning session.
+        Learning is learner-paced: saying done / next moves on; only
+        telemetry proof (or the explicit escape) finishes the build.
+        Raises KeyError for an unknown or non-learning session.
         """
         s = self.sessions.get(session_id)
         if s is None or not s.get("learning"):
             raise KeyError("unknown learning session id")
         self.session = s
         self.current_id = session_id
+        if not s.get("rollcall_done", True):
+            return self._rollcall_view(s)
         idx = s["step_index"]
         if idx >= len(s["plan"]):
             return self._learning_status_view()
-        if s.get("confirm_pending"):
-            return self.confirm_learning_step(session_id, True)
+        heard = str(transcript or "").strip()
+        if idx == len(s["plan"]) - 1 and "mark complete" not in heard.lower():
+            # Final step: taps advance steps, only telemetry proof (or
+            # the explicit escape) finishes the build. A "next" here
+            # holds with guidance instead of completing unverified.
+            speak = ("This is the last step — tap Deploy Firmware to "
+                     "flash your code, then prove it works in the monitor.")
+            self.voice.speak(speak)
+            chapters = s.get("chapters") or []
+            return self._learning_view(
+                state="INSTRUCTING", instruction=speak, speak=speak,
+                verification=s.get("last_verification"),
+                fundi={"event": "CHAPTER_HINT",
+                       "chapter": chapter_for(chapters, idx),
+                       "hint": speak})
         step = s["plan"][idx]
         chapters = s.get("chapters") or []
         current_ch = chapter_for(chapters, idx) or {}
-        heard = str(transcript or "").strip()
         verification = {
             "test": "LEARNER_DONE",
             "passed": True,
@@ -601,11 +494,54 @@ class AgentOrchestrator:
         return self._commit_learner_advance(
             s, step, verification, current_ch, praise, "learner")
 
+    def telemetry_verify(self, session_id: str, lines: list) -> dict:
+        """Mark a build DONE on telemetry proof, never on ask.
+
+        The monitor submits its trailing lines; the deterministic
+        proof rule admits only a healthy streak. Returns the DONE
+        learning view, or {"verified": False, "proof": ...} when the
+        evidence does not hold yet. Raises KeyError for an unknown or
+        non-learning session.
+        """
+        from .telemetry import telemetry_proof
+
+        s = self.sessions.get(session_id)
+        if s is None or not s.get("learning"):
+            raise KeyError("unknown learning session id")
+        self.session = s
+        self.current_id = session_id
+        proof = telemetry_proof(lines or [])
+        if not proof["verified"]:
+            return {"verified": False, "proof": proof,
+                    "session_id": session_id}
+        plan = s.get("plan") or []
+        s["completed_at"] = _now()
+        s["code_ready"] = True
+        steps = s.get("verified", {}).setdefault("steps", [])
+        if not steps or steps[-1].get("test") != "TELEMETRY":
+            steps.append({"n": "telemetry", "test": "TELEMETRY",
+                          "passed": True,
+                          "measured": "%d consecutive healthy lines"
+                                      % proof["healthy"]})
+        verification = {"test": "TELEMETRY", "passed": True,
+                        "measured": "%d consecutive healthy lines"
+                                    % proof["healthy"]}
+        s["last_verification"] = verification
+        speak = "It works! You built %s." % (
+            s.get("project_title") or "your project")
+        self.voice.speak(speak)
+        return self._learning_view(
+            state="DONE",
+            instruction="Project verified — live telemetry proves the "
+                        "build works. Your project code is below.",
+            speak=speak, verification=verification,
+            fundi={"event": "LESSON_DONE", "chapter": None,
+                   "chapters_total": len(plan)})
+
     def _commit_learner_advance(self, s: dict, step: dict, verification: dict,
                                 current_ch: dict, celebration: str,
                                 confirmed_by: str) -> dict:
         """Shared tail: log the attestation, bump the step, speak the next."""
-        s["confirm_pending"] = None
         s["last_verification"] = verification
         s["verified"]["steps"].append({
             "n": step.get("n", s["step_index"] + 1),
@@ -633,9 +569,7 @@ class AgentOrchestrator:
         text = "%s Next: %s" % (
             celebration, speak_start(next_ch or {}, s.get("project_title", "")))
         if next_ch is not None and not str(next_ch.get("teach") or "").strip():
-            text = "%s Next step %s: %s" % (
-                celebration, next_ch.get("n", idx + 1),
-                str(next_ch.get("task") or "").strip())
+            text = "%s %s" % (celebration, next_step_opening(next_ch))
         self.voice.speak(text)
         view = self._learning_view(
             state="INSTRUCTING", instruction=text, speak=text,
@@ -643,7 +577,9 @@ class AgentOrchestrator:
             fundi={"event": "CHAPTER_PASSED", "chapter": current_ch,
                    "next_chapter": next_ch,
                    "celebration": str(current_ch.get("celebration") or celebration)})
-        self._attach_step_code(view, s["plan"][idx])
+        if not getattr(self.Muse, "mock", True):
+            if idx == len(s["plan"]) - 1:
+                self._start_stretch_prefetch()
         return view
 
     @staticmethod
@@ -704,10 +640,18 @@ class AgentOrchestrator:
             "code_ready": bool(s.get("code_ready")),
             "started_at": s["started_at"],
         }
-        if s.get("confirm_pending"):
-            view["confirm_pending"] = dict(s["confirm_pending"])
         if fundi is not None:
             view["fundi"] = fundi
+            if fundi.get("event") == "LESSON_DONE" \
+                    and "stretch" not in fundi:
+                # Every DONE view carries stretch goals: the model
+                # upgrade when its prefetch landed, else the grounded
+                # fallback computed at start. Speech teases the first.
+                stretch = list(s.get("stretch") or [])
+                view["fundi"] = dict(fundi, stretch=stretch)
+                if stretch and stretch[0].get("summary"):
+                    view["speak"] = "%s And when you want more: %s" % (
+                        speak, stretch[0]["summary"])
         return view
 
     def _learning_status_view(self) -> dict:
@@ -888,13 +832,18 @@ class AgentOrchestrator:
 
         Raises CameraError/MetaAPIError on camera or Meta API failure: the
         API returns the real error and the step stops. Nothing is faked.
+        Raises ValueError for learning sessions: those advance with
+        /api/session/advance and prove with telemetry-verified.
         """
         req = req or CheckNowRequest()
         if self.session is None:
             self.start_session()
         assert self.session is not None
         if self.session.get("learning"):
-            return self._learning_turn(req, progress=progress)
+            raise ValueError(
+                "check-now serves guided/diagnostic sessions; learning "
+                "sessions advance with /api/session/advance and prove "
+                "with /api/session/telemetry-verified")
 
         def emit(stage: str, detail: dict | None = None) -> None:
             if progress is not None:

@@ -8,6 +8,7 @@ model calls in these tests.
 Run from the repo root:
   backend\\.venv\\Scripts\\python.exe -m unittest backend.tests.test_schematic -v
 """
+import re
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -277,6 +278,54 @@ class BreadboardSchematicTest(unittest.TestCase):
         self.assertIn('id="wire-led-_"', svg2)
         self.assertIn("schematic-new", svg2)
 
+    def test_breadboard_wires_route_orthogonally(self):
+        # Organized wiring like the reference diagram: off-board wire
+        # paths are horizontal/vertical segments only — no bezier
+        # swoops, no diagonal hops across the board. (The small E-F
+        # jumper hop uses Q and is allowed.)
+        plan = [
+            {"n": 1, "instruction": "Power.", "verify": "CHECK_SERIAL",
+             "expect": {}, "depends_on_parts": ["esp32"]},
+            {"n": 2, "instruction": "Eyes.", "verify": "CHECK_GPIO",
+             "expect": {}, "depends_on_parts": ["hc_sr04"]},
+            {"n": 3, "instruction": "Arm.", "verify": "CHECK_GPIO",
+             "expect": {}, "depends_on_parts": ["servo"]},
+        ]
+        svg = render_breadboard_svg(
+            build_netlist(plan, 3, pin_map_for("esp32_devkit")), 3)
+        groups = re.findall(r'<g id="wire-[^"]+"[^>]*>.*?</g>', svg, re.S)
+        self.assertTrue(groups)
+        for group in groups:
+            for d in re.findall(r'<path d="([^"]+)"', group):
+                self.assertNotIn("C", d)
+                toks = re.findall(r"[MHVLQ]|-?\d+(?:\.\d+)?", d)
+                x = y = None
+                i = 0
+                while i < len(toks):
+                    cmd = toks[i]
+                    i += 1
+                    if cmd == "M":
+                        x, y = float(toks[i]), float(toks[i + 1])
+                        i += 2
+                    elif cmd == "H":
+                        x = float(toks[i])
+                        i += 1
+                    elif cmd == "V":
+                        y = float(toks[i])
+                        i += 1
+                    elif cmd == "L":
+                        nx, ny = float(toks[i]), float(toks[i + 1])
+                        i += 2
+                        self.assertTrue(
+                            nx == x or ny == y,
+                            "diagonal segment in %r" % d)
+                        x, y = nx, ny
+                    elif cmd == "Q":
+                        x, y = float(toks[i + 2]), float(toks[i + 3])
+                        i += 4
+                    else:
+                        self.fail("unexpected path token in %r" % d)
+
 
 class SchematicEndpointTest(unittest.TestCase):
     def setUp(self):
@@ -320,6 +369,60 @@ class SchematicEndpointTest(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx:
             self.app_main.api_step_schematic("s1", 1)
         self.assertEqual(ctx.exception.status_code, 400)
+
+
+class WireAnnotationTest(unittest.TestCase):
+    """Netlist wires carry their drawn color, its spoken name, and the
+    part's display title, so narration matches the diagram exactly."""
+
+    def test_known_signals_named(self):
+        from backend.app.visual_schematic import wire_color_name
+
+        for signal, name in (("power", "red"), ("ground", "gray"),
+                             ("TRIG", "blue"), ("ECHO", "green"),
+                             ("SDA", "blue"), ("SCL", "green"),
+                             ("SIG", "purple"), ("OUT", "amber"),
+                             ("AO", "orange")):
+            self.assertEqual(wire_color_name(signal), name, signal)
+
+    def test_unknown_signal_falls_back_to_gray(self):
+        from backend.app.visual_schematic import wire_color_name
+
+        self.assertEqual(wire_color_name("NOPE"), "gray")
+        self.assertEqual(wire_color_name(""), "gray")
+        self.assertEqual(wire_color_name(None), "gray")
+
+    def test_annotate_adds_presentation_keys(self):
+        from backend.app.visual_schematic import annotate_wires
+
+        wires = [{"part": "hc_sr04", "part_pin": "TRIG",
+                  "board_pin": "GPIO25", "signal": "TRIG"},
+                 {"part": "mystery", "part_pin": "X",
+                  "board_pin": "GPIO26", "signal": "X"}]
+        annotate_wires(wires)
+        self.assertEqual(wires[0]["color"], "#3b82f6")
+        self.assertEqual(wires[0]["color_name"], "blue")
+        self.assertEqual(wires[0]["part_title"], "HC-SR04P Ultrasonic")
+        self.assertEqual(wires[1]["color_name"], "gray")
+        self.assertEqual(wires[1]["part_title"], "Mystery")
+
+    def test_endpoint_wires_carry_annotation(self):
+        import backend.app.main as app_main
+        from unittest import mock as _mock
+
+        session = {"learning": True, "board": "esp32_devkit",
+                   "pin_map": pin_map_for("esp32_devkit"), "plan": PLAN}
+        fake_orc = SimpleNamespace(sessions={"s1": session})
+        with _mock.patch.object(app_main, "orchestrator", fake_orc):
+            out = app_main.api_step_schematic("s1", 2)
+        sda = next(w for w in out["netlist"]["wires"]
+                   if w.get("signal") == "SDA")
+        self.assertEqual(sda["color_name"], "blue")
+        self.assertEqual(sda["part_title"], "BME280")
+        for wire in out["netlist"]["wires"]:
+            self.assertIn("color", wire)
+            self.assertIn("color_name", wire)
+            self.assertIn("part_title", wire)
 
 
 if __name__ == "__main__":

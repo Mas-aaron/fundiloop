@@ -24,30 +24,27 @@
 <main>
   <div class="hero">
     <h2 class="hero-title">Hi, I'm Fundi</h2>
-    <p class="fine">Tell me what you want to build. I will plan it, wire it with you, and check every step.</p>
+    <p>Tell me what you want to build. I'll plan it, wire it with you, and check every step.</p>
   </div>
 
   <div class="orb-container">
-    <div class="orb-glow"></div>
-    <div class="orb-ring"></div>
-    <div class="orb-ring-2"></div>
-    <div class="orb-ring-3"></div>
-    <div class="orb-wave" aria-hidden="true"></div>
-    <div id="orb" class="orb" aria-hidden="true"></div>
+    <canvas id="orb-canvas" width="320" height="320" aria-hidden="true"></canvas>
   </div>
 
   <div id="learn-chapter" class="chapter-title" hidden></div>
   <div id="instruction" role="status">Hi! I'm ready to help you with your circuit.</div>
   
-  <div id="state-line" class="fine"></div>
+  <div id="state-line" class="chip-row"></div>
+  <progress id="learn-progress" max="100" value="0" hidden></progress>
 
-  <div id="confirm-bar" class="panel" hidden>
-    <div id="confirm-q"></div>
+  <div id="rollcall-bar" class="panel" hidden>
+    <div id="rollcall-q"></div>
     <div class="btn-row" style="margin-top:8px">
-      <button id="confirm-yes" class="small" type="button">CONFIRM</button>
-      <button id="confirm-no" class="small" type="button">NOT YET</button>
+      <button id="rollcall-ready" class="small" type="button">READY — START BUILDING</button>
     </div>
   </div>
+
+  <!-- learn troubleshoot + stretch live in the left drawer. -->
 
   <div class="mic-container">
     <button id="talk" class="mic" type="button">
@@ -83,7 +80,8 @@
       <button id="learn-suggest" class="small">SUGGEST</button>
       <button id="cook-resume" class="small" hidden>RESUME</button>
     </div>
-    <ol id="learn-cards" class="list" style="margin-top: 1rem;"></ol>
+    <div id="learn-results-head" class="fine" style="margin-top: 1rem;"></div>
+    <ol id="learn-cards" class="list" style="margin-top: 0.5rem;"></ol>
   </section>
 
   <!-- Guided/Diagnostic home panels: implementations kept, unreachable
@@ -116,50 +114,26 @@
     <div id="passport"></div>
   </section>
 
-  <section id="code-sec" class="panel" hidden>
-    <h2>Project Firmware</h2>
-    <div id="code-kind" class="fine"></div>
-    <div class="btn-row" style="margin-bottom: 1rem;">
-      <button id="send-code" class="small" type="button">Send to Board</button>
-      <button id="send-step-code" class="small" type="button">Step Code</button>
-      <button id="copy-code" class="small" type="button">Copy</button>
-    </div>
-    <pre id="code-out"></pre>
-    <div id="schematic-panel">
-      <h3>Wiring schematic</h3>
-      <div class="fine">Wires draw in with the tutor. Toggle breadboard to see the holes.</div>
-      <div class="btn-row schematic-view-toggle">
-        <button type="button" class="small schematic-view-btn active" data-view="cards">Pin cards</button>
-        <button type="button" class="small schematic-view-btn" data-view="breadboard">Breadboard</button>
-      </div>
-      <div id="schematic-svg"></div>
-      <div id="schematic-sel" class="fine"></div>
-      <div id="schematic-wires" class="fine"></div>
-      <div class="btn-row" style="margin-top: 0.5rem;">
-        <button id="schematic-download" class="small" type="button">Download SVG</button>
-        <button id="schematic-speak" class="small" type="button">Speak wires</button>
-      </div>
-      <div class="btn-row" style="margin-top: 0.5rem;">
-        <button id="web-connect" class="small" type="button">CONNECT BOARD</button>
-        <button id="web-flash" class="small" type="button">FLASH IN BROWSER</button>
-      </div>
-      <progress id="webflash-progress" max="100" value="0" hidden style="width: 100%;"></progress>
-      <div id="webflash-status" class="fine"></div>
-      <div class="fine" style="margin-top: 0.75rem;">Recommended: FLASH ESP32 uses the server's native esptool at 921600 baud, the same auto-reset upload path as Arduino IDE.</div>
-      <div class="btn-row" style="margin-top: 0.5rem;">
-        <select id="flash-port" aria-label="ESP32 serial port"></select>
-        <button id="flash-esp32" class="small" type="button">FLASH ESP32</button>
-      </div>
-      <div id="flash-status" class="fine"></div>
-    </div>
-  </section>
+  <!-- code-sec (firmware + learn schematic + learn flash) lives in the
+       left drawer now; see the drawer markup before the script tag. -->
 
 </main>
 
-<div class="controls-footer">
-  <button id="check" type="button">CHECK NOW</button>
-  <button id="cancel" class="big danger" type="button" hidden>CANCEL</button>
-  <button id="move-on" class="big" type="button">MOVE ON</button>
+<div id="resume-bar" hidden>
+  <span id="resume-text"></span>
+  <button id="resume-go" class="small" type="button">RESUME</button>
+</div>
+
+<div id="flash-dialog" hidden>
+  <div class="modal-card flash-card" role="dialog" aria-modal="true" aria-label="Flashing">
+    <h2 id="flash-title">Flashing…</h2>
+    <pre id="flash-console" aria-live="polite"></pre>
+    <progress id="flash-progress" max="100" value="0"></progress>
+    <div id="flash-summary" class="fine"></div>
+    <div class="btn-row" style="margin-top: 1rem;">
+      <button id="flash-close" class="small" type="button">Close</button>
+    </div>
+  </div>
 </div>
 
 <div id="settings-modal" hidden>
@@ -176,16 +150,8 @@
     <div class="btn-row" style="margin-top: 0.5rem;">
       <button id="save-serial" class="small">Save Serial</button>
       <button id="serial-detect" class="small">Auto Detect</button>
-      <button id="show-sketch" class="small" type="button">GET BOARD SKETCH</button>
     </div>
     <div id="serial-msg" class="fine"></div>
-    <div id="sketch-panel" hidden>
-      <div class="fine" style="margin-bottom: 0.5rem;">COPY it, paste into Arduino IDE, Upload to your board, close Serial Monitor, then press CHECK NOW.</div>
-      <div class="btn-row" style="margin-bottom: 0.5rem;">
-        <button id="copy-sketch" class="small" type="button">COPY SKETCH</button>
-      </div>
-      <pre id="sketch-code"></pre>
-    </div>
     
     <label>Code Analysis</label>
     <textarea id="code" placeholder="Paste code here..."></textarea>
@@ -225,9 +191,7 @@
         <div id="cook-step" class="cook-step"></div>
       </div>
       <div class="orb-container-small">
-        <div class="orb-ring" style="opacity: 0.05;"></div>
-        <div class="orb-wave" aria-hidden="true"></div>
-        <div id="cook-orb" class="orb orb-small" aria-hidden="true"></div>
+        <canvas id="cook-orb-canvas" width="80" height="80" aria-hidden="true"></canvas>
       </div>
       <div class="btn-row">
         <button id="cook-stop" class="small" type="button">STOP</button>
@@ -237,24 +201,12 @@
     
     <div class="cook-progress"><div id="cook-bar"></div></div>
 
-    <div class="btn-row cook-btns cook-actions" style="flex-wrap: wrap;">
-      <button id="cook-talk" class="small" type="button">TALK</button>
-      <button id="cook-check" class="small" type="button">CHECK</button>
-      <button id="cook-phase-done" class="small" type="button">PHASE DONE</button>
-      <button id="cook-auto" class="small" type="button">AUTO ✓</button>
-      <button id="cook-confirm" class="small" type="button" hidden>CONFIRM</button>
-      <button id="cook-repeat" class="small" type="button">REPEAT</button>
-      <button id="cook-look" class="small" type="button">LOOK</button>
-      <button id="cook-move-on" class="small" type="button">MOVE ON</button>
-    </div>
-
-    <div id="cook-eyeball" class="panel" hidden>
-      <div id="cook-eyeball-q" role="status"></div>
-      <div class="btn-row" style="margin-top: 0.5rem;">
-        <button id="cook-eyeball-yes" class="small" type="button">YES - IT WORKS</button>
-        <button id="cook-eyeball-no" class="small" type="button">NOT YET</button>
-      </div>
-      <div class="fine">Your eyes are the sensor for this one. YES moves to the next step; you can also just say "yes" or "not yet".</div>
+    <!-- The action row moved into the coach bar (TALK + primary) and its
+         overflow (CHECK, PHASE DONE, AUTO, CONFIRM, REPEAT, LOOK, MOVE
+         ON). cook-ready stays as the scripted fallback; the coach
+         primary is the visible READY path. -->
+    <div class="btn-row cook-btns cook-actions" style="flex-wrap: wrap;" hidden>
+      <button id="cook-ready" class="small" type="button" hidden>READY</button>
     </div>
 
     <div class="cook-split">
@@ -262,13 +214,7 @@
         <div id="cook-chapter" class="chapter-title" hidden></div>
         <div id="cook-instruction" role="status" class="panel"></div>
         <div id="cook-heard" class="fine"></div>
-        <div id="cook-stepcode" hidden>
-          <div class="btn-row" style="margin-top: 0.5rem;">
-            <button id="cook-fetch-step" class="small" type="button">STEP CODE</button>
-            <button id="cook-copy-step" class="small" type="button">COPY CODE</button>
-          </div>
-          <pre id="cook-step-out"></pre>
-        </div>
+        <!-- Step code, troubleshoot, and stretch live in the left drawer. -->
 
         <div id="cook-nudge" class="panel" hidden>
           <span id="cook-nudge-text"></span>
@@ -303,22 +249,8 @@
         <div id="cook-schematic-svg"></div>
         <div id="cook-schematic-sel" class="fine"></div>
         <div id="cook-schematic-wires" class="fine"></div>
-        <div class="btn-row" style="margin-top: 0.5rem;">
-          <button id="cook-schematic-download" class="small" type="button">DOWNLOAD SVG</button>
-          <button id="cook-schematic-speak" class="small" type="button">SPEAK WIRES</button>
-        </div>
-        <div class="btn-row" style="margin-top: 0.5rem;">
-          <button id="cook-web-connect" class="small" type="button">CONNECT BOARD</button>
-          <button id="cook-web-flash" class="small" type="button">FLASH IN BROWSER</button>
-        </div>
-        <progress id="cook-webflash-progress" max="100" value="0" hidden style="width: 100%;"></progress>
-        <div id="cook-webflash-status" class="fine"></div>
-        <div class="fine" style="margin-top: 0.75rem;">Recommended: FLASH ESP32 uses the server's native esptool at 921600 baud, the same auto-reset upload path as Arduino IDE.</div>
-        <div class="btn-row" style="margin-top: 0.5rem;">
-          <select id="cook-flash-port" aria-label="ESP32 serial port"></select>
-          <button id="cook-flash-esp32" class="small" type="button">FLASH ESP32</button>
-        </div>
-        <div id="cook-flash-status" class="fine"></div>
+        <!-- Download/speak moved to the coach overflow; connect/flash
+             moved to the left drawer flash section. -->
       </div>
     </div>
 
@@ -339,19 +271,137 @@
       <input id="cook-handsfree" type="checkbox"> Hands-free mode
     </label>
     
-    <div id="cook-done" hidden>
-      <div class="panel" style="margin-top: 1rem;">
-        <h2>Final Code</h2>
-        <div class="btn-row" style="margin-bottom: 1rem;">
-          <button id="cook-code" class="small" type="button">SEND CODE</button>
-          <button id="cook-step-code" class="small" type="button">STEP CODE</button>
-          <button id="cook-copy" class="small" type="button">COPY</button>
-        </div>
-        <pre id="cook-code-out"></pre>
-      </div>
-    </div>
+    <!-- cook-done (final code) lives in the left drawer. -->
   </div>
 </div>
+
+<!-- Three-zone layout: center stage above, coach bar fixed at the
+     bottom, drawers collapsed on the edges. All ids below are the same
+     ones the script has always wired; only their homes changed. -->
+<button id="left-drawer-tab" class="drawer-tab left" type="button">CODE</button>
+<aside id="left-drawer" class="drawer left" hidden>
+  <div class="drawer-head">
+    <span>Build panel</span>
+    <button id="left-drawer-close" class="small" type="button">Close</button>
+  </div>
+
+  <section id="code-sec" class="panel" hidden>
+    <h2>Project Firmware</h2>
+    <div id="code-kind" class="fine"></div>
+    <div class="btn-row" style="margin-bottom: 1rem;">
+      <button id="send-code" class="small" type="button">Send to Board</button>
+      <button id="copy-code" class="small" type="button">Copy</button>
+    </div>
+    <pre id="code-out"></pre>
+    <div id="schematic-panel">
+      <h3>Wiring schematic</h3>
+      <div class="fine">Wires draw in with the tutor. Toggle breadboard to see the holes.</div>
+      <div class="btn-row schematic-view-toggle">
+        <button type="button" class="small schematic-view-btn active" data-view="cards">Pin cards</button>
+        <button type="button" class="small schematic-view-btn" data-view="breadboard">Breadboard</button>
+      </div>
+      <div id="schematic-svg"></div>
+      <div id="schematic-sel" class="fine"></div>
+      <div id="schematic-wires" class="fine"></div>
+      <div class="btn-row" style="margin-top: 0.5rem;">
+        <button id="schematic-download" class="small" type="button">Download SVG</button>
+        <button id="schematic-speak" class="small" type="button">Speak wires</button>
+      </div>
+      <div class="fine" style="margin-top: 0.75rem;">FLASH FINAL uses the server's native esptool at 921600 baud, the same auto-reset upload path as Arduino IDE.</div>
+      <div class="btn-row" style="margin-top: 0.5rem;">
+        <select id="flash-port" aria-label="ESP32 serial port"></select>
+        <button id="flash-final" class="small" type="button">FLASH FINAL</button>
+      </div>
+      <div id="flash-status" class="fine"></div>
+      <div class="fine" style="margin-top: 0.75rem;">Or flash from this browser over Web Serial (Chrome/Edge): CONNECT BOARD picks the port, then FLASH IN BROWSER writes the finished firmware.</div>
+      <div class="btn-row" style="margin-top: 0.5rem;">
+        <button id="web-connect" class="small" type="button">CONNECT BOARD</button>
+        <button id="web-flash" class="small" type="button">FLASH IN BROWSER</button>
+      </div>
+      <progress id="webflash-progress" max="100" value="0" hidden style="width: 100%;"></progress>
+      <div id="webflash-status" class="fine"></div>
+    </div>
+  </section>
+
+  <div id="cook-done" hidden>
+    <div class="panel" style="margin-top: 1rem;">
+      <h2>Project Code</h2>
+      <div class="btn-row" style="margin-bottom: 1rem;">
+        <button id="cook-code" class="small" type="button">SEND CODE</button>
+        <button id="cook-copy" class="small" type="button">COPY</button>
+      </div>
+      <pre id="cook-code-out"></pre>
+    </div>
+  </div>
+
+  <section class="panel">
+    <h3>Fix-it</h3>
+    <ol id="learn-troubleshoot" class="list" hidden></ol>
+    <ol id="cook-troubleshoot" class="list" hidden></ol>
+    <div id="rescue-card" class="panel" hidden>
+      <h3>Rescue</h3>
+      <div id="rescue-msg" role="status"></div>
+      <div id="rescue-suspect" class="fine"></div>
+      <div class="btn-row" style="margin-top: 0.5rem;">
+        <button id="rescue-complete" class="small" type="button" title="Finish without telemetry proof (logged as unverified)">MARK COMPLETE ANYWAY</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h3>What's next</h3>
+    <div id="learn-stretch" class="panel" hidden></div>
+    <div id="cook-stretch" class="panel" hidden></div>
+  </section>
+
+  <section class="panel">
+    <h3>Coach</h3>
+    <ol id="coach-log" class="list"></ol>
+  </section>
+<!-- /left-drawer -->
+</aside>
+
+<button id="right-drawer-tab" class="drawer-tab right" type="button">MONITOR</button>
+<aside id="right-drawer" class="drawer right" hidden>
+  <div class="drawer-head">
+    <span>Live monitor</span>
+    <button id="right-drawer-close" class="small" type="button">Close</button>
+  </div>
+  <div id="monitor-meta" class="fine">Not connected.</div>
+  <pre id="monitor-out" aria-live="polite"></pre>
+  <div class="btn-row" style="margin-top: 0.5rem;">
+    <button id="monitor-start" class="small" type="button">START</button>
+    <button id="monitor-stop" class="small" type="button">STOP</button>
+  </div>
+<!-- /right-drawer -->
+</aside>
+
+<div id="coach-bar" hidden>
+  <div id="coach-text" role="status"></div>
+  <div class="coach-actions">
+    <button id="coach-primary" class="primary" type="button">Next</button>
+    <button id="cook-talk" class="small" type="button">TALK</button>
+    <button id="coach-voice" class="small" type="button">Mute</button>
+    <button id="coach-more" class="small" type="button">···</button>
+  </div>
+  <div id="coach-overflow" class="btn-row" hidden>
+    <button id="cook-repeat" class="small" type="button">REPEAT</button>
+    <button id="cook-look" class="small" type="button">LOOK</button>
+    <button id="cook-schematic-download" class="small" type="button">DOWNLOAD SVG</button>
+    <button id="cook-schematic-speak" class="small" type="button">SPEAK WIRES</button>
+  <!-- /coach-overflow -->
+  </div>
+</div>
+
+<div id="deploy-bar" hidden>
+  <span id="deploy-label">Deploy firmware</span>
+  <span id="cook-flash-status" class="fine" role="status"></span>
+  <progress id="cook-webflash-progress" max="100" value="0" hidden></progress>
+  <select id="cook-flash-port" aria-label="ESP32 serial port for server deploy"></select>
+  <button id="cook-web-connect" class="small" type="button">CONNECT BOARD</button>
+  <button id="cook-deploy" class="primary" type="button">DEPLOY</button>
+</div>
+<!-- /deploy-bar -->
 
 <script src="/app.js"></script>
 </body>

@@ -1,4 +1,4 @@
-"""Fundi chapters: validated narration, events only on sensor evidence.
+"""Fundi chapters: validated narration, tap-paced lesson flow.
 
 Run from the repo root:
   backend\\.venv\\Scripts\\python.exe -m unittest backend.tests.test_fundi -v
@@ -10,14 +10,16 @@ from unittest import mock
 
 from backend.app.boards import pin_map_for
 from backend.app.fundi import (
+    complete_beat,
+    complete_rollcall,
+    next_step_opening,
     plan_chapters,
-    speak_passed,
+    plan_stretch,
+    rollcall_accepts,
     speak_start,
     template_chapters,
     validate_chapters,
 )
-from backend.app.learning import build_hint, run_learning_verification
-from backend.app.models import CheckNowRequest, ProbeReading
 from backend.tests.helpers import use_mock_env
 from backend.tests.test_latency import make_orchestrator
 
@@ -32,23 +34,15 @@ PLAN = [
 CHAPTERS = [
     {"n": 1, "title": "Meet the sensor",
      "teach": "The sensor talks to the board over two shared wires.",
+     "why": "If the sensor answers here, every later step can trust it.",
      "task": "Wire SDA, SCL, and power to the sensor.",
      "verify": "RUN_I2C_SCAN", "celebration": "Boom!"},
     {"n": 2, "title": "Blink the light",
      "teach": "GPIO pins switch on and off in code.",
+     "why": "One blinking pin proves your code reaches the real world.",
      "task": "Blink the builtin LED.", "verify": "CHECK_GPIO",
      "celebration": "Spot on!"},
 ]
-
-I2C_OK = ProbeReading(connected=True, i2c_devices=["0x76"],
-                      temperature_c=22.0, humidity_pct=50.0,
-                      pressure_hpa=1010.0, oled_ok=None, led_ok=None,
-                      mock=False, raw="{}")
-I2C_EMPTY = I2C_OK.model_copy(update={"i2c_devices": []})
-GPIO_UNKNOWN = ProbeReading(
-    connected=True, i2c_devices=[], temperature_c=None, humidity_pct=None,
-    pressure_hpa=None, oled_ok=None, led_ok=None, mock=False, raw="{}")
-
 
 class StubBrain:
     mock = False
@@ -132,34 +126,53 @@ class SpeakBuildersTest(unittest.TestCase):
     def test_start_teaches_first(self):
         text = speak_start(CHAPTERS[0], "Blink")
         self.assertEqual(text, "The sensor talks to the board over two shared "
-                               "wires. Wire SDA, SCL, and power to the sensor.")
+                               "wires. If the sensor answers here, every later "
+                               "step can trust it. Wire SDA, SCL, and power "
+                               "to the sensor.")
         self.assertNotIn("Chapter", text)
 
+    def test_start_without_why_keeps_old_shape(self):
+        text = speak_start({"n": 1, "teach": "T.", "task": "K."}, "Blink")
+        self.assertEqual(text, "T. K.")
+
     def test_start_template_falls_back(self):
-        text = speak_start(template_chapters(PLAN)[0], "Blink")
+        ch = template_chapters(PLAN)[0]
+        text = speak_start(ch, "Blink")
         # One step announcement, no repeated project title: the UI
-        # opening line already names the project.
-        self.assertEqual(text, "Step 1: %s" % PLAN[0]["instruction"])
+        # opening line already names the project. The task leads so the
+        # learner knows what to do; the derived why-line trails so
+        # fallback mode still teaches.
+        self.assertTrue(
+            text.startswith("Step 1: " + PLAN[0]["instruction"]))
+        self.assertIn(ch["why"], text)
+        self.assertLess(text.index(PLAN[0]["instruction"]),
+                        text.index(ch["why"]))
 
-    def test_passed_celebrates_then_opens_next(self):
-        text = speak_passed(CHAPTERS[0], "I2C found [0x76]", CHAPTERS[1],
-                            "Blink", "Nice work.")
-        self.assertEqual(text, "Boom! Verified: I2C found [0x76]. Next: "
-                               "GPIO pins switch on and off in code. "
-                               "Blink the builtin LED.")
-
-    def test_passed_template_keeps_plain_phrasing(self):
+    def test_template_why_is_plain_language(self):
         tmpl = template_chapters(PLAN)
-        text = speak_passed(tmpl[0], "I2C found [0x76]", tmpl[1],
-                            "Blink", "Nice work.")
-        self.assertEqual(text, "Nice work. Verified: I2C found [0x76]. "
-                               "Next step 2: Blink the builtin LED.")
+        # Fallback principle lines teach in plain words: no proverbs
+        # or riddles ahead of the action.
+        self.assertEqual(
+            tmpl[0]["why"],
+            "Each address that answers proves its wiring before any "
+            "reading is trusted.")
+        self.assertEqual(
+            tmpl[1]["why"],
+            "This check proves each wire really reaches its GPIO "
+            "before the build trusts it.")
+        other = template_chapters(
+            [{"n": 9, "instruction": "Do the thing.", "verify": "NOPE"}])
+        self.assertEqual(
+            other[0]["why"],
+            "Measure first, then build on what the measurement proved.")
 
-    def test_passed_final_has_no_next(self):
-        text = speak_passed(CHAPTERS[1], "GPIO13 toggles", None,
-                            "Blink", "Nice work.")
-        self.assertEqual(text, "Spot on! Verified: GPIO13 toggles.")
-
+    def test_next_step_opening_leads_with_task(self):
+        tmpl = template_chapters(PLAN)
+        self.assertEqual(
+            next_step_opening(tmpl[1]),
+            "Next step 2: Blink the builtin LED. This check proves "
+            "each wire really reaches its GPIO before the build "
+            "trusts it.")
 
 class LessonFlowTest(unittest.TestCase):
     def setUp(self):
@@ -168,10 +181,12 @@ class LessonFlowTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.orc = make_orchestrator(self.tmp.name)
 
-    def start(self, plan, script, sid="fundi-1"):
+    def start(self, plan, script, sid="fundi-1", ready=True):
         # Start answers instantly from templates (zero model calls); the
         # background thread stays suppressed here and the fill step runs
-        # explicitly below, so no real timing is involved.
+        # explicitly below, so no real timing is involved. The parts
+        # roll call gates chapter 1: ready=True answers it, tests for
+        # the gate itself pass ready=False.
         self.orc.Muse = StubBrain(script)
 
         class NoThread:
@@ -182,223 +197,319 @@ class LessonFlowTest(unittest.TestCase):
                 pass
 
         with mock.patch("threading.Thread", NoThread):
-            return self.orc.start_learning_session(
+            view = self.orc.start_learning_session(
                 "blink", [dict(s) for s in plan], visible_parts=[],
                 session_id=sid, project_title="Blink", board="arduino_uno")
+        if ready:
+            view = self.orc.answer_rollcall(sid, "ready")
+        return view
 
     def fill(self, sid="fundi-1"):
         self.orc._fill_chapters(
             sid, self.orc.session, PLAN, "Blink", "arduino_uno",
             Muse=StubBrain([json.dumps({"chapters": CHAPTERS})]))
 
-    def test_start_emits_chapter_start(self):
-        v = self.start(PLAN, [])
-        self.assertEqual(v["fundi"]["event"], "CHAPTER_START")
-        # Templates answer now, with zero model calls on the start path.
-        self.assertEqual(v["fundi"]["chapter"]["title"], "Step 1")
-        self.assertTrue(v["speak"].startswith("Step 1: "))
-        self.assertNotIn("Chapter", v["speak"])
+    def test_start_emits_rollcall_then_chapter_start(self):
+        v = self.start(PLAN, [], ready=False)
+        self.assertEqual(v["state"], "ROLLCALL")
+        self.assertEqual(v["fundi"]["event"], "ROLLCALL")
+        self.assertIn("READY", v["speak"])
+        self.assertTrue(v["fundi"]["rollcall"]["question"].strip())
         self.assertEqual(v["step_index"], 0)
         self.assertEqual(len(self.orc.Muse.calls), 0)
-        # Step 1 code rides along from the start: no fail-first.
-        self.assertEqual(v["step_code"]["source"], "template")
-        self.assertEqual(v["step_code"]["n"], 1)
-        self.assertIn("scan done", v["step_code"]["code"])
+        # READY begins chapter 1: templates answer now, with zero model
+        # calls on the path.
+        answered = self.orc.answer_rollcall("fundi-1", "ready")
+        self.assertEqual(answered["fundi"]["event"], "CHAPTER_START")
+        self.assertEqual(answered["fundi"]["chapter"]["title"], "Step 1")
+        self.assertTrue(answered["speak"].startswith("Step 1: "))
+        self.assertNotIn("Chapter", answered["speak"])
+        self.assertEqual(answered["step_index"], 0)
+        self.assertEqual(len(self.orc.Muse.calls), 0)
         # ...then the background fill swaps the full chapters in.
         self.fill()
         full = self.orc.session["chapters"]
         self.assertEqual(full[0]["title"], "Meet the sensor")
         self.assertIn("two shared wires", full[0]["teach"])
 
-    def test_pass_emits_chapter_passed_with_next(self):
-        self.start(PLAN, [json.dumps({"chapters": CHAPTERS[:1]})])
+    def test_rollcall_names_missing_parts(self):
+        plan = [{"n": 1, "instruction": "Swing the servo.",
+                 "verify": "CHECK_GPIO", "expect": {},
+                 "depends_on_parts": ["servo"]}]
+        v = self.start(plan, [], sid="roll-1", ready=False)
+        self.assertIn("servo", v["speak"])
+
+    def test_hold_reprompts_without_advancing(self):
+        self.start(PLAN, [], ready=False)
+        v = self.orc.answer_rollcall("fundi-1", "wait")
+        self.assertEqual(v["state"], "ROLLCALL")
+        self.assertEqual(v["step_index"], 0)
+        self.assertIn("READY", v["speak"])
+
+    def test_advance_gated_until_ready(self):
+        self.start(PLAN, [], ready=False)
+        v = self.orc.advance_learning_step("fundi-1", "next")
+        self.assertEqual(v["state"], "ROLLCALL")
+        self.assertEqual(v["step_index"], 0)
+
+    def test_ready_unknown_session_raises(self):
+        self.start(PLAN, [], ready=False)
+        with self.assertRaises(KeyError):
+            self.orc.answer_rollcall("nope", "ready")
+
+    def test_double_ready_reorients_without_error(self):
+        self.start(PLAN, [])
+        v = self.orc.answer_rollcall("fundi-1", "ready")
+        self.assertEqual(v["fundi"]["event"], "CHAPTER_START")
+        self.assertEqual(v["step_index"], 0)
+
+    def test_advance_emits_chapter_passed_with_next(self):
+        self.start(PLAN, [])
         self.fill()
-        seen = []
-        with mock.patch.object(self.orc.probe, "read_all",
-                               return_value=I2C_OK):
-            v = self.orc.check_now(CheckNowRequest(),
-                                   progress=lambda s, d: seen.append(s))
+        v = self.orc.advance_learning_step("fundi-1", "done")
         self.assertEqual(v["fundi"]["event"], "CHAPTER_PASSED")
         self.assertEqual(v["fundi"]["chapter"]["n"], 1)
         self.assertEqual(v["fundi"]["next_chapter"]["n"], 2)
         self.assertEqual(v["fundi"]["celebration"], "Boom!")
-        self.assertIn("CHAPTER_PASSED", seen)
-        self.assertIn("Boom! Verified:", v["speak"])
-        self.assertIn("Next: GPIO pins switch on and off in code.", v["speak"])
+        self.assertIn("Nice work. Next: GPIO pins switch on and off in "
+                      "code. One blinking pin proves your code reaches the "
+                      "real world. Blink the builtin LED.", v["speak"])
         self.assertEqual(v["step_index"], 1)
-        # Passing hands over the NEXT step's code at once.
-        self.assertEqual(v["step_code"]["source"], "template")
-        self.assertEqual(v["step_code"]["n"], 2)
-        self.assertIn("LED_PIN", v["step_code"]["code"])
 
-    def test_fail_emits_chapter_hint_without_advancing(self):
-        self.start(PLAN, [])
-        self.fill()
-        seen = []
-        with mock.patch.object(self.orc.probe, "read_all",
-                               return_value=I2C_EMPTY):
-            v = self.orc.check_now(CheckNowRequest(),
-                                   progress=lambda s, d: seen.append(s))
-        self.assertEqual(v["fundi"]["event"], "CHAPTER_HINT")
-        self.assertEqual(v["fundi"]["chapter"]["n"], 1)
-        # Classified failure: the instant template answers, no model call.
-        self.assertIn("SDA and SCL", v["fundi"]["hint"])
-        self.assertEqual(self.orc.Muse.calls, [])
-        self.assertIn("CHAPTER_HINT", seen)
-        self.assertEqual(v["step_index"], 0)
-        self.assertNotIn("celebration", v["fundi"])  # cheer only on passes
-        # Classified failure: speech still carries measured plus the hint.
-        self.assertIn("I2C found", v["speak"])
-        self.assertIn("SDA and SCL", v["speak"])
-        # ...and the step's runnable code is attached, not just described.
-        self.assertEqual(v["step_code"]["source"], "template")
-        self.assertEqual(v["step_code"]["n"], 1)
-        self.assertIn("scan done", v["step_code"]["code"])
-
-    def test_silent_serial_fail_speaks_hint_and_attaches_code(self):
-        plan = [{"n": 1, "instruction": "Wire the serial link.",
-                 "verify": "CHECK_SERIAL", "expect": {},
-                 "depends_on_parts": []}]
-        self.start(plan, [])
-        silent = ProbeReading(
-            connected=False, i2c_devices=[], temperature_c=None,
-            humidity_pct=None, pressure_hpa=None, oled_ok=None, led_ok=None,
-            mock=False, raw=json.dumps({"ping": {
-                "cmd": "PING", "error": "no PING reply on COM3, COM9",
-                "board_state": "silent:COM9"}}))
-        with mock.patch.object(self.orc.probe, "read_all",
-                               return_value=silent):
-            v = self.orc.check_now(CheckNowRequest())
-        self.assertEqual(v["fundi"]["event"], "CHAPTER_HINT")
-        self.assertEqual(v["fundi"]["hint"],
-                         "The board on COM9 never answers. Flash the patient "
-                         "sketch, then press CHECK NOW.")
-        # Known failure: the port dump stays on screen, speech is guidance.
-        self.assertEqual(v["speak"], v["fundi"]["hint"])
-        self.assertEqual(v["instruction"], v["speak"])
-        self.assertNotIn("no live serial traffic", v["speak"])
-        self.assertEqual(v["step_code"]["source"], "patient")
-        self.assertIn("PING", v["step_code"]["code"])
-        # Template chapters + instant hint: no model calls at all.
-        self.assertEqual(len(self.orc.Muse.calls), 0)
-
-    def test_unverifiable_asks_then_confirms_to_done(self):
-        one = [dict(PLAN[1])]
-        one_ch = [dict(c) for c in CHAPTERS[1:]]
-        self.start(one, [json.dumps({"chapters": one_ch})])
-        with mock.patch.object(self.orc.probe, "read_all",
-                               return_value=GPIO_UNKNOWN):
-            v = self.orc.check_now(CheckNowRequest())
-        self.assertEqual(v["fundi"]["event"], "CHAPTER_HINT")
-        self.assertIn("CONFIRM", v["confirm_pending"]["question"])
-        v = self.orc.confirm_learning_step("fundi-1", True)
-        self.assertEqual(v["fundi"]["event"], "LESSON_DONE")
-        self.assertTrue(v["code_ready"])
-
-    def test_final_pass_emits_lesson_done(self):
+    def test_escape_finishes_final_step_to_lesson_done(self):
         one = [dict(PLAN[0])]
-        self.start(one, [json.dumps({"chapters": [CHAPTERS[0]]})])
-        with mock.patch.object(self.orc.probe, "read_all",
-                               return_value=I2C_OK):
-            v = self.orc.check_now(CheckNowRequest())
+        self.start(one, [])
+        v = self.orc.advance_learning_step("fundi-1", "mark complete anyway")
         self.assertEqual(v["state"], "DONE")
         self.assertEqual(v["fundi"]["event"], "LESSON_DONE")
         self.assertEqual(v["fundi"]["chapters_total"], 1)
         self.assertIn("Boom", v["speak"])
 
+    def test_lesson_done_carries_stretch(self):
+        one = [dict(PLAN[0])]
+        self.start(one, [])
+        v = self.orc.advance_learning_step("fundi-1", "mark complete anyway")
+        self.assertEqual(v["fundi"]["event"], "LESSON_DONE")
+        stretch = v["fundi"]["stretch"]
+        self.assertGreaterEqual(len(stretch), 1)
+        self.assertLessEqual(len(stretch), 2)
+        self.assertIn("more", v["speak"])
+        # Advancing past DONE re-serves the same stretch.
+        again = self.orc.advance_learning_step("fundi-1", "done")
+        self.assertEqual(again["fundi"]["stretch"], stretch)
 
-class BuildHintGuardTest(unittest.TestCase):
-    STEP = {"n": 1, "instruction": "wire it"}
-    VER = {"test": "CHECK_SERIAL",
-           "measured": "no live serial traffic (board silent)"}
-
-    def test_refusal_blob_falls_back(self):
-        blob = '{"refusal": "Loud refusal triggered:\\n[dev]: be brief"}'
-        hint = build_hint(self.STEP, self.VER, StubBrain([blob]))
-        self.assertIn("Check the wiring for step 1", hint)
-        self.assertNotIn("refusal", hint)
-        # The caller already speaks measured; the hint must not repeat it.
-        self.assertNotIn("no live serial traffic", hint)
-
-    def test_prose_refusal_falls_back(self):
-        hint = build_hint(self.STEP, self.VER,
-                          StubBrain(["Loud refusal triggered: caps conflict"]))
-        self.assertIn("Check the wiring for step 1", hint)
-
-    def test_good_hint_passes_through_caps_and_all(self):
-        hint = build_hint(self.STEP, self.VER,
-                          StubBrain(["Reseat the SDA wire."]))
-        self.assertEqual(hint, "Reseat the SDA wire.")
-
-    def test_model_error_falls_back(self):
-        hint = build_hint(self.STEP, self.VER,
-                          StubBrain([RuntimeError("boom")]))
-        self.assertIn("Check the wiring for step 1", hint)
-        self.assertNotIn("no live serial traffic", hint)
-
-    def test_known_board_states_skip_model(self):
-        for state, needle in (
-            ("silent:COM11", "COM11"),
-            ("unreachable:COM9", "COM9"),
-            ("no_usb", "USB"),
-            ("no_ports", "USB"),
-        ):
-            brain = StubBrain(["model hint"])
-            hint = build_hint(self.STEP, dict(self.VER, board_state=state),
-                              brain)
-            self.assertEqual(brain.calls, [], state)
-            self.assertIn(needle, hint, state)
-            self.assertIn("CHECK NOW", hint, state)
-
-    def test_classified_sensor_failures_skip_model(self):
-        cases = (
-            ({"test": "RUN_I2C_SCAN",
-              "measured": "I2C found [0x3C] MISSING 0x76"}, "SDA"),
-            ({"test": "READ_SENSOR",
-              "measured": "sensor read failed"}, "power"),
-        )
-        for ver, needle in cases:
-            brain = StubBrain(["model hint"])
-            hint = build_hint(self.STEP, ver, brain)
-            self.assertEqual(brain.calls, [], ver)
-            self.assertIn(needle, hint, ver)
-            self.assertIn("CHECK NOW", hint, ver)
+    def test_stretch_prefetch_upgrades_to_model(self):
+        one = [dict(PLAN[0])]
+        self.start(one, [])
+        give = {"stretch": [{"title": "Model stretch",
+                             "summary": "A model-written next step."}]}
+        self.orc.Muse = StubBrain([json.dumps(give)])
+        self.orc._prefetch_stretch()
+        self.assertEqual(self.orc.session["stretch"], give["stretch"])
+        v = self.orc.advance_learning_step("fundi-1", "mark complete anyway")
+        self.assertEqual(v["fundi"]["stretch"], give["stretch"])
+        self.assertIn("model-written", v["speak"])
 
 
-class SerialMeasuredTruncationTest(unittest.TestCase):
-    def _check(self, error):
-        reading = ProbeReading(
-            connected=False, i2c_devices=[], temperature_c=None,
-            humidity_pct=None, pressure_hpa=None, oled_ok=None, led_ok=None,
-            mock=False, raw=json.dumps({"ping": {"cmd": "PING", "error": error}}))
-        return run_learning_verification(
-            "CHECK_SERIAL", {}, reading, pin_map_for("esp32_devkit"))
+class TutorBeatTest(unittest.TestCase):
+    """Dynamic tutor beats: every chapter carries a check-in question,
+    accepted answers, and a diagnostic question, model-written when
+    possible and derived from step data otherwise."""
 
-    def test_long_error_truncates_at_word_boundary(self):
-        v = self._check("COM3: could not open port 'COM3': "
-                        "FileNotFoundError(2, 'The system cannot find the "
-                        "file specified.', None, 2) and then some more text")
-        self.assertFalse(v["passed"])
-        self.assertTrue(v["measured"].endswith("…)"), v["measured"])
-        self.assertLessEqual(len(v["measured"]), len(
-            "no live serial traffic ()") + 120)
+    def test_template_chapters_carry_complete_beats(self):
+        out = template_chapters(PLAN)
+        for ch in out:
+            self.assertTrue(str(ch["question"] or "").strip(), ch)
+            self.assertTrue(ch["answers"], ch)
+            self.assertTrue(str(ch["diagnose"] or "").strip(), ch)
 
-    def test_short_error_passes_through_whole(self):
-        v = self._check("board silent")
-        self.assertEqual(v["measured"],
-                         "no live serial traffic (board silent)")
-        self.assertEqual(v["board_state"], "")
+    def test_beat_question_targets_step_pins(self):
+        plan = [{"n": 1, "instruction": "Wire TRIG to GPIO5 and ECHO to GPIO13.",
+                 "verify": "CHECK_GPIO", "expect": {},
+                 "depends_on_parts": ["hc-sr04"]}]
+        (ch,) = template_chapters(plan)
+        self.assertIn("pin", ch["question"].lower())
+        self.assertTrue(ch["question"].strip().endswith("?"))
+        flat = [kw for alt in ch["answers"] for kw in alt]
+        self.assertIn("5", flat)
+        self.assertIn("13", flat)
 
-    def test_board_state_carried_from_ping(self):
-        reading = ProbeReading(
-            connected=False, i2c_devices=[], temperature_c=None,
-            humidity_pct=None, pressure_hpa=None, oled_ok=None, led_ok=None,
-            mock=False, raw=json.dumps({"ping": {"cmd": "PING",
-                                                "error": "no PING reply",
-                                                "board_state": "silent:COM11"}}))
-        v = run_learning_verification(
-            "CHECK_SERIAL", {}, reading, pin_map_for("esp32_devkit"))
-        self.assertEqual(v["board_state"], "silent:COM11")
+    def test_beat_completed_when_model_omits_fields(self):
+        brain = StubBrain([json.dumps({"chapters": CHAPTERS})])
+        out = plan_chapters(PLAN, brain, "Blink")
+        for ch in out:
+            self.assertTrue(str(ch["question"] or "").strip(), ch)
+            self.assertTrue(ch["answers"], ch)
+            self.assertTrue(str(ch["diagnose"] or "").strip(), ch)
+
+    def test_beat_keeps_model_beats(self):
+        give = [dict(CHAPTERS[0], question="Which pin?",
+                     answers=[["5"]], diagnose="Quiet pin?"),
+                dict(CHAPTERS[1], question="What blinks?",
+                     answers=[["led"]], diagnose="Dark LED?")]
+        brain = StubBrain([json.dumps({"chapters": give})])
+        out = plan_chapters(PLAN, brain, "Blink")
+        self.assertEqual(out[0]["question"], "Which pin?")
+        self.assertEqual(out[0]["answers"], [["5"]])
+        self.assertEqual(out[1]["diagnose"], "Dark LED?")
+
+    def test_diagnose_templates_cover_all_tests(self):
+        from backend.app.fundi import diagnose_for
+
+        for test in ("CHECK_GPIO", "CHECK_SERIAL", "RUN_I2C_SCAN",
+                     "READ_SENSOR", "CHECK_OLED"):
+            self.assertTrue(diagnose_for(test).strip(), test)
+        self.assertTrue(diagnose_for("NOPE").strip())
+
+    def test_question_and_diagnose_follow_pin_repair(self):
+        from backend.app.schematic import build_netlist, repair_chapters_pins
+
+        pin_map = pin_map_for("esp32_devkit")
+        plan = [{"n": 1,
+                 "instruction": "Connect the DHT22 DATA pin to GPIO18.",
+                 "verify": "CHECK_SERIAL", "depends_on_parts": ["dht22"]}]
+        board = next(w["board_pin"] for w in build_netlist(
+            plan, 1, pin_map)["wires"]
+            if w["part"] == "dht22" and w["part_pin"] == "DATA")
+        self.assertNotEqual(board, "GPIO18")  # the test must rewrite
+        (fixed,) = repair_chapters_pins(
+            [{"n": 1, "title": "T", "teach": "t", "task": "t",
+              "verify": "CHECK_SERIAL", "celebration": "",
+              "question": "Which pin is DATA on, GPIO18?",
+              "answers": [], "diagnose": "Is DATA on GPIO18?"}],
+            plan, pin_map)
+        self.assertIn(board, fixed["question"])
+        self.assertIn(board, fixed["diagnose"])
+
+
+class ChapterNarrationTest(unittest.TestCase):
+    """Every chapter teaches the principle (why) and chains the fix
+    (troubleshoot): model-written when possible, derived from step
+    data otherwise."""
+
+    def test_templates_carry_why_and_troubleshoot(self):
+        out = template_chapters(PLAN)
+        self.assertEqual(len(out), 2)
+        for ch in out:
+            self.assertTrue(str(ch.get("why") or "").strip(), ch)
+            tips = ch.get("troubleshoot")
+            self.assertIsInstance(tips, list, ch)
+            self.assertGreaterEqual(len(tips), 1, ch)
+            self.assertTrue(all(str(t).strip() for t in tips), ch)
+
+    def test_narration_differs_by_verify(self):
+        out = template_chapters(PLAN)
+        self.assertNotEqual(out[0]["why"], out[1]["why"])
+        self.assertNotEqual(out[0]["troubleshoot"], out[1]["troubleshoot"])
+
+    def test_troubleshoot_leads_with_diagnose(self):
+        out = template_chapters(PLAN)
+        self.assertIn("SDA and SCL", out[0]["troubleshoot"][0])
+
+    def test_complete_beat_fills_missing_narration(self):
+        beat = {"n": 1, "title": "t", "teach": "x", "task": "y",
+                "verify": "RUN_I2C_SCAN", "celebration": ""}
+        out = complete_beat(beat, PLAN[0])
+        self.assertTrue(str(out["why"]).strip())
+        self.assertIsInstance(out["troubleshoot"], list)
+        self.assertGreaterEqual(len(out["troubleshoot"]), 1)
+
+    def test_complete_beat_keeps_model_narration(self):
+        beat = dict(CHAPTERS[0], troubleshoot=["Model tip."])
+        out = complete_beat(beat, PLAN[0])
+        self.assertEqual(out["why"], CHAPTERS[0]["why"])
+        self.assertEqual(out["troubleshoot"], ["Model tip."])
+
+    def test_complete_beat_repairs_bad_narration_types(self):
+        beat = dict(CHAPTERS[0], why=["not", "a", "string"],
+                    troubleshoot="a string, not a list")
+        out = complete_beat(beat, PLAN[0])
+        self.assertIsInstance(out["why"], str)
+        self.assertTrue(out["why"].strip())
+        self.assertIsInstance(out["troubleshoot"], list)
+        self.assertTrue(all(isinstance(t, str) and t.strip()
+                            for t in out["troubleshoot"]))
+
+    def test_model_narration_survives_plan_chapters(self):
+        give = [dict(CHAPTERS[0], troubleshoot=["Model tip."]), CHAPTERS[1]]
+        brain = StubBrain([json.dumps({"chapters": give})])
+        out = plan_chapters(PLAN, brain, "Blink")
+        self.assertEqual(out[0]["why"], CHAPTERS[0]["why"])
+        self.assertEqual(out[0]["troubleshoot"], ["Model tip."])
+        self.assertEqual(out[1]["why"], CHAPTERS[1]["why"])
+
+
+class RollcallTest(unittest.TestCase):
+    """Roll call inventories the live parts data: nothing to invent,
+    so it is always derived — and always accurate."""
+
+    def test_rollcall_names_missing_parts(self):
+        rc = complete_rollcall(None, ["esp32"], ["hc-sr04", "buzzer"])
+        self.assertIn("hc-sr04", rc["say"])
+        self.assertIn("buzzer", rc["say"])
+        self.assertIn("3", rc["say"])
+        self.assertTrue(rc["question"].strip().endswith("?"))
+        flat = [kw for alt in rc["answers"] for kw in alt]
+        self.assertIn("ready", flat)
+
+    def test_rollcall_all_present_says_so(self):
+        rc = complete_rollcall(None, ["esp32", "hc-sr04"], [])
+        self.assertIn("all", rc["say"].lower())
+        self.assertNotIn("missing", rc["say"].lower())
+
+    def test_rollcall_without_inventory_stays_honest(self):
+        rc = complete_rollcall(None, [], [])
+        self.assertTrue(rc["say"].strip())
+        self.assertTrue(rc["question"].strip().endswith("?"))
+        flat = [kw for alt in rc["answers"] for kw in alt]
+        self.assertIn("ready", flat)
+
+    def test_rollcall_accepts_readies(self):
+        rc = complete_rollcall(None, ["esp32"], ["hc-sr04"])
+        for msg in ("ready", "yes ready", "we are ready", "let's go",
+                    "all here", "yep, done"):
+            self.assertTrue(rollcall_accepts(msg, rc["answers"]), msg)
+
+    def test_rollcall_rejects_holds_and_negations(self):
+        rc = complete_rollcall(None, ["esp32"], ["hc-sr04"])
+        for msg in ("wait", "not ready", "hold on", "no", "not yet",
+                    "give me a minute", "don't mark me ready yet",
+                    "i'm not ready"):
+            self.assertFalse(rollcall_accepts(msg, rc["answers"]), msg)
+
+
+class StretchTest(unittest.TestCase):
+    """DONE earns model-written stretch ideas grounded in the project;
+    the fallback stays honest when the model is away."""
+
+    def test_fallback_suggests_grounded_ideas(self):
+        brain = StubBrain([])
+        brain.mock = True
+        out = plan_stretch("Blink", PLAN, ["led"], [], brain)
+        self.assertGreaterEqual(len(out), 1)
+        self.assertLessEqual(len(out), 2)
+        for idea in out:
+            self.assertTrue(str(idea["title"]).strip(), idea)
+            self.assertTrue(str(idea["summary"]).strip(), idea)
+            self.assertIn("Blink", idea["summary"], idea)
+        self.assertEqual(brain.calls, [])
+
+    def test_model_stretch_used_verbatim(self):
+        give = {"stretch": [
+            {"title": "Model idea", "summary": "A model-written stretch."}]}
+        brain = StubBrain([json.dumps(give)])
+        out = plan_stretch("Blink", PLAN, ["led"], [], brain)
+        self.assertEqual(out, give["stretch"])
+        self.assertEqual(len(brain.calls), 1)
+
+    def test_bad_model_stretch_falls_back(self):
+        brain = StubBrain(["not json",
+                           json.dumps({"stretch": [{"title": "  "}]})])
+        out = plan_stretch("Blink", PLAN, ["led"], [], brain)
+        self.assertGreaterEqual(len(out), 1)
+        for idea in out:
+            self.assertTrue(str(idea["title"]).strip(), idea)
+            self.assertIn("Blink", idea["summary"], idea)
 
 
 if __name__ == "__main__":

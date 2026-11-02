@@ -181,6 +181,81 @@ def flash_artifacts(artifacts: list, port: str, runner=None) -> dict:
     return {"ok": True, "log_excerpt": _excerpt(log)}
 
 
+_PROGRESS_RE = re.compile(r"\((\d+(?:\.\d+)?)\s*%\)")
+
+
+def flash_artifacts_stream(artifacts: list, port: str, popen=None):
+    """Streaming flash: yields log lines + progress, then the result.
+
+    Yields {"event": "log", "line": str} per esptool output segment
+    (carriage-return progress redraws split apart),
+    {"event": "progress", "fraction": 0..1} for "(NN %)" write lines,
+    then exactly one {"event": "result", "ok": bool,
+    "log_excerpt": str}. Same command and error semantics as
+    flash_artifacts; only `popen` (subprocess.Popen-compatible) is
+    injectable for hermetic tests.
+    """
+    if not artifacts:
+        yield {"event": "result", "ok": False,
+               "log_excerpt": "nothing to flash: no binaries"}
+        return
+    cmd = [*esptool_cmd(), "--port", port, "--baud", str(esptool_baud()),
+           "write_flash", "-z"]
+    for artifact in artifacts:
+        cmd += [str(artifact.get("offset")), str(artifact.get("file"))]
+    spawn = popen or subprocess.Popen
+    try:
+        proc = spawn(cmd, stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT, text=True)
+    except FileNotFoundError:
+        yield {"event": "result", "ok": False,
+               "log_excerpt": "esptool not found: pip install esptool "
+               "(see README) or set ESPTOOL_BIN"}
+        return
+    log_lines: list[str] = []
+    deadline = time.monotonic() + esptool_timeout()
+    timed_out = False
+    while True:
+        line = proc.stdout.readline()
+        if line:
+            log_lines.append(line)
+            for segment in line.replace("\r", "\n").split("\n"):
+                segment = segment.strip()
+                if not segment:
+                    continue
+                yield {"event": "log", "line": segment}
+                match = _PROGRESS_RE.search(segment)
+                if match:
+                    try:
+                        pct = float(match.group(1))
+                    except ValueError:
+                        continue
+                    yield {"event": "progress",
+                           "fraction": min(1.0, max(0.0, pct / 100.0))}
+        elif proc.poll() is not None:
+            break
+        elif time.monotonic() > deadline:
+            try:
+                proc.kill()
+            except Exception:
+                pass  # already gone; the timeout below still reports
+            timed_out = True
+            break
+        else:
+            time.sleep(0.01)
+    if timed_out:
+        yield {"event": "result", "ok": False,
+               "log_excerpt": "esptool timed out after %ss"
+               % esptool_timeout()}
+        return
+    log = "".join(log_lines)
+    if proc.returncode != 0:
+        yield {"event": "result", "ok": False,
+               "log_excerpt": _excerpt(log) or "esptool failed"}
+        return
+    yield {"event": "result", "ok": True, "log_excerpt": _excerpt(log)}
+
+
 def settle_before_ping(probe) -> None:
     """Let a freshly flashed board reboot (skipped for mock probes)."""
     if getattr(probe, "mock", False):
@@ -206,9 +281,12 @@ def verify_ping(probe) -> dict:
             "reply": str(reply.get("status") or reply.get("error") or reply)[:200]}
 
 
-def audit_flash(session_id: str, step_n: int, port: str, build_hash: str,
+def audit_flash(session_id: str, step_n, port: str, build_hash: str,
                 ok: bool, reason: str, detail: str = "") -> None:
-    """Append one flash event to the hash-chained audit trail."""
+    """Append one flash event to the hash-chained audit trail.
+
+    `step_n` is the step number, or "final" for project firmware.
+    """
     audit_rail("flash", session_id=session_id, tool="flash",
                args={"step": step_n, "port": port,
                      "build_hash": build_hash},

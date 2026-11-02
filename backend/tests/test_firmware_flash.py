@@ -23,6 +23,41 @@ ARTIFACTS = [{"offset": "0x1000", "file": "boot.bin"},
              {"offset": "0x10000", "file": "sketch.bin"}]
 
 
+class FakePopen:
+    """Scripted subprocess.Popen: yields output lines, then a returncode."""
+
+    def __init__(self, lines, returncode=0, hang=False):
+        self._lines = [(l if l.endswith("\n") else l + "\n")
+                       for l in lines]
+        self._rc = returncode
+        self._hang = hang
+        self.returncode = None
+        self.killed = False
+        self.cmd = None
+
+    def __call__(self, *args, **kwargs):
+        self.cmd = args[0] if args else None
+        return self
+
+    @property
+    def stdout(self):
+        return self
+
+    def readline(self):
+        if self._lines:
+            return self._lines.pop(0)
+        if not self._hang:
+            self.returncode = self._rc
+        return ""
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
 class EsptoolCmdTest(unittest.TestCase):
     def test_env_override_wins(self):
         with mock.patch.dict(os.environ, {"ESPTOOL_BIN": "custom-esptool"}):
@@ -93,6 +128,49 @@ class FlashArtifactsTest(unittest.TestCase):
                                  runner=lambda *a, **k: None)
         self.assertFalse(out["ok"])
         self.assertIn("nothing to flash", out["log_excerpt"])
+
+
+class FlashStreamTest(unittest.TestCase):
+    """Streaming flash yields log lines + progress, then the result."""
+
+    def test_lines_progress_then_ok(self):
+        fake = FakePopen(["esptool.py v4.8\n",
+                          "Writing at 0x00010000... (50 %)\n",
+                          "Wrote 16 bytes\n"], 0)
+        events = list(ff.flash_artifacts_stream(ARTIFACTS, "COM3",
+                                                popen=fake))
+        kinds = [e["event"] for e in events]
+        self.assertIn("log", kinds)
+        self.assertIn("progress", kinds)
+        self.assertEqual(kinds[-1], "result")
+        self.assertTrue(events[-1]["ok"])
+        prog = [e for e in events if e["event"] == "progress"]
+        self.assertEqual(prog[0]["fraction"], 0.5)
+        self.assertIn("write_flash", fake.cmd)
+        self.assertIn("COM3", fake.cmd)
+
+    def test_failure_result(self):
+        fake = FakePopen(["esptool: chip sync error\n"], 2)
+        events = list(ff.flash_artifacts_stream(ARTIFACTS, "COM3",
+                                                popen=fake))
+        self.assertFalse(events[-1]["ok"])
+        self.assertIn("chip sync", events[-1]["log_excerpt"])
+
+    def test_no_artifacts_refuses(self):
+        events = list(ff.flash_artifacts_stream([], "COM3",
+                                                popen=FakePopen([])))
+        self.assertFalse(events[-1]["ok"])
+        self.assertIn("nothing to flash", events[-1]["log_excerpt"])
+
+    def test_hung_esptool_is_killed(self):
+        fake = FakePopen([], 0, hang=True)
+        with mock.patch("backend.app.firmware_flash.esptool_timeout",
+                        return_value=0.05):
+            events = list(ff.flash_artifacts_stream(ARTIFACTS, "COM3",
+                                                    popen=fake))
+        self.assertTrue(fake.killed)
+        self.assertFalse(events[-1]["ok"])
+        self.assertIn("timed out", events[-1]["log_excerpt"])
 
 
 class BusyPortTest(unittest.TestCase):
@@ -193,7 +271,7 @@ class VerifyPingTest(unittest.TestCase):
         nap.assert_not_called()
 
 
-class FlashEndpointTest(unittest.TestCase):
+class FlashHarnessTest(unittest.TestCase):
     def setUp(self):
         import backend.app.main as app_main
 
@@ -202,7 +280,7 @@ class FlashEndpointTest(unittest.TestCase):
                       "expect": {}, "depends_on_parts": ["led"]}]
         self.session = {"learning": True, "board": "esp32_devkit",
                         "pin_map": pin_map_for("esp32_devkit"),
-                        "plan": self.plan, "step_code": {}}
+                        "plan": self.plan}
         self.orc_closed, self.live_closed = [], []
         orc_probe = SimpleNamespace(
             mock=True, close=lambda: self.orc_closed.append(True),
@@ -254,14 +332,16 @@ class FlashEndpointTest(unittest.TestCase):
         self.assertTrue(verify_audit_chain(events))
         return [e for e in events if e.get("event") == "flash"]
 
+class FlashEndpointTest(FlashHarnessTest):
     def test_success_releases_handles_and_audits(self):
         self._stub_pipeline()
-        out = self.app_main.api_step_flash("s1", 1, {"port": "COM3"})
+        out = self.app_main.api_project_flash("s1", {"port": "COM3"})
         self.assertTrue(out["ok"])
+        self.assertTrue(out["final"])
         self.assertEqual(out["build_hash"], "abc123")
         self.assertEqual(out["port"], "COM3")
         self.assertTrue(out["verify_ping"]["answered"])
-        self.assertEqual(out["source"], "template")
+        self.assertEqual(out["source"], "final")
         self.assertTrue(self.orc_closed)
         self.assertTrue(self.live_closed)
         flashes = self._audit_events()
@@ -275,7 +355,7 @@ class FlashEndpointTest(unittest.TestCase):
         self._stub_pipeline(flash_ok=False,
                             flash_log="could not open port 'COM3'")
         with self.assertRaises(HTTPException) as ctx:
-            self.app_main.api_step_flash("s1", 1, {"port": "COM3"})
+            self.app_main.api_project_flash("s1", {"port": "COM3"})
         self.assertEqual(ctx.exception.status_code, 500)
         self.assertIn("Serial Monitor", ctx.exception.detail)
         flashes = self._audit_events()
@@ -287,7 +367,7 @@ class FlashEndpointTest(unittest.TestCase):
 
         self._stub_pipeline(build_ok=False)
         with self.assertRaises(HTTPException) as ctx:
-            self.app_main.api_step_flash("s1", 1, {"port": "COM3"})
+            self.app_main.api_project_flash("s1", {"port": "COM3"})
         self.assertEqual(ctx.exception.status_code, 500)
         self.assertIn("compile failed", ctx.exception.detail)
         self.assertEqual(len(self._audit_events()), 1)
@@ -298,15 +378,7 @@ class FlashEndpointTest(unittest.TestCase):
 
         self._stub_pipeline()
         with self.assertRaises(HTTPException) as ctx:
-            self.app_main.api_step_flash("nope", 1, {"port": "COM3"})
-        self.assertEqual(ctx.exception.status_code, 404)
-
-    def test_unknown_step_is_404(self):
-        from fastapi import HTTPException
-
-        self._stub_pipeline()
-        with self.assertRaises(HTTPException) as ctx:
-            self.app_main.api_step_flash("s1", 7, {"port": "COM3"})
+            self.app_main.api_project_flash("nope", {"port": "COM3"})
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_uno_board_is_400(self):
@@ -315,7 +387,7 @@ class FlashEndpointTest(unittest.TestCase):
         self.session["board"] = "arduino_uno"
         self._stub_pipeline()
         with self.assertRaises(HTTPException) as ctx:
-            self.app_main.api_step_flash("s1", 1, {"port": "COM3"})
+            self.app_main.api_project_flash("s1", {"port": "COM3"})
         self.assertEqual(ctx.exception.status_code, 400)
 
     def test_missing_port_is_400(self):
@@ -323,7 +395,7 @@ class FlashEndpointTest(unittest.TestCase):
 
         self._stub_pipeline()
         with self.assertRaises(HTTPException) as ctx:
-            self.app_main.api_step_flash("s1", 1, {"port": " "})
+            self.app_main.api_project_flash("s1", {"port": " "})
         self.assertEqual(ctx.exception.status_code, 400)
 
     def test_busy_port_fails_fast_with_409(self):
@@ -336,7 +408,7 @@ class FlashEndpointTest(unittest.TestCase):
             with mock.patch(
                     "backend.app.firmware_build.compile_sketch") as comp:
                 with self.assertRaises(HTTPException) as ctx:
-                    self.app_main.api_step_flash("s1", 1, {"port": "COM3"})
+                    self.app_main.api_project_flash("s1", {"port": "COM3"})
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertIn("Serial Monitor", ctx.exception.detail)
         comp.assert_not_called()
@@ -357,8 +429,8 @@ class FlashEndpointTest(unittest.TestCase):
                 with mock.patch(
                         "backend.app.firmware_build.compile_sketch") as comp:
                     with self.assertRaises(HTTPException) as ctx:
-                        self.app_main.api_step_flash(
-                            "s1", 1, {"port": "COM3"})
+                        self.app_main.api_project_flash(
+                            "s1", {"port": "COM3"})
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertIn("does not exist", ctx.exception.detail)
         self.assertIn("COM4, COM5", ctx.exception.detail)
@@ -379,9 +451,93 @@ class FlashEndpointTest(unittest.TestCase):
                     "backend.app.firmware_flash.available_ports",
                     return_value=[]):
                 with self.assertRaises(HTTPException) as ctx:
-                    self.app_main.api_step_flash("s1", 1, {"port": "COM3"})
+                    self.app_main.api_project_flash("s1", {"port": "COM3"})
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertIn("No serial ports found", ctx.exception.detail)
+
+
+class StreamEndpointTest(FlashHarnessTest):
+    """SSE flash streams: same validation, audit, and payload as the
+    blocking endpoints, with live log lines before the done frame."""
+
+    def _frames(self, gen):
+        import json
+
+        out = []
+        for chunk in gen:
+            for frame in str(chunk).split("\n\n"):
+                name, data = "", ""
+                for line in frame.split("\n"):
+                    if line.startswith("event:"):
+                        name = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data += line[5:].strip()
+                if name or data:
+                    out.append((name, json.loads(data or "null")))
+        return out
+
+    def _stub_stream(self, build_ok=True, flash_ok=True):
+        build = {"ok": build_ok, "build_hash": "abc123",
+                 "build_dir": self.tmp.name, "artifacts": ARTIFACTS,
+                 "fqbn": "esp32:esp32:esp32",
+                 "log_excerpt": "" if build_ok else "compile boom",
+                 "cached": False}
+
+        def fake_compile(*args, **kwargs):
+            yield {"event": "log", "line": "compiling…"}
+            yield {"event": "result", "build": build}
+
+        def fake_flash(*args, **kwargs):
+            yield {"event": "log", "line": "writing…"}
+            yield {"event": "result", "ok": flash_ok,
+                   "log_excerpt": "" if flash_ok else "chip sync error"}
+
+        c_patch = mock.patch(
+            "backend.app.firmware_build.compile_sketch_stream",
+            side_effect=fake_compile)
+        f_patch = mock.patch(
+            "backend.app.firmware_flash.flash_artifacts_stream",
+            side_effect=fake_flash)
+        c_patch.start()
+        f_patch.start()
+        self.addCleanup(c_patch.stop)
+        self.addCleanup(f_patch.stop)
+
+    def test_final_stream_logs_then_done(self):
+        self._stub_stream()
+        frames = self._frames(self.app_main.iter_final_flash_events(
+            "s1", "COM3", "// final"))
+        names = [n for n, _ in frames]
+        self.assertIn("log", names)
+        self.assertEqual(names[-1], "done")
+        done = frames[-1][1]
+        self.assertTrue(done["ok"])
+        self.assertTrue(done["final"])
+        self.assertEqual(done["build_hash"], "abc123")
+        self.assertEqual(done["port"], "COM3")
+        self.assertTrue(self.orc_closed)
+        self.assertTrue(self.live_closed)
+        flashes = self._audit_events()
+        self.assertEqual(len(flashes), 1)
+        self.assertTrue(flashes[0]["ok"])
+
+    def test_final_stream_flash_failure_is_error_event(self):
+        self._stub_stream(flash_ok=False)
+        frames = self._frames(self.app_main.iter_final_flash_events(
+            "s1", "COM3", "// final"))
+        self.assertEqual(frames[-1][0], "error")
+        self.assertIn("chip sync", frames[-1][1]["detail"])
+        flashes = self._audit_events()
+        self.assertEqual(len(flashes), 1)
+        self.assertFalse(flashes[0]["ok"])
+
+    def test_final_stream_unknown_session_is_404(self):
+        from fastapi import HTTPException
+
+        self._stub_stream()
+        with self.assertRaises(HTTPException) as ctx:
+            self.app_main.api_project_flash_stream("nope", {"port": "COM3"})
+        self.assertEqual(ctx.exception.status_code, 404)
 
 
 if __name__ == "__main__":

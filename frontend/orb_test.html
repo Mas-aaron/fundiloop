@@ -1,0 +1,159 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Orb Test</title>
+<style>
+  body { background:#0b0b0f; display:flex; flex-direction:column; align-items:center; padding:40px; font-family:sans-serif; color:#aaa; }
+  canvas { display:block; }
+  #log { margin-top:16px; font-size:12px; font-family:monospace; color:lime; white-space:pre; }
+  .controls { margin-top:16px; display:flex; gap:12px; }
+  button { background:#1a1a2a; border:1px solid #333; color:#fff; padding:8px 18px; border-radius:8px; cursor:pointer; font-size:14px; }
+  button:hover { background:#2a2a4a; }
+</style>
+</head>
+<body>
+<canvas id="c" width="320" height="320"></canvas>
+<div class="controls">
+  <button onclick="setMode('idle')">Idle</button>
+  <button onclick="setMode('listen')">Listen</button>
+  <button onclick="setMode('speak')">Speak</button>
+  <button onclick="setMode('think')">Think</button>
+</div>
+<div id="log">starting…</div>
+<script>
+const log = document.getElementById('log');
+let logLines = [];
+function say(msg) {
+  logLines.push(msg);
+  if (logLines.length > 8) logLines.shift();
+  log.textContent = logLines.join('\n');
+}
+
+const canvas = document.getElementById('c');
+let _mode = 'idle', _level = 0, rotY = 0;
+const TILT = 0.30, sinX = Math.sin(TILT), cosX = Math.cos(TILT);
+
+// Geometry
+const NODE_COUNT = 48;
+function fibSphere(n) {
+  const pts = [], phi = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < n; i++) {
+    const y = 1 - (i / (n-1)) * 2;
+    const r = Math.sqrt(Math.max(0, 1-y*y));
+    pts.push([Math.cos(phi*i)*r, y, Math.sin(phi*i)*r]);
+  }
+  return pts;
+}
+const BASE = fibSphere(NODE_COUNT);
+const EDGES = [];
+for (let i=0; i<NODE_COUNT; i++) for (let j=i+1; j<NODE_COUNT; j++) {
+  const [ax,ay,az]=BASE[i],[bx,by,bz]=BASE[j];
+  if (Math.sqrt((ax-bx)**2+(ay-by)**2+(az-bz)**2) < 0.58) EDGES.push([i,j]);
+}
+say('nodes:'+BASE.length+' edges:'+EDGES.length);
+
+const C = {
+  idle:   {er:0,  eg:210,eb:180,nr:120,ng:255,nb:220,hr:30, hg:0,  hb:120},
+  listen: {er:0,  eg:230,eb:230,nr:180,ng:255,nb:255,hr:0,  hg:80, hb:160},
+  speak:  {er:140,eg:80, eb:255,nr:210,ng:140,nb:255,hr:100,hg:0,  hb:200},
+  think:  {er:200,eg:160,eb:20, nr:255,ng:220,nb:60, hr:100,hg:50, hb:0  },
+};
+
+function drawMesh(lvl, t, state) {
+  const W=canvas.width, H=canvas.height;
+  const ctx=canvas.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+  const c=C[state]||C.idle, cx=W/2, cy=H/2;
+  const baseR=Math.min(W,H)*0.37;
+  const pulse = state==='speak' ? lvl*0.45+0.04*Math.sin(t/50)
+              : state==='listen' ? lvl*0.28+0.03*Math.sin(t/70)
+              : 0.03*Math.sin(t/1400);
+  const R = baseR*(1+pulse);
+  // Haze
+  const hazeR=Math.min(W,H)*(0.46+lvl*0.22);
+  const hg=ctx.createRadialGradient(cx,cy,0,cx,cy,hazeR);
+  const ha=(0.30+lvl*0.40).toFixed(2);
+  hg.addColorStop(0,  `rgba(${c.hr},${c.hg},${c.hb},${ha})`);
+  hg.addColorStop(0.55,`rgba(${c.hr},${c.hg},${c.hb},${(ha*0.3).toFixed(2)})`);
+  hg.addColorStop(1,  `rgba(${c.hr},${c.hg},${c.hb},0)`);
+  ctx.fillStyle=hg; ctx.fillRect(0,0,W,H);
+  // Project
+  const sinY=Math.sin(rotY), cosY=Math.cos(rotY);
+  const proj=BASE.map(([bx,by,bz],i)=>{
+    const eq=Math.sqrt(bx*bx+bz*bz);
+    const ph=i*0.53+t*0.0025;
+    const vibe=lvl*(state==='speak'?0.50:0.30)*(0.5+0.5*Math.sin(ph))*(0.3+0.7*eq);
+    const x0=bx*(1+vibe),y0=by*(1+vibe*0.5),z0=bz*(1+vibe);
+    const x1=x0*cosY-z0*sinY, z1=x0*sinY+z0*cosY;
+    const y1=y0*cosX-z1*sinX, z2=y0*sinX+z1*cosX;
+    const sc=1/(1+0.45*(1-z2)*0.5);
+    return {sx:cx+x1*R*sc, sy:cy-y1*R*sc, z:z2, sc};
+  });
+  // Edges
+  const eb=1+lvl*1.2;
+  for(const [i,j] of EDGES){
+    const a=proj[i],b=proj[j], dz=(a.z+b.z)/2;
+    if(dz<-0.65) continue;
+    const df=(dz+1)/2;
+    const alpha=Math.min(0.9,(0.12+0.75*df)*eb);
+    ctx.beginPath(); ctx.moveTo(a.sx,a.sy); ctx.lineTo(b.sx,b.sy);
+    ctx.strokeStyle=`rgba(${c.er},${c.eg},${c.eb},${alpha.toFixed(3)})`;
+    ctx.lineWidth=df>0.55?1.2:0.7; ctx.stroke();
+  }
+  // Nodes
+  for(const p of proj){
+    if(p.z<-0.60) continue;
+    const df=(p.z+1)/2, alpha=0.35+0.65*df;
+    const dotR=Math.max(0.9,(p.z>0.2?2.0:1.2)*p.sc);
+    const glowR=Math.max(dotR+1.5,dotR*2.2);
+    const grd=ctx.createRadialGradient(p.sx,p.sy,0,p.sx,p.sy,glowR);
+    grd.addColorStop(0,  `rgba(${c.nr},${c.ng},${c.nb},${(alpha*0.85).toFixed(3)})`);
+    grd.addColorStop(0.5,`rgba(${c.nr},${c.ng},${c.nb},${(alpha*0.25).toFixed(3)})`);
+    grd.addColorStop(1,  `rgba(${c.nr},${c.ng},${c.nb},0)`);
+    ctx.beginPath(); ctx.arc(p.sx,p.sy,glowR,0,Math.PI*2); ctx.fillStyle=grd; ctx.fill();
+    ctx.beginPath(); ctx.arc(p.sx,p.sy,dotR,0,Math.PI*2);
+    ctx.fillStyle=`rgba(${c.nr},${c.ng},${c.nb},${Math.min(1,alpha+0.1).toFixed(3)})`; ctx.fill();
+  }
+  // Outer ring
+  if((state==='speak'||state==='listen')&&lvl>0.1){
+    const ri=R*1.02, ro=R*(1.18+lvl*0.20);
+    const rg=ctx.createRadialGradient(cx,cy,ri,cx,cy,ro);
+    rg.addColorStop(0,  `rgba(${c.er},${c.eg},${c.eb},0)`);
+    rg.addColorStop(0.4,`rgba(${c.er},${c.eg},${c.eb},${(lvl*0.45).toFixed(3)})`);
+    rg.addColorStop(1,  `rgba(${c.er},${c.eg},${c.eb},0)`);
+    ctx.beginPath(); ctx.arc(cx,cy,ro,0,Math.PI*2); ctx.fillStyle=rg; ctx.fill();
+  }
+}
+
+function setMode(m) {
+  _mode = m;
+  say('mode → '+m);
+}
+
+function frame(t) {
+  requestAnimationFrame(frame);
+  let target;
+  if (_mode==='speak') {
+    target = 0.5+0.4*Math.abs(Math.sin(t/80));
+  } else if (_mode==='listen') {
+    target = 0.4+0.4*Math.abs(Math.sin(t/100));
+  } else if (_mode==='think') {
+    target = 0.2+0.18*Math.abs(Math.sin(t/350));
+  } else {
+    target = 0.05+0.04*Math.sin(t/1400);
+  }
+  _level += (target-_level)*0.15;
+  rotY += _mode==='speak' ? 0.016+_level*0.02
+        : _mode==='listen' ? 0.012+_level*0.014
+        : _mode==='think' ? 0.007 : 0.008;
+  try { drawMesh(_level, t, _mode); }
+  catch(e) { say('ERROR: '+e.message); }
+}
+
+say('starting rAF loop…');
+requestAnimationFrame(frame);
+say('loop started');
+</script>
+</body>
+</html>

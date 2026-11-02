@@ -5,7 +5,7 @@
 //
 // Serial protocol (115200 baud): the host sends one line command and the
 // board replies with exactly one structured JSON line:
-//   PING        -> {"cmd":"PING","status":"OK","uptime_ms":123}
+//   PING        -> {"cmd":"PING","status":"OK","sketch":"patient","uptime_ms":123}
 //   I2C_SCAN    -> {"cmd":"I2C_SCAN","i2c_devices":["0x3C","0x76"]}
 //   READ_SENSOR -> {"cmd":"READ_SENSOR","temperature_c":24.6,...}
 //   SELFTEST    -> {"cmd":"SELFTEST","oled_ok":true,...}
@@ -69,7 +69,7 @@ void showOnOled(const String &l1, const String &l2) {
 }
 
 void handlePing() {
-  Serial.print("{\"cmd\":\"PING\",\"status\":\"OK\",\"uptime_ms\":");
+  Serial.print("{\"cmd\":\"PING\",\"status\":\"OK\",\"sketch\":\"patient\",\"uptime_ms\":");
   Serial.print(millis());
   Serial.println("}");
 }

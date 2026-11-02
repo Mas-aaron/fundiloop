@@ -229,17 +229,52 @@ def sanitize_alternatives(proj: dict, visible: list[str]) -> list:
     return [a for a in alts if not alternative_reasons(a, visible)]
 
 
+_TITLE_LEADERS = ("who", "what", "when", "where", "why", "how",
+                  "do", "does", "did", "is", "are", "was", "were",
+                  "can", "could", "will", "would", "should",
+                  "have", "has", "you", "your")
+
+
+def title_reasons(title: object) -> list[str]:
+    """Why a plan title is unusable ([] == fine). Titles are spoken
+    aloud as "I found this project: <title>", so a title must be a
+    short build name. Raw mic transcripts reach the planner verbatim
+    and get echoed back ("when does before you started"), so
+    question- and sentence-shaped titles are rejected; the retry then
+    asks the model for a clean noun-phrase title for the same build.
+    A missing title stays valid (other callers pass title-less
+    step lists; the frontend falls back to "project").
+    """
+    text = str(title or "").strip()
+    if not text:
+        return []
+    if "?" in text:
+        return ["title %r is a question, not a build name: retitle it "
+                "as a short (at most 6 words) noun phrase" % text]
+    words = re.findall(r"[a-z0-9']+", text.lower())
+    if len(words) > 8:
+        return ["title %r is sentence-shaped (%d words): retitle it "
+                "as a short (at most 6 words) noun phrase"
+                % (text, len(words))]
+    if len(words) >= 2 and words[0] in _TITLE_LEADERS:
+        return ["title %r is conversational, not a build name: retitle "
+                "it as a short (at most 6 words) noun phrase" % text]
+    return []
+
+
 def validate_project(proj: dict, visible: list[str],
                      enforce_visible: bool = True) -> list[str]:
     """Return rejection reasons ([] == valid). Pure function of the plan.
 
     With enforce_visible=False (a user-requested build) the bench does
     not gate the plan: any parts are accepted and no alternatives are
-    required. Real test names and instructions are always required.
+    required. Real test names, instructions, and a speakable title are
+    always required.
     """
     reasons: list[str] = []
     if not isinstance(proj, dict) or not isinstance(proj.get("steps"), list) or not proj["steps"]:
         return ["project has no steps"]
+    reasons.extend(title_reasons(proj.get("title")))
     missing = [str(m) for m in (proj.get("missing_parts") or [])]
     _check_steps(proj["steps"], "", True, visible, missing, reasons,
                  check_visible=enforce_visible)
@@ -348,4 +383,13 @@ def plan_projects(visible_parts: list[str], user_project: str | None = None,
         user_msg = base_user + "\n" + plan_retry_suffix(
             [r for entry in rejected if entry["attempt"] == attempt for r in entry["reasons"]],
             user_project)
+    if requested:
+        # Named request, nothing speakable: say what failed (often a
+        # misheard mic transcript) instead of the generic parts message.
+        return {"projects": [], "rejected_plans": rejected,
+                "hint": "I couldn't make sense of '%s' as something to "
+                        "build — try naming the project again, using the "
+                        "parts on your bench: %s."
+                        % (str(user_project).strip(),
+                           ", ".join(visible) or "none")}
     return {"projects": [], "rejected_plans": rejected}

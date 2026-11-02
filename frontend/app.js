@@ -146,6 +146,7 @@ let speechChunkHook = null; // called with each spoken chunk as it sounds
 function armSpeechClock(text, seq) {
   speechClockSeq = seq;
   speechClockStart = 0;
+  speechArmedAt = Date.now();
   speechClockMs = estimateSpeechMs(text);
   speechAudible = false;
   // Where does this utterance first name a wire? The schematic draw
@@ -166,6 +167,16 @@ function markSpeechEnded() {
 function speechRemainMs() {
   if (muted || !speechAudible || !speechClockMs || speechClockSeq !== speakSeq) return 0;
   return Math.max(0, speechClockMs - (Date.now() - speechClockStart));
+}
+
+let speechArmedAt = 0; // when the current utterance was armed (fetch gap)
+function speechActive() {
+  // True while the tutor owns the audio: sounding now, or still in the
+  // synthesis/fetch gap before first audio. Bounded, so a hung fetch
+  // never silences the loop forever; muted never blocks.
+  if (muted || !speechClockMs || speechClockSeq !== speakSeq) return false;
+  if (speechAudible) return speechRemainMs() > 0;
+  return Date.now() - speechArmedAt < 4000;
 }
 
 function markSpeechAudible(durationMs) {
@@ -195,6 +206,20 @@ function clearServerQueue() {
   serverPlaying = false;
 }
 
+// speech:fetch:start
+async function fetchWithTimeout(url, opts, ms) {
+  // TTS fetch with a hard bound: a hung synthesis must fall back to
+  // browser speech, never lose the utterance silently.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+// speech:fetch:end
+
 // One Meta TTS fetch: object URL on playable audio, null on any failure
 // (the caller falls back to browser speech for that utterance only).
 async function fetchServerSpeech(text) {
@@ -203,11 +228,11 @@ async function fetchServerSpeech(text) {
   // Persistent failures still fall back to browser speech fast.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const r = await fetch("/api/voice/speak", {
+      const r = await fetchWithTimeout("/api/voice/speak", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
-      });
+      }, 10000);
       if (!r.ok) {
         // Surface the server's reason in the console; the utterance
         // still falls back to browser speech if the retry also fails.
@@ -230,7 +255,12 @@ function speakBrowserNow(say, done) {
   const finish = () => { if (done) { try { done(); } catch (e) { console.log("speak onend failed", e); } } };
   try {
     if (!("speechSynthesis" in window)) { finish(); return; }
-    speechSynthesis.cancel();
+    // Cancel only when something is actually queued: a bare cancel()
+    // in the same tick as speak() wedges Chrome's queue and the
+    // utterance never sounds (text shown, quiet kept).
+    if (speechSynthesis.speaking || speechSynthesis.pending) {
+      speechSynthesis.cancel();
+    }
     if (speechSynthesis.paused) speechSynthesis.resume();
     const voice = pickFallbackVoice(speechSynthesis.getVoices());
     // Sentence chunks: some mobile browsers stall on single long utterances.
@@ -244,12 +274,24 @@ function speakBrowserNow(say, done) {
       u.rate = 0.98;
       u.pitch = 1.0;
       if (voice) u.voice = voice;
-      u.onboundary = () => OrbWave.blip(0.55); // word-by-word shimmer
+      u.onboundary = (e) => {
+        OrbWave.blip(0.55);
+        // Feed the text spoken-so-far to the wire-draw hook so each wire
+        // lights up as the tutor actually names it (word by word), not
+        // all at once when the chunk starts. charIndex is the cursor
+        // into this utterance's text; charLength covers the current word.
+        if (speechChunkHook && e && Number.isFinite(e.charIndex)) {
+          try {
+            const upto = e.charIndex + (e.charLength || 0);
+            speechChunkHook(p.substring(0, upto));
+          } catch (err) { /* draw only */ }
+        }
+      };
       u.onstart = () => {
         if (i === 0) markSpeechAudible(estimateSpeechMs(say));
-        if (speechChunkHook) {
-          try { speechChunkHook(p); } catch (e) { /* draw only */ }
-        }
+        // No full-chunk hook here: onboundary drives word-by-word drawing.
+        // Browsers without boundary events fall back to the parked-draw
+        // timer schedule (runParkedSchematicDraw), so wires still land.
       };
       if (i === parts.length - 1) u.onend = finish;
       speechSynthesis.speak(u);
@@ -323,7 +365,11 @@ function pumpServerQueue(id) {
 function splitSpeakChunks(say) {
   const safe = String(say).replace(/(\d)\.(\d)/g, "$1<DOT>$2");
   const parts = (safe.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [safe])
-    .map((p) => p.replace(/<DOT>/g, ".").trim()).filter((p) => p);
+    .map((p) => p.replace(/<DOT>/g, ".").trim())
+    // Drop punctuation-only pieces: they synthesize dead air that
+    // vibrates the orb while nothing is heard, then speech seems to
+    // "start midway" on the next chunk.
+    .filter((p) => /[A-Za-z0-9]/.test(p));
   // Pack small sentences into 60-140 char chunks: first audio sounds
   // after one short synthesis (~36ms/char server-side), and each
   // chunk's playback (~1s per 15 chars) hides the next chunk's
@@ -354,8 +400,21 @@ function splitSpeakChunks(say) {
     cur = cur ? cur + " " + p : p;
   }
   pushCur();
-  return chunks.length ? chunks : [say];
+  return chunks; // possibly empty: the player ends silently, no dead air
 }
+
+// speech:watchdog:start
+function armPlaybackWatchdog(ms, onStall) {
+  // One-shot stall guard: when audio never starts (hung play promise,
+  // no events), the utterance must fall back instead of dying quiet.
+  // Returns settle(): call it on any playback progress.
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (!settled) { settled = true; onStall(); }
+  }, ms);
+  return () => { if (!settled) { settled = true; clearTimeout(timer); } };
+}
+// speech:watchdog:end
 
 // Long utterances synthesize chunk-by-chunk with the next chunk
 // prefetched during playback: first audio sounds after one short
@@ -396,10 +455,14 @@ function playServerChunks(chunks, mySpeech, done) {
       if (i + 1 >= chunks.length) { done(); return; } // last chunk played
       pending[i + 1].then((nextUrl) => playUrl(nextUrl, i + 1));
     };
-    el.onended = advance;
+    const settleWatchdog = armPlaybackWatchdog(12000, () => {
+      if (mySpeech === speakSeq) broken();
+    });
+    el.onended = () => { settleWatchdog(); advance(); };
     const restMs = estimateSpeechMs(chunks.slice(i).join(" "));
     let hooked = false;
     const noteStart = () => {
+      settleWatchdog();
       const heard = (el.duration && isFinite(el.duration) && el.duration > 0)
         ? (el.duration * 1000 + estimateSpeechMs(chunks.slice(i + 1).join(" ")))
         : restMs;
@@ -413,6 +476,7 @@ function playServerChunks(chunks, mySpeech, done) {
     };
     el.onplaying = noteStart;
     const broken = () => {
+      settleWatchdog();
       if (mySpeech !== speakSeq) return;
       stopServerAudio();
       speakBrowserNow(chunks.slice(i).join(" "), done);
@@ -542,16 +606,17 @@ const VoiceEngine = {
 
 function speak(text, onend) { VoiceEngine.speak(text, onend); }
 
-// OrbWave: Trillion-style live motion for the orb. It breathes at idle,
-// ripples with live mic level while listening, and vibrates with speaker
-// level while talking. Levels come from AnalyserNodes tapped onto mic
-// streams and audio elements; paths without a tap (speech recognition,
-// browser speech) fall back to a synthetic pulse so the orb never lies
-// still mid-turn. All taps are guarded no-ops where Web Audio is absent.
+// OrbWave + MeshOrb: Trillion-style wireframe globe.
+// Edges are the hero — thin teal mesh lines like Trillion's orb.
+// Nodes are tiny bright dots at intersections only.
+// Audio level drives: sphere scale pulse + per-node radial ripple.
+// Public API unchanged: tapElement, tapStream, blip, setMode, releaseMic, level.
+
 const OrbWave = (() => {
+  // ── Audio analysers ────────────────────────────────────────────────────
   let actx = null, analyser = null, micAnalyser = null, micSource = null;
-  let mode = "idle"; // idle | listen | speak (set from Orb.paint)
-  let level = 0, blipLevel = 0;
+  let _mode = "idle";
+  let _level = 0, blipLevel = 0;
   const scratch = new Uint8Array(512);
 
   function ensureCtx() {
@@ -577,55 +642,198 @@ const OrbWave = (() => {
     } catch (e) { return -1; }
   }
 
-  function paintWave(v) {
-    try {
-      const s = (1 + v * 0.45).toFixed(3);
-      const o = (0.1 + v * 0.65).toFixed(3);
-      const b = (1 + v * 0.45).toFixed(3);
-      for (const w of document.querySelectorAll(".orb-wave")) {
-        w.style.transform = "scale(" + s + ")";
-        w.style.opacity = o;
-      }
-      for (const el of document.querySelectorAll(".orb")) {
-        el.style.filter = "brightness(" + b + ")";
-      }
-    } catch (e) { /* static orb */ }
+  // ── Globe geometry ─────────────────────────────────────────────────────
+  // Fewer nodes = cleaner visible mesh like Trillion (not a dense cloud)
+  const NODE_COUNT = 48;
+  function fibSphere(n) {
+    const pts = [], phi = Math.PI * (3 - Math.sqrt(5));
+    for (let i = 0; i < n; i++) {
+      const y = 1 - (i / (n - 1)) * 2;
+      const r = Math.sqrt(Math.max(0, 1 - y * y));
+      const th = phi * i;
+      pts.push([Math.cos(th) * r, y, Math.sin(th) * r]);
+    }
+    return pts;
+  }
+  const BASE_NODES = fibSphere(NODE_COUNT);
+
+  // Edges: connect nodes within chord distance — tight threshold = sparse clean mesh
+  const CHORD_THRESH = 0.58;
+  const EDGES = [];
+  for (let i = 0; i < NODE_COUNT; i++) {
+    for (let j = i + 1; j < NODE_COUNT; j++) {
+      const [ax,ay,az] = BASE_NODES[i], [bx,by,bz] = BASE_NODES[j];
+      const d = Math.sqrt((ax-bx)**2 + (ay-by)**2 + (az-bz)**2);
+      if (d < CHORD_THRESH) EDGES.push([i, j]);
+    }
   }
 
+  // ── Colours ────────────────────────────────────────────────────────────
+  // Trillion palette: teal/cyan mesh, purple glow when speaking
+  const C = {
+    idle:   { er:0,   eg:210, eb:180, nr:120, ng:255, nb:220, hr:30,  hg:0,   hb:120 },
+    listen: { er:0,   eg:230, eb:230, nr:180, ng:255, nb:255, hr:0,   hg:80,  hb:160 },
+    speak:  { er:140, eg:80,  eb:255, nr:210, ng:140, nb:255, hr:100, hg:0,   hb:200 },
+    think:  { er:200, eg:160, eb:20,  nr:255, ng:220, nb:60,  hr:100, hg:50,  hb:0   },
+    ok:     { er:20,  eg:220, eb:120, nr:150, ng:255, nb:180, hr:0,   hg:120, hb:60  },
+    fault:  { er:255, eg:110, eb:20,  nr:255, ng:180, nb:80,  hr:160, hg:40,  hb:0   },
+  };
+
+  // ── Renderer ───────────────────────────────────────────────────────────
+  let rotY = 0;
+  const TILT = 0.30; // fixed X-axis tilt (radians) — tilts globe like Trillion
+  const sinX = Math.sin(TILT), cosX = Math.cos(TILT);
+
+  function drawMesh(canvas, lvl, t, state) {
+    const W = canvas.width, H = canvas.height;
+    if (!W || !H) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, W, H);
+    const c = C[state] || C.idle;
+    const cx = W / 2, cy = H / 2;
+
+    // Globe radius — pulses strongly with audio
+    const baseR = Math.min(W, H) * 0.37;
+    const pulse = state === "speak"
+      ? lvl * 0.45 + 0.04 * Math.sin(t / 50)
+      : state === "listen"
+        ? lvl * 0.28 + 0.03 * Math.sin(t / 70)
+        : 0.03 * Math.sin(t / 1400);          // idle: tiny slow breath
+    const R = baseR * (1 + pulse);
+
+    // Background haze glow — grows with level
+    const hazeR = Math.min(W, H) * (0.46 + lvl * 0.22);
+    const hg = ctx.createRadialGradient(cx, cy, 0, cx, cy, hazeR);
+    const hazeA = 0.30 + lvl * 0.40;
+    hg.addColorStop(0,    `rgba(${c.hr},${c.hg},${c.hb},${hazeA.toFixed(2)})`);
+    hg.addColorStop(0.55, `rgba(${c.hr},${c.hg},${c.hb},${(hazeA * 0.3).toFixed(2)})`);
+    hg.addColorStop(1,    `rgba(${c.hr},${c.hg},${c.hb},0)`);
+    ctx.fillStyle = hg;
+    ctx.fillRect(0, 0, W, H);
+
+    // Project all nodes — vibration: each node ripples outward with its own phase
+    const sinY = Math.sin(rotY), cosY = Math.cos(rotY);
+    const proj = BASE_NODES.map(([bx, by, bz], i) => {
+      // Radial vibration — unique phase per node, stronger at equator
+      const eq = Math.sqrt(bx * bx + bz * bz);
+      const phase = i * 0.53 + t * 0.0025;
+      const vibe = lvl * (state === "speak" ? 0.50 : 0.30)
+                       * (0.5 + 0.5 * Math.sin(phase)) * (0.3 + 0.7 * eq);
+      const x0 = bx * (1 + vibe);
+      const y0 = by * (1 + vibe * 0.5);
+      const z0 = bz * (1 + vibe);
+
+      // Y rotation (spin)
+      const x1 = x0 * cosY - z0 * sinY;
+      const z1 = x0 * sinY + z0 * cosY;
+      // X tilt (fixed)
+      const y1 = y0 * cosX - z1 * sinX;
+      const z2 = y0 * sinX + z1 * cosX;
+      // Perspective divide
+      const scale = 1 / (1 + 0.45 * (1 - z2) * 0.5);
+      return { sx: cx + x1 * R * scale, sy: cy - y1 * R * scale, z: z2, sc: scale };
+    });
+
+    // ── Draw edges first (the hero element) ───────────────────────────────
+    // Front edges are bright and crisp; back edges fade out
+    const eBright = 1 + lvl * 1.2;
+    for (const [i, j] of EDGES) {
+      const a = proj[i], b = proj[j];
+      const dz = (a.z + b.z) / 2;
+      if (dz < -0.65) continue; // cull deep back face
+      // Depth-based alpha: front = bright, back = faint but visible
+      const depthFac = (dz + 1) / 2; // 0..1
+      const alpha = Math.min(0.9, (0.12 + 0.75 * depthFac) * eBright);
+      ctx.beginPath();
+      ctx.moveTo(a.sx, a.sy);
+      ctx.lineTo(b.sx, b.sy);
+      ctx.strokeStyle = `rgba(${c.er},${c.eg},${c.eb},${alpha.toFixed(3)})`;
+      // Front edges thicker for the Trillion crisp wireframe look
+      ctx.lineWidth = depthFac > 0.55 ? 1.2 : 0.7;
+      ctx.stroke();
+    }
+
+    // ── Draw nodes: small, sharp, bright — NOT big blurry blobs ──────────
+    for (const p of proj) {
+      if (p.z < -0.60) continue;
+      const depthFac = (p.z + 1) / 2;
+      const alpha = 0.35 + 0.65 * depthFac;
+      // Node size: small fixed size + slight perspective scale — never huge
+      const dotR = Math.max(0.9, (p.z > 0.2 ? 2.0 : 1.2) * p.sc);
+      // Tight glow — only 2× dot size so it doesn't bleed into neighbours
+      const glowR = Math.max(dotR + 1.5, dotR * 2.2);
+      const grd = ctx.createRadialGradient(p.sx, p.sy, 0, p.sx, p.sy, glowR);
+      grd.addColorStop(0,   `rgba(${c.nr},${c.ng},${c.nb},${(alpha * 0.85).toFixed(3)})`);
+      grd.addColorStop(0.5, `rgba(${c.nr},${c.ng},${c.nb},${(alpha * 0.25).toFixed(3)})`);
+      grd.addColorStop(1,   `rgba(${c.nr},${c.ng},${c.nb},0)`);
+      ctx.beginPath();
+      ctx.arc(p.sx, p.sy, glowR, 0, Math.PI * 2);
+      ctx.fillStyle = grd;
+      ctx.fill();
+      // Solid core dot
+      ctx.beginPath();
+      ctx.arc(p.sx, p.sy, dotR, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${c.nr},${c.ng},${c.nb},${Math.min(1, alpha + 0.1).toFixed(3)})`;
+      ctx.fill();
+    }
+
+    // Pulsing outer ring removed — it created an unwanted boundary halo
+  }
+
+  // ── Animation loop ─────────────────────────────────────────────────────
   function frame(t) {
-    try { requestAnimationFrame(frame); } catch (e) { return; }
-    let target = 0;
-    if (mode === "speak") {
+    requestAnimationFrame(frame);
+    // Target level from real audio or synthetic pulse
+    let target;
+    if (_mode === "speak") {
       const r = rmsOf(analyser);
-      target = r >= 0 ? Math.min(1, r * 3) : 0;
+      target = r >= 0 ? Math.min(1, r * 8) : 0;
       if (blipLevel > 0) target = Math.max(target, blipLevel);
-      if (target <= 0.02) target = 0.25 + 0.15 * Math.sin(t / 130);
-    } else if (mode === "listen") {
+      const synth = 0.5 + 0.4 * Math.abs(Math.sin(t / 80));
+      target = Math.max(target, synth);
+    } else if (_mode === "listen") {
       const r = rmsOf(micAnalyser);
-      target = r >= 0 ? Math.min(1, r * 4) : 0;
-      if (target <= 0.02) target = 0.35 + 0.25 * Math.sin(t / 170);
+      target = r >= 0 ? Math.min(1, r * 8) : 0;
+      const synth = 0.4 + 0.4 * Math.abs(Math.sin(t / 100));
+      target = Math.max(target, synth);
+    } else if (_mode === "think") {
+      target = 0.2 + 0.18 * Math.abs(Math.sin(t / 350));
+    } else if (_mode === "fault") {
+      target = 0.5 + 0.4 * Math.abs(Math.sin(t / 180));
     } else {
-      target = 0.07 + 0.05 * Math.sin(t / 900);
+      target = 0.05 + 0.04 * Math.sin(t / 1400);
     }
-    blipLevel *= 0.9;
-    level += (target - level) * 0.35;
-    paintWave(level);
+    blipLevel *= 0.88;
+    _level += (target - _level) * 0.15;
+
+    rotY += _mode === "speak"  ? 0.016 + _level * 0.020
+          : _mode === "listen" ? 0.012 + _level * 0.014
+          : _mode === "think"  ? 0.007
+          : _mode === "fault"  ? 0.030
+          : 0.008;
+
+    const state = _mode === "speak" ? "speak"
+                : _mode === "listen" ? "listen"
+                : _mode === "think" ? "think"
+                : _mode === "ok" ? "ok"
+                : _mode === "fault" ? "fault" : "idle";
+
+    const c1 = document.getElementById("orb-canvas");
+    const c2 = document.getElementById("cook-orb-canvas");
+    if (c1) { try { drawMesh(c1, _level, t, state); } catch(e) { console.error("drawMesh c1:", e); } }
+    if (c2) { try { drawMesh(c2, _level, t, state); } catch(e) { console.error("drawMesh c2:", e); } }
   }
 
-  try {
-    let reduced = false;
-    try {
-      reduced = !!(window.matchMedia &&
-        window.matchMedia("(prefers-reduced-motion: reduce)").matches);
-    } catch (e) { /* assume motion is fine */ }
-    if (!reduced && typeof requestAnimationFrame === "function") {
-      requestAnimationFrame(frame);
-    }
-  } catch (e) { /* static orb */ }
-
+  // ── Bootstrap ──────────────────────────────────────────────────────────
+  // Start unconditionally. Reduced-motion check is best-effort only.
+  (function startOrb() {
+    // Always run — reduced-motion users get a slower, calmer orb rather than nothing
+    requestAnimationFrame(frame);
+  })();
   return {
-    setMode(m) { mode = m; },
-    level() { return level; },
+    setMode(m) { _mode = m; },
+    level() { return _level; },
     blip(v) { blipLevel = Math.max(blipLevel, v || 0.6); },
     tapElement(el) {
       const ctx = ensureCtx();
@@ -635,14 +843,11 @@ const OrbWave = (() => {
         const an = ctx.createAnalyser();
         an.fftSize = 512;
         src.connect(an);
-        an.connect(ctx.destination); // without this the element goes silent
+        an.connect(ctx.destination);
         analyser = an;
         el._orbTapped = true;
-        if (ctx.resume) {
-          try { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); }
-          catch (e) { /* suspended context still analyses */ }
-        }
-      } catch (e) { /* one tap per element; blobs only */ }
+        if (ctx.resume) try { ctx.resume().catch(()=>{}); } catch(e){}
+      } catch (e) {}
     },
     tapStream(stream) {
       const ctx = ensureCtx();
@@ -652,19 +857,14 @@ const OrbWave = (() => {
         const src = ctx.createMediaStreamSource(stream);
         const an = ctx.createAnalyser();
         an.fftSize = 512;
-        src.connect(an); // mic: analyse only, never route to speakers
-        micSource = src;
-        micAnalyser = an;
-        if (ctx.resume) {
-          try { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); }
-          catch (e) { /* suspended context still analyses */ }
-        }
+        src.connect(an);
+        micSource = src; micAnalyser = an;
+        if (ctx.resume) try { ctx.resume().catch(()=>{}); } catch(e){}
       } catch (e) { micAnalyser = null; }
     },
     releaseMic() {
-      try { if (micSource) micSource.disconnect(); } catch (e) { /* done */ }
-      micSource = null;
-      micAnalyser = null;
+      try { if (micSource) micSource.disconnect(); } catch(e){}
+      micSource = null; micAnalyser = null;
     },
   };
 })();
@@ -674,7 +874,8 @@ const OrbWave = (() => {
 // listening > thinking > idle. Listening/thinking are explicit counters
 // (nested turns overlap); speaking is polled from live audio state.
 const Orb = (() => {
-  let listenDepth = 0, thinkDepth = 0, errUntil = 0;
+  let listenDepth = 0, thinkDepth = 0, errUntil = 0, okUntil = 0;
+  let faultLatched = false, monitorHealthy = false;
   function speakingNow() {
     try {
       if (serverAudio || serverPlaying) return true;
@@ -686,18 +887,26 @@ const Orb = (() => {
   }
   function paint() {
     let state = "";
-    if (Date.now() < errUntil) state = "is-error";
+    if (faultLatched) state = "is-fault";
+    else if (Date.now() < errUntil) state = "is-error";
     else if (speakingNow()) state = "is-speaking";
     else if (listenDepth > 0) state = "is-listening";
     else if (thinkDepth > 0) state = "is-thinking";
+    else if (Date.now() < okUntil) state = "is-ok";
+    else if (monitorHealthy) state = "is-ok";
     try {
       OrbWave.setMode(state === "is-listening" ? "listen"
-        : state === "is-speaking" ? "speak" : "idle");
+        : state === "is-speaking" ? "speak"
+        : state === "is-thinking" ? "think"
+        : state === "is-ok" ? "ok"
+        : state === "is-fault" ? "fault"
+        : "idle");
     } catch (e) { /* static orb */ }
     for (const el of document.querySelectorAll(".orb")) {
       if (el._orbState === state) continue;
       el._orbState = state;
-      el.classList.remove("is-listening", "is-thinking", "is-speaking", "is-error");
+      el.classList.remove("is-listening", "is-thinking", "is-speaking",
+        "is-error", "is-ok", "is-fault");
       if (state) el.classList.add(state);
     }
   }
@@ -708,6 +917,9 @@ const Orb = (() => {
     thinkStart() { thinkDepth++; paint(); },
     thinkEnd() { thinkDepth = Math.max(0, thinkDepth - 1); paint(); },
     error() { errUntil = Date.now() + 2500; paint(); },
+    ok() { okUntil = Date.now() + 2500; paint(); },
+    fault(on) { faultLatched = !!on; paint(); },
+    monitor(on) { monitorHealthy = !!on; paint(); },
   };
 })();
 
@@ -788,16 +1000,7 @@ async function startSession() {
   // No auto-speak here: speech fires on check results, replay, and talk.
 }
 
-const CHECK_STAGES = { ack: "Checking…", sense: "Sensing…", reason: "Reasoning…", verify: "Verifying…" };
-// A turn always settles: probe + two model passes stay under ~90s, so
-// 120s means the turn is wedged, not slow. The timer aborts it into
-// the normal cancel path with a timeout message instead of silence.
-const CHECK_TIMEOUT_MS = 120000;
-const CHECK_TIMEOUT_MSG = "Check timed out after 120s — the board or network is stuck. " +
-  "Try CHECK NOW again, or MOVE ON to continue anyway.";
-let checkAbort = null; // AbortController for the in-flight turn (CANCEL)
-let pendingCheck = ""; // voice trigger heard mid-turn, run when free
-let pendingConfirmSid = ""; // learning session waiting on CONFIRM
+let pendingVoiceStep = ""; // voice "done" heard mid-turn, advance when free
 
 function fmtTimings(t) {
   if (!t) return "";
@@ -807,93 +1010,117 @@ function fmtTimings(t) {
     " · reason " + s(t.reason_ms) + ")";
 }
 
-function paintConfirm(v) {
-  const pend = v && v.confirm_pending;
-  $("confirm-bar").hidden = !pend;
-  $("cook-confirm").hidden = !pend;
-  // The eyeball ask gets its own unmissable card in cook view: the
-  // question plus both answers, where the learner is already looking.
-  const card = $("cook-eyeball");
-  if (card) {
-    card.hidden = !pend;
-    if (pend) {
-      $("cook-eyeball-q").textContent = pend.question || "Confirm this step?";
+// Trillion-style status chips: render key/value pills into an element
+// instead of a flat " · "-separated line, so the build state reads at a
+// glance. Falsy chips are skipped. Each chip may carry a tone class
+// (ok/warn/dot) and an optional label shown dim ahead of the value.
+function stateChipClass(state) {
+  if (state === "DONE" || state === "COMPLETE" || state === "VERIFIED_FIXED") return "ok";
+  if (state === "FAULT_FOUND" || state === "VERIFYING") return "warn";
+  return "";
+}
+function paintChips(el, chips) {
+  if (!el) return;
+  const parts = (chips || []).filter(Boolean).map((c) => {
+    const cls = c.cls ? " " + c.cls : "";
+    const label = c.label ? '<span>' + esc(c.label) + ' </span>' : "";
+    return '<span class="chip' + cls + '">' + label +
+      '<strong>' + esc(String(c.value)) + '</strong></span>';
+  });
+  el.innerHTML = parts.join("");
+}
+
+// Roll call owns the screen until READY: the question plus the button
+// in learn view, the READY button in the cook action row.
+function paintRollcall(v) {
+  const roll = !!v && v.state === "ROLLCALL";
+  const bar = $("rollcall-bar"), ready = $("cook-ready");
+  // The rollcall bar serves the learn fallback; cook mode answers the
+  // roll call from the coach bar instead.
+  const inCook = (typeof cookMode !== "undefined") && cookMode;
+  if (bar) bar.hidden = !roll || inCook;
+  if (ready) ready.hidden = !roll;
+  if (roll) {
+    const rc = (v.fundi && v.fundi.rollcall) || {};
+    const q = $("rollcall-q");
+    if (q) {
+      q.textContent =
+        rc.question || "Say READY when your parts are on the bench.";
     }
-  }
-  if (pend) {
-    pendingConfirmSid = v.id || learnSid || "";
-    $("confirm-q").textContent = pend.question || "Confirm this step?";
-  } else {
-    pendingConfirmSid = "";
   }
 }
 
-async function sendConfirm(confirmed) {
-  if (!pendingConfirmSid) return;
-  // A check turn (often the AUTO loop) may be mid-flight: wait for it
-  // to settle instead of silently dropping this tap, and say so where
-  // the learner is actually looking.
-  let waited = 0;
-  while (busy && waited < 40) {
-    if (cookMode) $("cook-heard").textContent = "Checking - confirming as soon as it finishes…";
-    await new Promise((res) => setTimeout(res, 500));
-    waited++;
-  }
-  if (busy || !pendingConfirmSid) {
-    if (cookMode) $("cook-heard").textContent = "Still checking - press CONFIRM again in a moment.";
-    return;
-  }
+// Escalated failures carry their fix chain; DONE carries stretch
+// goals. Both paint as plain lists and hide when absent.
+function paintTroubleshoot(elId, tips) {
+  const el = $(elId);
+  if (!el) return;
+  const list = (tips || []).filter((t) => t);
+  el.hidden = !list.length;
+  el.innerHTML = list.map((t) => "<li>" + esc(t) + "</li>").join("");
+}
+
+function paintStretch(elId, ideas) {
+  const el = $(elId);
+  if (!el) return;
+  const list = (ideas || []).filter((s) => s && (s.title || s.summary));
+  el.hidden = !list.length;
+  el.innerHTML = list.map((s) =>
+    "<h3>" + esc(s.title || "Keep going") + "</h3><p>" +
+    esc(s.summary || "") + "</p>").join("");
+}
+
+// READY: answer the parts roll call. READY begins chapter 1; anything
+// else re-prompts without advancing (the server decides the match).
+async function sendReady(transcript) {
+  if (!learnSid) return;
+  if (busy) return;
   busy = true;
+  const wantSid = learnSid;
   try {
-    const r = await fetch("/api/session/confirm", {
+    const r = await fetch("/api/session/ready", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: pendingConfirmSid, confirmed: confirmed }),
+      body: JSON.stringify({ session_id: learnSid, transcript: transcript || "ready" }),
     });
     const v = await r.json();
+    if (turnViewStale(v, wantSid)) return; // session moved on mid-turn
     if (!r.ok) {
-      const detail = (v && v.detail) || "confirm failed";
-      if (cookMode) {
-        $("cook-heard").textContent = "Confirm failed: " + detail +
-          " - press CHECK, then CONFIRM again.";
-      }
-      showError(detail);
+      if (cookMode) $("cook-heard").textContent =
+        "Ready failed: " + ((v && v.detail) || "unknown session");
       return;
     }
     if (cookMode && v.learning) {
       renderCook(v);
-      $("cook-heard").textContent = confirmed
-        ? "Confirmed - next step below."
-        : "Not confirmed - fix it up, then CHECK.";
-      cookSpeak(v.speak);
+      tutorBeat(v, cookSpeak, { quiet: false, manual: true });
     } else {
       renderLearning(v);
-      speak(v.speak);
+      tutorBeat(v, speak, { quiet: false, manual: true });
     }
   } catch (e) {
-    if (cookMode) {
-      $("cook-heard").textContent = "Confirm failed: " + e.message +
-        " - is the backend window still running?";
-    }
-    showError(e.message);
+    if (cookMode) $("cook-heard").textContent = "Ready failed: " + e.message;
   } finally {
     busy = false;
+    drainVoiceStep();
+    drainCookVoice();
   }
 }
-$("confirm-yes").onclick = () => sendConfirm(true);
-$("confirm-no").onclick = () => sendConfirm(false);
-$("cook-confirm").onclick = () => sendConfirm(true);
-$("cook-eyeball-yes").onclick = () => sendConfirm(true);
-$("cook-eyeball-no").onclick = () => sendConfirm(false);
+$("cook-ready").onclick = () => sendReady("ready");
+$("rollcall-ready").onclick = () => sendReady("ready");
 
-// MOVE ON: learner-paced advance, audit-logged as unverified. Always
-// available - no step can trap the learner behind a sensor, an eyeball
-// question, or a wedged check turn: the escape hatch aborts an
-// in-flight turn first, then advances. During an eyeball ask it counts
-// as confirming.
-async function sendAdvance() {
+// NEXT STEP: the tap that moves the build forward. Steps advance on
+// taps, not sensor passes — proof comes once, at the end, from live
+// telemetry. The server holds the final step (only Deploy or the
+// explicit escape finishes the build) and audit-logs every advance.
+function drainVoiceStep() {
+  // Voice "done" heard mid-turn advances once free.
+  const q = pendingVoiceStep;
+  pendingVoiceStep = "";
+  if (q) sendNextStep(q);
+}
+
+async function sendNextStep(transcript) {
   if (!learnSid) return;
-  if (checkAbort) checkAbort.abort();
   let waited = 0;
   while (busy && waited < 10) {
     await new Promise((res) => setTimeout(res, 200));
@@ -901,245 +1128,792 @@ async function sendAdvance() {
   }
   if (busy) return;
   busy = true;
+  const wantSid = learnSid;
   try {
     const r = await fetch("/api/session/advance", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: learnSid, transcript: "move on" }),
+      body: JSON.stringify({ session_id: learnSid,
+        transcript: transcript || "next step" }),
     });
     const v = await r.json();
+    if (turnViewStale(v, wantSid)) return; // session moved on mid-turn
     if (!r.ok) {
       if (cookMode) $("cook-heard").textContent =
-        "Move on failed: " + ((v && v.detail) || "unknown session");
+        "Next step failed: " + ((v && v.detail) || "unknown session");
       return;
     }
     if (cookMode && v.learning) {
       renderCook(v);
-      $("cook-heard").textContent = "Moved on - next step below.";
-      cookSpeak(v.speak);
+      $("cook-heard").textContent = "Next step below.";
+      tutorBeat(v, cookSpeak, { quiet: false, manual: true });
     } else {
       renderLearning(v);
-      speak(v.speak);
+      tutorBeat(v, speak, { quiet: false, manual: true });
     }
   } catch (e) {
-    if (cookMode) $("cook-heard").textContent = "Move on failed: " + e.message;
+    if (cookMode) $("cook-heard").textContent = "Next step failed: " + e.message;
   } finally {
     busy = false;
+    drainVoiceStep();
+    drainCookVoice();
   }
 }
-$("cook-move-on").onclick = () => sendAdvance();
-$("move-on").onclick = () => sendAdvance(); // learn escape hatch: same as cook
-$("cancel").onclick = () => { if (checkAbort) checkAbort.abort(); };
+
 $("rescan").onclick = async () => {
   if (busy) return;
   $("instruction").textContent = "Re-scanning equipment…";
   try {
     await fetch("/api/session/rescan", { method: "POST" });
   } catch (e) { showError(e.message); return; }
-  checkNow("");
+  $("instruction").textContent = "Equipment re-scanned.";
 };
 
-let flashSpokenFor = ""; // "sid:n" already told to flash, so it nags once
+// turn:stale:start
+function turnViewStale(view, wantSid) {
+  // A turn response belongs to the session that was live when the
+  // turn was sent; anything else is a late arrival from a session
+  // the learner already left, and rendering it would flap the
+  // instruction, the diagram, and the beats between two builds.
+  const id = (view && view.id) || "";
+  return !!(id && wantSid && id !== wantSid);
+}
+// turn:stale:end
 
-// A silent board with a step sketch means one thing: the user must
-// upload code, and the cook-heard line alone never says so out loud.
-// Returns the sentence to speak (once per step), or "" when the board
-// talks or the sketch was already announced.
-function flashSpeech(view) {
-  const code = (view && view.step_code) || {};
-  if (!code.code) return "";
-  const bs = String(((view.verification) || {}).board_state || "");
-  if (bs.indexOf("silent:") !== 0) return "";
-  const key = ((view && view.id) || learnSid || "") + ":" + (code.n || learnStepN);
-  if (flashSpokenFor === key) return "";
-  flashSpokenFor = key;
-  return "Your board is silent — it needs this step's sketch. " +
-    "Press FLASH ESP32, then CHECK.";
+// Beat driver: speaks the turn. Turns end when the speech ends —
+// the follow-up check-in question was removed.
+function tutorBeat(view, say, opts) {
+  const text = (view && view.speak) || "";
+  logCoach("Coach", text);
+  say(text);
 }
 
-function renderCheckView(view) {
-  if (cookMode && view.learning) {
-    renderCook(view);
-    // Auto-checks speak on PASS and on state changes, but a repeated
-    // identical FAIL stays silent (panels still update) so the loop
-    // waits quietly while the user wires. Manual checks always speak.
-    // A first-time flash instruction always sounds, even on a quiet
-    // repeat — a silent board means the user is stuck, not wiring.
-    const key = learnStepN + ":" + (((view.verification) || {}).passed ? "P" : "F");
-    const wasAuto = autoFired;
-    autoFired = false;
-    const quiet = wasAuto && key === lastAutoKey && key.slice(-1) === "F";
-    lastAutoKey = key;
-    const flashSay = flashSpeech(view);
-    if (!quiet) cookSpeak((view.speak || "") + (flashSay ? " " + flashSay : ""));
-    else if (flashSay) cookSpeak(flashSay);
-  } else {
-    if (view.learning) renderLearning(view); else render(view);
-    speak(view.speak);
+// ── Flow phases: ideation → reveal → building → deploying → ──
+// ── verifying → rescue. The coach bar offers one primary action ──
+// ── per state; drawers hold code, fix-it lists, and the monitor. ──
+
+// phase:machine:start
+function resolveAppPhase(ctx) {
+  const c = ctx || {};
+  if (!c.hasSession) return "IDEATION";
+  if (!c.revealed) return "REVEAL";
+  if (c.fault) return "RESCUE";
+  if (c.monitorOn) return "VERIFYING";
+  if (c.flashOpen) return "DEPLOYING";
+  return "BUILDING";
+}
+// phase:machine:end
+
+// coach:action:start
+function coachPrimaryAction(ctx) {
+  // Exactly one primary action per state (null hides the button and
+  // lets a card own the moment: confirm ask, flash dialog, monitor).
+  const c = ctx || {};
+  if (c.phase === "REVEAL") {
+    return { id: "start-building", label: "Start Building" };
   }
+  if (c.phase !== "BUILDING") return null;
+  if (c.serverState === "DONE") {
+    return { id: "deploy", label: "Deploy Firmware" };
+  }
+  if (c.serverState === "ROLLCALL") {
+    return { id: "ready", label: "Ready — Start Building" };
+  }
+  const total = c.wiresTotal || 0;
+  if (total > 0 && !c.wireAcked) {
+    return { id: "wire-connected", label: "Wire Connected" };
+  }
+  if (total > 0 && (c.wireIdx || 0) + 1 < total) {
+    return { id: "wire-next", label: "Next Wire" };
+  }
+  // Wiring done (or a beatless step): steps advance on taps, and the
+  // final step deploys. Proof comes later, once, from live telemetry —
+  // there is no per-step check to offer here.
+  const stepN = c.stepN || 0, stepsTotal = c.stepsTotal || 0;
+  if (stepsTotal > 0 && stepN >= stepsTotal) {
+    return { id: "deploy", label: "Deploy Firmware" };
+  }
+  return { id: "next-step", label: "Next Step" };
+}
+// coach:action:end
+
+// reveal:speech:start
+function revealArticle(word) {
+  // Spoken article for part titles: initialisms follow letter-name
+  // sounds (an LED, an HC-SR04, a USB), plain words follow spelling.
+  const w = String(word || "");
+  const first = w.charAt(0);
+  if (!first) return "a";
+  const initialism = /[-0-9]/.test(w) ||
+    (w.length > 1 && w === w.toUpperCase());
+  if (initialism) {
+    return "AEFHILMNORSX".indexOf(first.toUpperCase()) >= 0 ? "an" : "a";
+  }
+  return "aeiouAEIOU".indexOf(first) >= 0 ? "an" : "a";
 }
 
-// Streaming turn: instant ack, then one status line per stage, then the
-// same verified view the blocking endpoint returns. Returns true when the
-// stream finished (done or error), false when the caller should fall back.
-async function checkNowStream(payload, onStage) {
-  const r = await fetch("/api/session/check-now/stream", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: checkAbort ? checkAbort.signal : undefined,
-  });
-  if (!r.ok || !r.body || !r.body.getReader) return false;
-  const reader = r.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (value) buf += decoder.decode(value, { stream: true });
-    let cut;
-    while ((cut = buf.indexOf("\n\n")) >= 0) {
-      const frame = buf.slice(0, cut);
-      buf = buf.slice(cut + 2);
-      let name = "", data = "";
-      for (const line of frame.split("\n")) {
-        if (line.indexOf("event:") === 0) name = line.slice(6).trim();
-        else if (line.indexOf("data:") === 0) data = line.slice(5).trim();
-      }
-      if (!name) continue;
-      if (name === "done") {
-        renderCheckView(JSON.parse(data));
-        return true;
-      }
-      if (name === "error") {
-        const detail = (JSON.parse(data) || {}).detail || "check-now failed";
-        showError(detail);
-        refreshBadge();
-        return true;
-      }
-      let detail = {};
-      try { detail = data ? JSON.parse(data) : {}; } catch (e) { /* stage only */ }
-      onStage(name, detail);
-    }
-    if (done) return false; // stream died mid-turn: caller falls back
-  }
+function revealBoardName(board) {
+  const names = { esp32_devkit: "ESP32 DevKit", arduino_uno: "Arduino Uno" };
+  return names[board] || "";
 }
 
-async function checkNow(transcript) {
-  if (!cookMode && !learnSid) {
-    $("instruction").textContent =
-      "Start a project first - pick one above, then CHECK NOW verifies your wiring.";
-    speak("Start a project first, then I will check your wiring.");
-    return;
+function revealPartTitles(wires, board) {
+  // Board first, then each wired part once, display titles verbatim.
+  const titles = [];
+  const boardName = revealBoardName(board);
+  if (boardName) titles.push(boardName);
+  for (const w of wires || []) {
+    const t = w && (w.part_title || "");
+    if (t && titles.indexOf(t) < 0) titles.push(t);
   }
-  if (flashBusy) {
-    const box = $(cookMode ? "cook-instruction" : "instruction");
-    if (box) box.textContent = "Flashing — CHECK unlocks when it finishes.";
-    return;
+  return titles;
+}
+
+function revealSpeech(title, parts) {
+  const list = (parts || []).filter((p) => p);
+  let need = "the parts on your bench";
+  if (list.length === 1) need = revealArticle(list[0]) + " " + list[0];
+  else if (list.length > 1) {
+    const last = list[list.length - 1];
+    need = list.slice(0, -1).map((p) => revealArticle(p) + " " + p)
+      .join(", ") + ", and " + revealArticle(last) + " " + last;
   }
-  if (busy) return;
-  cancelWireSpeech(); // this run owns speech and the diagram now
-  busy = true;
-  clearAutoTimer(); // this run owns the loop now; finally re-arms it
-  // An open page port would block the probe; a wedged port must not hang
-  // the check before its own cancel exists (busy would stick forever).
-  await Promise.race([closeWebPortQuiet(),
-    new Promise((r) => setTimeout(r, 2000))]);
-  Orb.thinkStart();
-  checkAbort = new AbortController();
-  let checkTimedOut = false;
-  const checkTimer = setTimeout(() => {
-    checkTimedOut = true;
-    if (checkAbort) checkAbort.abort();
-  }, CHECK_TIMEOUT_MS);
-  $("check").disabled = true;
-  $("cancel").hidden = false;
-  const t0 = Date.now();
-  let stage = "Working…";
-  const paint = () => {
-    $("instruction").textContent = stage + " " + Math.round((Date.now() - t0) / 1000) + "s";
+  return "Here is the circuit we are going to build" +
+    (title ? " for " + title : "") + ". We need " + need + ".";
+}
+// reveal:speech:end
+
+// wire:beats:start
+function wireBeatSay(wire, idx, total, boardTitle) {
+  // One wire, narrated: endpoints, color, position. Everything comes
+  // from the netlist annotation; nothing is invented. (Article helper
+  // shared with the reveal block, concatenated in tests.)
+  const w = wire || {};
+  const fromPin = w.board_pin || "?";
+  const toPin = w.part_pin || "?";
+  const part = w.part_title || "the part";
+  const board = boardTitle || "the board";
+  const color = w.color_name || "";
+  return "Wire " + (idx + 1) + " of " + total + ": Connect the " + fromPin +
+    " pin on " + board + " to the " + toPin + " pin on " + part +
+    (color ? ". Use " + revealArticle(color) + " " + color + " wire." : ".");
+}
+
+function wireBeatsForStep(wires, stepN, boardTitle) {
+  const stepWires = (wires || []).filter((w) => w && w.step_added === stepN);
+  return stepWires.map((w, i) => ({
+    key: (w.part || "") + ":" + (w.part_pin || ""),
+    wire: w,
+    say: wireBeatSay(w, i, stepWires.length, boardTitle),
+  }));
+}
+// wire:beats:end
+
+let appRevealed = false; // Start Building tapped for this session
+let appPhase = "IDEATION";
+let appFault = false; // rescue latched by the monitor
+let monitorOn = false; // telemetry streaming
+let wireBeats = []; // this step's wires, narrated one by one
+let wireBeatIdx = 0;
+let wireBeatAcked = false;
+let lastFlashPort = ""; // the monitor reuses the deploy port
+
+function currentPhaseCtx() {
+  const dialog = $("flash-dialog");
+  return {
+    hasSession: !!learnSid,
+    revealed: appRevealed,
+    fault: appFault,
+    monitorOn: monitorOn,
+    flashOpen: flashBusy || !!(dialog && !dialog.hidden),
   };
-  $("instruction").textContent = "Checking…";
-  const ack = transcript === "phase done" && learnSid
-    ? "Got it — checking phase " + learnStepN + "."
-    : (transcript ? "Got it. Checking." : "Checking.");
-  if (!autoFired) speak(ack); // ack the technician, then the verdict replaces it
-  const tick = setInterval(paint, 1000);
+}
+
+function paintCoachBar(instruction) {
+  const bar = $("coach-bar");
+  if (!bar) return;
+  bar.hidden = !cookMode;
+  if (!cookMode) return;
+  appPhase = resolveAppPhase(currentPhaseCtx());
+  if (instruction !== undefined && instruction !== null) {
+    $("coach-text").textContent = instruction;
+  }
+  const action = coachPrimaryAction({
+    phase: appPhase,
+    serverState: (cookView && cookView.state) || learnState,
+    wiresTotal: wireBeats.length,
+    wireIdx: wireBeatIdx,
+    wireAcked: wireBeatAcked,
+    stepN: learnStepN,
+    stepsTotal: (cookView && cookView.steps_total) || learnStepTotal,
+  });
+  const btn = $("coach-primary");
+  if (!action) {
+    btn.hidden = true;
+    btn.classList.remove("coach-deploy");
+    return;
+  }
+  btn.hidden = false;
+  btn.textContent = action.label;
+  btn.dataset.action = action.id;
+  btn.classList.toggle("coach-deploy", action.id === "deploy");
+}
+
+function coachTapped() {
+  const id = ($("coach-primary").dataset.action) || "";
+  if (id === "start-building") revealToBuilding();
+  else if (id === "ready") sendReady("ready");
+  else if (id === "wire-connected") ackWireBeat();
+  else if (id === "wire-next") nextWireBeat();
+  else if (id === "next-step") sendNextStep();
+  else if (id === "deploy") openDeploy();
+}
+$("coach-primary").onclick = () => coachTapped();
+
+function toggleCoachMore() {
+  const ov = $("coach-overflow");
+  ov.hidden = !ov.hidden;
+}
+$("coach-more").onclick = () => toggleCoachMore();
+
+function toggleMute() {
+  muted = !muted;
+  try { localStorage.setItem("fundiloop-muted", muted ? "1" : "0"); } catch (e) { /* private mode */ }
+  if (muted) VoiceEngine.stop();
+  updateMuteBtn();
+}
+$("coach-voice").onclick = () => toggleMute();
+
+function setDrawer(which, open) {
+  const el = $(which === "left" ? "left-drawer" : "right-drawer");
+  if (el) el.hidden = !open;
+}
+
+function toggleDrawer(which) {
+  const el = $(which === "left" ? "left-drawer" : "right-drawer");
+  if (el) setDrawer(which, el.hidden);
+}
+$("left-drawer-tab").onclick = () => toggleDrawer("left");
+$("left-drawer-close").onclick = () => setDrawer("left", false);
+$("right-drawer-tab").onclick = () => toggleDrawer("right");
+$("right-drawer-close").onclick = () => setDrawer("right", false);
+
+function maybeOpenDrawer(v) {
+  // The drawer opens itself for moments that live inside it: DONE
+  // stretch cards and escalated fix-it chains.
+  const fundi = (v || {}).fundi || {};
+  if (fundi.event === "LESSON_DONE") { setDrawer("left", true); return; }
+  if (fundi.troubleshoot && fundi.troubleshoot.length) {
+    setDrawer("left", true);
+  }
+}
+
+function logCoach(who, text) {
+  // Tiny coach history for the drawer (cap 20, newest last).
+  const log = $("coach-log");
+  if (!log || !text) return;
+  while (log.children.length >= 20) log.removeChild(log.firstChild);
+  const li = document.createElement("li");
+  li.textContent = who + ": " + text;
+  log.appendChild(li);
+}
+
+let revealView = null; // stored /diagnose view while revealing
+
+async function enterReveal(view, project) {
+  revealView = view;
+  stopMonitor("New session.");
+  exitRescue(false);
+  appRevealed = false;
+  wireBeats = [];
+  wireBeatIdx = 0;
+  wireBeatAcked = false;
+  // Fresh-session hygiene: nothing from the last build leaks into
+  // this one — step counters, code cache, cue memory, auto baseline.
+  // The reveal total comes from THIS view, never the stale global.
+  const total = (view && view.steps_total) || learnStepTotal || 1;
+  learnStepN = 1;
+  learnStepTotal = total;
+  learnTitle = (view && view.project_title) || "";
+  learnDone = false;
+  codeFetchedSid = "";
+  appPhase = "REVEAL";
+  enterCookMode(view, { quiet: true });
+  setSchematicView("cards");
+  // Full-project diagram: the last step's netlist is the whole build.
   try {
-    const fault = $("fault").value || null;
-    const payload = {
-      code_snippet: $("code").value || "",
-      simulate_fault: fault,
-      transcript: transcript || "",
-    };
-    try {
-      const onStage = (name, detail) => {
-        if (CHECK_STAGES[name]) { stage = CHECK_STAGES[name]; paint(); }
-        else if (name === "CHAPTER_PASSED" || name === "CHAPTER_HINT") {
-          paintFundi({ event: name, chapter: (detail && detail.chapter) || null,
-            next_chapter: (detail && detail.next_chapter) || null,
-            celebration: (detail && detail.celebration) || "" });
-        }
-      };
-      if (await checkNowStream(payload, onStage)) return;
-    } catch (e) {
-      if (checkAbort && checkAbort.signal.aborted) {
-        pendingCheck = "";
-        if (checkTimedOut) {
-          $("instruction").textContent = CHECK_TIMEOUT_MSG;
-          if (cookMode) $("cook-heard").textContent = CHECK_TIMEOUT_MSG;
-          speak("Check timed out. Try again, or move on.");
-        } else {
-          $("instruction").textContent = "Cancelled.";
-          VoiceEngine.stop();
-        }
-        return;
-      }
-      console.log("stream turn failed, falling back", e);
-    }
-    const r = await fetch("/api/session/check-now", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: checkAbort ? checkAbort.signal : undefined,
-    });
-    const view = await r.json();
-    if (!r.ok) {
-      // Real camera/Meta error: show it, do not render a faked turn.
-      showError((view && view.detail) || "check-now failed");
-      refreshBadge();
+    await fetchSchematic("cook-schematic-svg", "cook-schematic-wires",
+      cookSchematicState, "cook-schematic-sel", total);
+  } catch (e) { /* the diagram is a bonus; voice carries the reveal */ }
+  const line = revealSpeech(project && project.title,
+    revealPartTitles(cookSchematicState.wires, learnBoard));
+  paintCoachBar("Review the circuit, then tap Start Building.");
+  cookSpeak(line);
+}
+
+function revealToBuilding() {
+  const v = revealView || cookView;
+  if (!v) return;
+  revealView = null;
+  appRevealed = true;
+  setSchematicView("breadboard");
+  renderCook(v);
+  tutorBeat(v, cookSpeak, { quiet: false, manual: true });
+}
+
+function openDeploy() {
+  // DONE primary: flash the finished firmware via the deploy bar's port.
+  const port = ($("cook-flash-port") && $("cook-flash-port").value) || "";
+  if (!port) {
+    $("cook-flash-status").textContent = "Pick the ESP32 serial port first, then DEPLOY — or CONNECT BOARD to flash from the browser.";
+    cookSpeak("Pick the ESP32 serial port in the deploy bar first, then tap Deploy.");
+    return;
+  }
+  flashFinal("cook-flash-port", "cook-flash-status");
+}
+
+let beatsKey = ""; // sid:step the current beats were built for
+let beatSpeech = null; // live beat-narration token
+
+function cancelBeatSpeech() { beatSpeech = null; }
+
+function speakBeat(beat, delayMs) {
+  // Narrate one wire, yielding to speech already in flight (the step
+  // opening): retry briefly, then speak anyway so beats never stall
+  // silent behind a wedged utterance. Any tap cancels the pending one.
+  const mine = {};
+  beatSpeech = mine;
+  let tries = 0;
+  const attempt = () => {
+    if (beatSpeech !== mine) return;
+    if (speechActive() && tries < 120) {
+      tries++;
+      setTimeout(attempt, 500);
       return;
     }
-    renderCheckView(view);
-  } catch (e) {
-    if (checkAbort && checkAbort.signal.aborted) {
-      pendingCheck = "";
-      if (checkTimedOut) {
-        $("instruction").textContent = CHECK_TIMEOUT_MSG;
-        if (cookMode) $("cook-heard").textContent = CHECK_TIMEOUT_MSG;
-        speak("Check timed out. Try again, or move on.");
-      } else {
-        $("instruction").textContent = "Cancelled.";
-      }
-    } else {
-      showError(e.message);
+    cookSpeak(beat.say);
+  };
+  setTimeout(attempt, delayMs || 0);
+}
+
+function coachBeatText() {
+  if (!wireBeats.length || wireBeatIdx >= wireBeats.length) {
+    return (cookView && cookView.instruction) || "";
+  }
+  return wireBeats[wireBeatIdx].say;
+}
+
+function buildWireBeats() {
+  // (Re)build this step's wire beats from the cook netlist. Step and
+  // session changes reset (and speak the first wire); re-renders and
+  // late-arriving wires keep acked progress.
+  if (!cookMode) return;
+  const key = learnSid + ":" + learnStepN;
+  const st = cookSchematicState;
+  const fresh = st.sid === learnSid && st.n === learnStepN;
+  const build = () => {
+    wireBeats = wireBeatsForStep(st.wires, learnStepN,
+      revealBoardName(learnBoard));
+    wireBeatIdx = 0;
+    wireBeatAcked = false;
+    paintWireBeat();
+    paintCoachBar(coachBeatText());
+    if (wireBeats.length) speakBeat(wireBeats[0], 500);
+  };
+  if (key !== beatsKey) {
+    cancelBeatSpeech();
+    beatsKey = key;
+    wireBeats = [];
+    wireBeatIdx = 0;
+    wireBeatAcked = false;
+    if (!fresh) {
+      paintWireBeat();
+      paintCoachBar(coachBeatText());
+      return;
     }
-  } finally {
-    clearTimeout(checkTimer);
-    clearInterval(tick);
-    Orb.thinkEnd();
-    busy = false;
-    checkAbort = null;
-    autoFired = false; // backstop: render already consumed it normally
-    $("check").disabled = false;
-    $("cancel").hidden = true;
-        const q = pendingCheck;
-    pendingCheck = "";
-    if (q) checkNow(q); // voice trigger heard mid-turn: run it now
-    else scheduleAutoCheck(); // cook loop continues unless interrupted
-    drainCookVoice(); // cook feedback heard mid-check gets answered now
+    build();
+    return;
+  }
+  if (!wireBeats.length && fresh && (st.wires || []).length) build();
+}
+
+function ackWireBeat() {
+  if (!wireBeats.length || wireBeatAcked) return;
+  if (wireBeatIdx >= wireBeats.length) return;
+  cancelBeatSpeech();
+  wireBeatAcked = true;
+  paintCoachBar(coachBeatText());
+}
+
+function nextWireBeat() {
+  if (!wireBeats.length || !wireBeatAcked) return;
+  if (wireBeatIdx + 1 >= wireBeats.length) return;
+  cancelBeatSpeech();
+  wireBeatIdx += 1;
+  wireBeatAcked = false;
+  paintWireBeat();
+  paintCoachBar(coachBeatText());
+  speakBeat(wireBeats[wireBeatIdx], 0);
+}
+
+function paintWireBeat() {
+  // Focus the active wire: it glows and redraws, its endpoint parts
+  // glow, sibling wires of this step dim. Done or beatless steps
+  // restore the full diagram.
+  const svg = $("cook-schematic-svg");
+  if (!svg) return;
+  svg.removeAttribute("data-sel");
+  const groups = svg.querySelectorAll('g[id^="wire-"]');
+  groups.forEach((g) => {
+    g.classList.remove("wire-active", "wire-dim");
+    g.style.opacity = ""; // click-isolate is inline; beats own this diagram
+  });
+  svg.querySelectorAll(".schematic-part").forEach(
+    (g) => g.classList.remove("part-active"));
+  if (!wireBeats.length || wireBeatIdx >= wireBeats.length) return;
+  const beat = wireBeats[wireBeatIdx];
+  const activeId = schematicWireId(beat.wire);
+  groups.forEach((g) => {
+    if (g.id === activeId) {
+      g.classList.add("wire-active");
+      g.setAttribute("opacity", "1");
+      animateWireNow(g, 0);
+    } else if (g.classList.contains("schematic-new")) {
+      g.classList.add("wire-dim");
+    }
+  });
+  const partEl = document.getElementById(schematicPartId(beat.wire.part || ""));
+  if (partEl) partEl.classList.add("part-active");
+  const boardEl = document.getElementById("part-esp32");
+  if (boardEl) boardEl.classList.add("part-active");
+}
+
+// monitor:start
+const MONITOR_MAX_LINES = 200; // painted lines kept in the monitor panel
+const MONITOR_CTX_LINES = 15; // recent lines sent to the tutor on rescue
+const MONITOR_STALL_MS = 8000; // silence that means the stream stalled
+const MONITOR_READOUT_MS = 12000; // slowest spoken telemetry readout
+const MONITOR_PROOF_LINES = 5; // trailing healthy lines that prove the build
+
+// monitor:pure:start
+function classifyTelemetryLine(line) {
+  // Deterministic triage for one device line: a spoken measurement
+  // (value + canonical unit), or a fault flag. Boot chatter never
+  // faults and never speaks; any negative reading is bogus.
+  const text = String(line == null ? "" : line);
+  if (!text.trim()) return { value: null, unit: "", fault: false };
+  if (/rst:|boot:|load:|entry |ets [A-Z]/i.test(text)) {
+    return { value: null, unit: "", fault: false };
+  }
+  const faultWord = /\b(error|timeout|time-out|fail|failed|nan|no echo|no response|not found|disconnect)\b/i.test(text);
+  const sentinel = /(^|:\s*)-1(\D|$)/.test(text);
+  let m = text.match(/distance\s*[:=]?\s*(-?\d+(?:\.\d+)?)\s*(cm|mm|meters?|inches?|in|m)?/i);
+  let value = null, unit = "";
+  if (m) {
+    value = parseFloat(m[1]);
+    unit = m[2] || "cm";
+  } else if ((m = text.match(/(-?\d+(?:\.\d+)?)\s*(cm|mm|meters?|inches?|in|m)\b/i))) {
+    value = parseFloat(m[1]);
+    unit = m[2];
+  }
+  unit = unit.toLowerCase();
+  if (unit === "meter" || unit === "meters") unit = "m";
+  if (unit === "inch" || unit === "inches" || unit === "in") unit = "in";
+  const fault = faultWord || sentinel || (value !== null && value < 0);
+  if (fault) return { value: null, unit: "", fault: true };
+  return { value: value, unit: unit, fault: false };
+}
+
+function telemetryReadout(c) {
+  // One spoken sentence for a classified line, or "" when there is
+  // nothing worth interrupting the tutor for.
+  if (!c || c.value === null || c.value === undefined || c.fault) return "";
+  const word = { cm: "centimeters", mm: "millimeters", m: "meters",
+    in: "inches" }[c.unit] || "";
+  if (!word) return "";
+  return "You are at " + (Math.round(c.value * 10) / 10) + " " + word + ".";
+}
+
+function telemetryProvesLife(line) {
+  // A line counts toward telemetry proof when it carries a live
+  // measurement or the firmware heartbeat. Boot chatter and bare
+  // chatter never count; fault lines reset the streak instead.
+  const c = classifyTelemetryLine(line);
+  if (c.fault) return false;
+  if (c.value !== null && c.value !== undefined) return true;
+  return /(status|heartbeat|\bhb\b|^ok\b|alive)/i.test(String(line || ""));
+}
+// monitor:pure:end
+
+let monitorSource = null; // live EventSource, one stream at a time
+let monitorStallTimer = null;
+let monitorCtx = []; // recent raw lines for the rescue diagnosis
+let monitorCount = 0;
+let lastMonitorLineAt = 0;
+let lastMonitorReadoutAt = 0;
+let monitorStreak = 0; // trailing healthy-shape lines toward proof
+let monitorVerified = false; // proof accepted (one DONE per session)
+let monitorVerifyCooldownUntil = 0;
+
+function paintMonitorMeta() {
+  const meta = $("monitor-meta");
+  if (meta) meta.textContent = "Listening · " + monitorCount + " lines";
+}
+
+function appendMonitorLine(line) {
+  const out = $("monitor-out");
+  if (!out) return;
+  out.textContent += line + "\n";
+  const rows = out.textContent.split("\n");
+  if (rows.length > MONITOR_MAX_LINES + 1) {
+    out.textContent = rows.slice(rows.length - MONITOR_MAX_LINES - 1).join("\n");
+  }
+  out.scrollTop = out.scrollHeight;
+}
+
+function maybeSpeakReadout(c) {
+  const say = telemetryReadout(c);
+  if (!say || muted) return;
+  const now = Date.now();
+  if (now - lastMonitorReadoutAt < MONITOR_READOUT_MS) return;
+  if (speechActive()) return; // readouts never queue behind the tutor
+  lastMonitorReadoutAt = now;
+  logCoach("Monitor", say);
+  cookSpeak(say);
+}
+
+function onMonitorLine(text) {
+  const line = String(text == null ? "" : text);
+  monitorCtx.push(line);
+  if (monitorCtx.length > MONITOR_CTX_LINES) monitorCtx.shift();
+  monitorCount += 1;
+  lastMonitorLineAt = Date.now();
+  appendMonitorLine(line);
+  paintMonitorMeta();
+  const c = classifyTelemetryLine(line);
+  if (c.fault) {
+    monitorStreak = 0;
+    enterRescue("The board reported: " + line);
+    return;
+  }
+  if (appFault) {
+    exitRescue(true);
+    // fall through: the recovery line itself may count toward proof
+  }
+  Orb.monitor(true);
+  maybeSpeakReadout(c);
+  if (telemetryProvesLife(line)) {
+    monitorStreak += 1;
+    if (monitorStreak >= MONITOR_PROOF_LINES && monitorOn &&
+        !monitorVerified && Date.now() >= monitorVerifyCooldownUntil) {
+      monitorVerified = true; // one attempt per streak; a failed
+      monitorStreak = 0; // attempt cools down, then the streak rebuilds
+      requestTelemetryProof();
+    }
   }
 }
 
+async function requestTelemetryProof() {
+  // The build proves itself: trailing healthy lines go to the server,
+  // which marks DONE only when the evidence holds (never on ask).
+  let v = null;
+  try {
+    const r = await fetch("/api/session/telemetry-verified", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: learnSid,
+        lines: monitorCtx.slice(-MONITOR_CTX_LINES) }),
+    });
+    v = await r.json();
+    if (!r.ok || !v || v.verified === false) throw new Error("not yet");
+  } catch (e) {
+    monitorVerified = false;
+    monitorVerifyCooldownUntil = Date.now() + 30000;
+    return;
+  }
+  if (turnViewStale(v, learnSid)) return;
+  if (!v.learning) return;
+  renderCook(v);
+  logCoach("Coach", v.speak || "It works!");
+  cookSpeak(v.speak || "It works! You built it.");
+}
+
+function monitorWatchdog() {
+  if (!monitorOn || appFault || !lastMonitorLineAt) return;
+  if (Date.now() - lastMonitorLineAt > MONITOR_STALL_MS) {
+    enterRescue("No data for " + Math.round(MONITOR_STALL_MS / 1000) +
+      " seconds — the stream stalled.");
+  }
+}
+
+function startMonitor(port) {
+  // Live serial monitor after the final flash: the stream owns the
+  // port (probes reopen lazily on demand).
+  if (!learnSid) return;
+  stopMonitor("");
+  const usePort = port || lastFlashPort || "";
+  if (!usePort) {
+    cookSpeak("Deploy the firmware first, then I will listen.");
+    return;
+  }
+  monitorOn = true;
+  monitorCtx = [];
+  monitorCount = 0;
+  lastMonitorLineAt = 0;
+  lastMonitorReadoutAt = 0;
+  monitorStreak = 0;
+  monitorVerified = false;
+  monitorVerifyCooldownUntil = 0;
+  setDrawer("right", true);
+  const meta = $("monitor-meta");
+  if (meta) meta.textContent = "Connecting to " + usePort + "…";
+  const out = $("monitor-out");
+  if (out) out.textContent = "";
+  paintCoachBar("Deployed. Listening to your board — interact with " +
+    "it and watch the monitor.");
+  let src;
+  try {
+    src = new EventSource("/project/" + encodeURIComponent(learnSid) +
+      "/telemetry/stream?port=" + encodeURIComponent(usePort) +
+      "&baud=115200");
+  } catch (e) {
+    enterRescue("I could not open the monitor stream.");
+    return;
+  }
+  monitorSource = src;
+  src.addEventListener("ready", () => {
+    lastMonitorLineAt = Date.now();
+    const m = $("monitor-meta");
+    if (m) m.textContent = "Listening on " + usePort + "…";
+  });
+  src.addEventListener("line", (ev) => {
+    let text = "";
+    try { text = String((JSON.parse(ev.data) || {}).line || ""); }
+    catch (e) { text = String(ev.data || ""); }
+    onMonitorLine(text);
+  });
+  src.addEventListener("error", (ev) => {
+    let detail = "";
+    try { detail = String((JSON.parse(ev.data) || {}).detail || ""); }
+    catch (e) { detail = ""; }
+    enterRescue(detail ? ("Monitor error: " + detail)
+                       : "The monitor stream closed.");
+  });
+  src.onerror = () => {
+    if (monitorSource !== src) return;
+    enterRescue("I lost the connection to the board.");
+  };
+  monitorStallTimer = setInterval(monitorWatchdog, 2000);
+}
+
+function stopMonitor(note) {
+  monitorOn = false;
+  if (monitorSource) {
+    try { monitorSource.close(); } catch (e) { /* already closed */ }
+    monitorSource = null;
+  }
+  if (monitorStallTimer) {
+    clearInterval(monitorStallTimer);
+    monitorStallTimer = null;
+  }
+  Orb.monitor(false);
+  const meta = $("monitor-meta");
+  if (meta && note !== "") meta.textContent = note || "Stopped.";
+  if (note !== "") paintCoachBar("Monitor stopped.");
+}
+
+async function requestRescueDiagnosis() {
+  // Model diagnosis for the stalled stream: spoken guidance plus a
+  // suspect netlist wire, or honest generic guidance when the model
+  // names nothing real (the endpoint validates the suspect).
+  const msg = $("rescue-msg"), susp = $("rescue-suspect");
+  let data = null;
+  try {
+    const r = await fetch("/project/" + encodeURIComponent(learnSid) +
+      "/telemetry/diagnose", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lines: monitorCtx.slice(-MONITOR_CTX_LINES) }),
+      });
+    if (r.ok) data = await r.json();
+  } catch (e) { data = null; }
+  if (!appFault) return; // back online while the tutor thought
+  const message = (data && data.message) || "";
+  const suspect = (data && data.suspect) || null;
+  if (msg) {
+    msg.textContent = message ||
+      "The stream stopped and I could not reach the tutor. Check that " +
+      "the board is powered and the wires are seated, then tap START.";
+  }
+  if (suspect && suspect.part && suspect.part_pin) {
+    document.querySelectorAll("#cook-schematic-svg g.wire-fault")
+      .forEach((g) => g.classList.remove("wire-fault"));
+    const g = document.getElementById(
+      schematicWireId({ part: suspect.part, part_pin: suspect.part_pin }));
+    if (g) g.classList.add("wire-fault");
+    const partEl = document.getElementById(schematicPartId(suspect.part));
+    if (partEl) partEl.classList.add("part-active");
+    if (susp) {
+      susp.textContent = "Suspect: " + suspect.part_pin + " on " +
+        suspect.part +
+        (suspect.board_pin ? (" (board " + suspect.board_pin + ")") : "") +
+        " — check that wire.";
+    }
+  } else if (susp) {
+    susp.textContent = "No single wire stood out — check power and ground first.";
+  }
+  if (message) {
+    logCoach("Coach", message);
+    cookSpeak(message);
+  }
+}
+
+function enterRescue(reason) {
+  if (appFault) return;
+  appFault = true;
+  Orb.fault(true);
+  Orb.monitor(false);
+  paintCoachBar("I lost the signal — see the Rescue card.");
+  const card = $("rescue-card"), msg = $("rescue-msg"),
+    susp = $("rescue-suspect");
+  if (card) card.hidden = false;
+  if (msg) msg.textContent = reason || "I lost the signal.";
+  if (susp) susp.textContent = "Asking the tutor…";
+  setDrawer("left", true);
+  logCoach("Coach", "Wait, I lost the signal.");
+  cookSpeak("Wait, I lost the signal. Let me check the last readings.");
+  requestRescueDiagnosis();
+}
+
+function exitRescue(backOnline) {
+  if (!appFault) return;
+  appFault = false;
+  Orb.fault(false);
+  Orb.monitor(monitorOn);
+  document.querySelectorAll("g.wire-fault")
+    .forEach((g) => g.classList.remove("wire-fault"));
+  const card = $("rescue-card");
+  if (card) card.hidden = true;
+  if (backOnline) paintCoachBar("Back online. Your build works.");
+  else paintCoachBar();
+  if (backOnline) {
+    logCoach("Coach", "Back online.");
+    cookSpeak("Got it! We're back online. Great job troubleshooting.");
+  }
+}
+
+function onFinalFlashSuccess(port) {
+  exitRescue(false);
+  startMonitor(port || lastFlashPort);
+}
+$("monitor-stop").onclick = () => stopMonitor();
+$("monitor-start").onclick = () => startMonitor(lastFlashPort);
+$("rescue-complete").onclick = () => sendNextStep("mark complete");
+// monitor:end
+
+// Check turns are gone: steps advance on taps (sendNextStep) and the
+// build proves itself once, in the monitor. Guide-mode diagnosis keeps
+// its own backend turn; the learning UI never checks.
 function drawEvidence(frameFile, detections, mock) {
   // Evidence frame UI removed (Learning-first surface): no-op so the
   // guided render path can keep calling it harmlessly.
@@ -1174,7 +1948,6 @@ function drawEvidence(frameFile, detections, mock) {
 }
 
 function render(v) {
-  paintConfirm(v);
   paintFundi(null); // guided/diagnostic turns carry no lesson chapter
   const box = $("instruction");
   box.textContent = v.instruction || "(no instruction)";
@@ -1183,13 +1956,15 @@ function render(v) {
   box.classList.toggle("done", v.state === "COMPLETE" || v.state === "VERIFIED_FIXED");
   if (v.speak) lastSpeak = v.speak;
   // Camera preview removed from the UI: frame sources are not shown.
-  $("state-line").textContent =
-    "state: " + (v.state || "—") + "  ·  mode: " + (v.mode || "—") +
-    (v.step ? "  ·  step " + (v.step_index + 1) + ": " + v.step.step_id : "") +
-    (v.attempts_total ? "  ·  attempts: " + v.attempts_total : "") +
-    (v.camera_source ? "  ·  " + v.camera_source : "") +
-    (v.frame_settled === false ? "  ·  frame settling…" : "") +
-    (v.timings ? "  ·  " + fmtTimings(v.timings) : "");
+  paintChips($("state-line"), [
+    { value: v.state || "—", cls: stateChipClass(v.state) },
+    { value: v.mode || "—" },
+    v.step ? { label: "step", value: (v.step_index + 1) + " " + v.step.step_id } : null,
+    v.attempts_total ? { label: "attempts", value: v.attempts_total } : null,
+    v.camera_source ? { value: v.camera_source } : null,
+    v.frame_settled === false ? { value: "frame settling…", cls: "warn" } : null,
+    v.timings ? { value: fmtTimings(v.timings) } : null,
+  ]);
   if (v.handoff) {
     pendingHandoff = v.handoff;
     $("handoff-learn").hidden = false;
@@ -1268,10 +2043,23 @@ function render(v) {
 // sessions and their startSession/render implementations remain in
 // the codebase, unreachable from the UI.
 mode = "LEARNING";
-$("check").onclick = () => checkNow("");
 
 let learnParts = [], learnConns = [], learnUnc = [], learnProjects = [], learnSid = "";
+let learnDone = false; // last learning view reached DONE (stops the auto loop)
+let learnState = ""; // last learning view state (holds auto checks during ROLLCALL)
 let learnStepN = 1; // current lesson step number (1-based) for STEP CODE
+let learnTitle = "", learnStepTotal = 0; // resume bar + progress paint
+
+// Step views fetch the schematic by learnStepN; on DONE the
+// session sits past the last step (step null, step_index = total),
+// so clamp to the final step — its schematic IS the full project,
+// and no step/{total+1} fetch 404s.
+function clampLearnStep(v) {
+  learnStepN = (v.step && v.step.n) || (v.step_index || 0) + 1;
+  const total = v.steps_total || 0;
+  if (total > 0 && learnStepN > total) learnStepN = total;
+  if (learnStepN < 1) learnStepN = 1;
+}
 let codeFetchedSid = ""; // session whose .ino is already on screen (cook + learn share)
 let learnBoard = "esp32_devkit";
 
@@ -1286,13 +2074,23 @@ function renderLearnParts(parts) {
 
 function renderLearnCards(projects) {
   learnProjects = projects || [];
+  const card = (num, title, summary, missing, attrs) =>
+    '<li ' + attrs + '><span class="card-top"><b>' + num + esc(title) +
+    '</b><span class="start-pill" aria-hidden="true">Start →</span></span>' +
+    '<br><span class="fine">' + esc(summary || "") + "</span>" +
+    (missing && missing.length
+      ? "<br><span class='fine need'>needs: " + esc(missing.join(", ")) + "</span>"
+      : "") + "</li>";
   $("learn-cards").innerHTML = learnProjects.map((p, i) => {
+    const num = learnProjects.length > 1 ? (i + 1) + ". " : "";
+    const main = card(num, p.title || "project", p.summary || "",
+                      p.missing_parts, 'data-p="' + i + '"');
     const alts = (p.alternatives || []).map((a, j) =>
-      '<li data-p="' + i + '" data-a="' + j + '"><b>ALT: ' + esc(a.title || "alternative") + "</b><br><span class='fine'>" + esc(a.summary || "") + "</span> — Start</li>"
+      card("Alt " + (j + 1) + ". ", a.title || "alternative",
+           a.summary || "", a.missing_parts,
+           'data-p="' + i + '" data-a="' + j + '"')
     ).join("");
-    return '<li data-p="' + i + '"><b>' + (learnProjects.length > 1 ? (i + 1) + ". " : "") + esc(p.title || "project") + "</b><br><span class='fine'>" + esc(p.summary || "") + "</span>" +
-      ((p.missing_parts || []).length ? "<br><span class='fine'>missing: " + esc(p.missing_parts.join(", ")) + "</span>" : "") +
-      " — Start</li>" + alts;
+    return main + alts;
   }).join("");
 }
 
@@ -1308,6 +2106,9 @@ function paintFundi(fundi) {
   const show = (ev === "CHAPTER_PASSED" ? fundi.next_chapter : fundi.chapter) || null;
   if (ev === "LESSON_DONE") {
     banner.textContent = "Lesson complete — your project code is below.";
+    Orb.ok();
+  } else if (ev === "ROLLCALL") {
+    banner.textContent = "Roll call — gather your parts.";
   } else if (show && show.title) {
     banner.textContent = show.title;
   } else {
@@ -1324,27 +2125,50 @@ function paintFundi(fundi) {
 }
 
 function renderLearning(v) {
-  paintConfirm(v);
+  paintRollcall(v);
   paintFundi(v.fundi);
+  const freshLearn = v.id && v.id !== learnSid;
   if (v.id) learnSid = v.id;
-  learnStepN = (v.step && v.step.n) || (v.step_index || 0) + 1;
+  clampLearnStep(v);
+  learnDone = v.state === "DONE";
+  learnState = v.state || "";
+  paintCoachBar(v.instruction);
+  maybeOpenDrawer(v);
+  if (freshLearn && !cookMode) {
+    // New build, no buttons: say the loop out loud once.
+    $("talk-hint").textContent =
+      "Wire along with the tutor — tap a project card to start building.";
+  }
   const box = $("instruction");
   box.textContent = v.instruction || "(no instruction)";
   lastInstruction = v.instruction || "";
   box.classList.toggle("fault", v.state === "VERIFYING");
   box.classList.toggle("done", v.state === "DONE");
   if (v.speak) lastSpeak = v.speak;
-  $("state-line").textContent =
-    "state: " + (v.state || "—") + "  ·  mode: LEARNING" +
-    (v.project_title ? "  ·  project: " + v.project_title : "") +
-    (v.board ? "  ·  board: " + v.board : "") +
-    "  ·  step " + (v.step_index + 1) + "/" + v.steps_total +
-    (v.timings ? "  ·  " + fmtTimings(v.timings) : "");
+  paintChips($("state-line"), [
+    { value: v.state || "—", cls: stateChipClass(v.state) },
+    { value: "LEARNING" },
+    v.project_title ? { value: v.project_title } : null,
+    v.board ? { value: v.board } : null,
+    { label: "step", value: Math.min(v.step_index + 1, v.steps_total) + "/" + v.steps_total },
+    v.timings ? { value: fmtTimings(v.timings) } : null,
+  ]);
+  learnTitle = v.project_title || "";
+  learnStepTotal = v.steps_total || 0;
+  const prog = $("learn-progress");
+  if (learnStepTotal > 0) {
+    prog.hidden = false;
+    prog.value = v.state === "DONE" ? 100
+      : Math.round(100 * (v.steps_passed || 0) / learnStepTotal);
+  } else {
+    prog.hidden = true;
+  }
+  paintResumeBar();
   const ver = v.verification || {};
   let html = ver.test
     ? "test: " + esc(ver.test) + " → " + (ver.passed ? "PASS" : "FAIL") +
       "\nmeasured: " + esc(ver.measured || "")
-    : "no test run yet — press CHECK NOW";
+    : "no evidence yet — the monitor proves the finished build";
   const p = v.probe || {};
   if (p.i2c_devices) html += "\nI2C: [" + esc((p.i2c_devices || []).join(", ") || "none") + "]";
   $("verify").innerHTML = html;
@@ -1357,14 +2181,8 @@ function renderLearning(v) {
     // DONE: the project code arrives on its own; SEND CODE stays as retry.
     setTimeout(() => { if (!cookMode && learnSid && codeFetchedSid !== learnSid) fetchCode(true); }, 150);
   }
-  // Silent board: surface the sketch to copy without hunting for it.
-  const bs = ((v.verification) || {}).board_state || "";
-  if (String(bs).indexOf("silent:") === 0) fetchSketch(true);
-  if (v.step_code && v.step_code.code) {
-    $("code-out").textContent = v.step_code.code;
-    const ports = String(bs).indexOf("silent:") === 0 ? String(bs).slice(7) : "";
-    $("code-kind").textContent = stepSketchLabel(v.step_code.n, ports);
-  }
+  paintTroubleshoot("learn-troubleshoot", (v.fundi || {}).troubleshoot);
+  paintStretch("learn-stretch", (v.fundi || {}).stretch);
   refreshSchematics();
 }
 
@@ -1497,15 +2315,26 @@ async function suggestProjects() {
     return;
   }
   busy = true;
+  Orb.thinkStart(); // orb enters think/planning mode
   learnBoard = $("learn-board").value || "esp32_devkit";
   const key = planCacheKey(learnParts, want, learnBoard, learnConns, learnUnc);
   const renderPlans = (projects, hint) => {
     renderLearnCards(projects || []);
+    const head = $("learn-results-head");
     if (!learnProjects.length) {
+      head.textContent = "";
       $("instruction").textContent = hint || "No buildable project found.";
-      speak("I could not plan a project with these parts.");
+      speak(hint || "I could not plan a project with these parts.");
       return;
     }
+    head.textContent = learnProjects.length === 1
+      ? "Found your project — tap it to start building."
+      : learnProjects.length + " projects found — tap one to start building.";
+    const reduced = window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    $("learn-cards").scrollIntoView({
+      behavior: reduced ? "auto" : "smooth", block: "nearest",
+    });
     const titles = learnProjects.map((p) => p.title).join("; ");
     $("instruction").textContent =
       (learnProjects.length === 1 ? "Tap the project to start: "
@@ -1524,7 +2353,9 @@ async function suggestProjects() {
     const label = "Planning projects for " + learnBoard;
     const t0 = Date.now();
     $("instruction").textContent = label + "…";
-    speak("Planning your projects.");
+    // Instant local ack: server synthesis would leave seconds of quiet
+    // before the first word while the model plans.
+    speakBrowserNow("Planning your projects.");
     tick = setInterval(() => {
       $("instruction").textContent = label + "… " +
         Math.round((Date.now() - t0) / 1000) + "s";
@@ -1540,12 +2371,13 @@ async function suggestProjects() {
     }
     renderPlans(v.projects, v.hint);
   } catch (e) { showError(e.message); }
-  finally { if (tick) clearInterval(tick); busy = false; }
+  finally { if (tick) clearInterval(tick); busy = false; Orb.thinkEnd(); }
 }
 
 async function startLearning(project) {
   if (busy) return;
   busy = true;
+  Orb.thinkStart(); // planning/loading a project
   learnBoard = $("learn-board").value || "esp32_devkit";
   const startLabel = "Starting " + (project.title || "project");
   const startT0 = Date.now();
@@ -1553,7 +2385,9 @@ async function startLearning(project) {
   // Ack only when the start actually takes a while: a fast start speaks
   // once (the cook intro), never ack-then-intro back to back.
   const ackTimer = setTimeout(() => {
-    speak("Getting your project ready.");
+    // Instant local ack: the start already took a while, and server
+    // synthesis would add more quiet before the first word.
+    speakBrowserNow("Getting your project ready.");
   }, 900);
   const startTick = setInterval(() => {
     $("instruction").textContent = startLabel + "… " +
@@ -1579,9 +2413,9 @@ async function startLearning(project) {
     // (guide + parts list) instead of being read out like a script.
     v.speak = "Let's build " + (project.title || "this project") + ". " +
       (v.speak || v.instruction || "");
-    enterCookMode(v);
+    enterReveal(v, project);
   } catch (e) { showError(e.message); }
-  finally { clearTimeout(ackTimer); clearInterval(startTick); busy = false; }
+  finally { clearTimeout(ackTimer); clearInterval(startTick); busy = false; Orb.thinkEnd(); }
 }
 
 // choice:prompt:start
@@ -1707,23 +2541,7 @@ async function fetchCode(auto) {
     } else showError(e.message);
   } finally { busy = false; }
 }
-async function fetchStepCode(preId, heardId) {
-  if (busy || !learnSid) return;
-  busy = true;
-  $(heardId).textContent = "Fetching step " + learnStepN + " code…";
-  try {
-    const r = await fetch("/project/" + encodeURIComponent(learnSid) +
-      "/step/" + learnStepN + "/code");
-    const v = await r.json();
-    if (!r.ok) { $(heardId).textContent = "Step code unavailable."; return; }
-    $(preId).textContent = v.code || "";
-    $(heardId).textContent = "Step " + v.n + " code below (" +
-      (v.source || "template") + "). Upload it, then press CHECK NOW.";
-  } catch (e) { $(heardId).textContent = "Step code failed: " + e.message; }
-  finally { busy = false; }
-}
 $("send-code").onclick = () => fetchCode(false);
-$("send-step-code").onclick = () => fetchStepCode("code-out", "code-kind");
 
 async function copyCode(preId, heardId) {
   const text = $(preId).textContent || "";
@@ -1984,22 +2802,27 @@ function setSchematicView(view) {
   syncSchematicViewButtons();
   if (schematicState.svg) paintSchematic("schematic-svg", "schematic-sel", schematicState, false, 0);
   if (cookSchematicState.svg) paintSchematic("cook-schematic-svg", "cook-schematic-sel", cookSchematicState, false, 0);
+  paintWireBeat(); // full repaints strip beat classes — restore them
 }
 
-async function fetchSchematic(svgId, wiresId, state, selId) {
+async function fetchSchematic(svgId, wiresId, state, selId, stepN) {
   if (!learnSid) return;
-  if (state.sid === learnSid && state.n === learnStepN && state.svg) return;
+  const wantSid = learnSid, wantN = stepN || learnStepN;
+  if (state.sid === wantSid && state.n === wantN && state.svg) return;
   if (schematicBusy) {
-    schematicQueued = { svgId: svgId, wiresId: wiresId, state: state, selId: selId };
+    schematicQueued = { svgId: svgId, wiresId: wiresId, state: state,
+      selId: selId, stepN: wantN };
     return;
   }
   schematicBusy = true;
-  const prevN = (state.sid === learnSid) ? (state.n || 0) : 0;
-  const wantSid = learnSid, wantN = learnStepN;
+  state.fetchToken = (state.fetchToken || 0) + 1;
+  const mine = state.fetchToken; // stale fetches never paint over newer ones
+  const prevN = (state.sid === wantSid) ? (state.n || 0) : 0;
   try {
     const r = await fetch("/project/" + encodeURIComponent(wantSid) +
       "/step/" + wantN + "/schematic");
     const v = await r.json();
+    if (state.fetchToken !== mine || learnSid !== wantSid) return;
     if (!r.ok) {
       $(wiresId).textContent = "Schematic unavailable: " +
         ((v && v.detail) || "unknown error");
@@ -2014,6 +2837,11 @@ async function fetchSchematic(svgId, wiresId, state, selId) {
     state.note = ((net.notes || [])[0]) || "";
     paintSchematic(svgId, selId, state, true, prevN);
     $(wiresId).textContent = wireListText(net.wires, v.unresolved, net);
+    if (svgId === "cook-schematic-svg") {
+      buildWireBeats();
+      paintWireBeat();
+      paintCoachBar();
+    }
   } catch (e) {
     $(wiresId).textContent = "Schematic failed: " + e.message;
   } finally {
@@ -2021,7 +2849,7 @@ async function fetchSchematic(svgId, wiresId, state, selId) {
     if (schematicQueued) {
       const q = schematicQueued;
       schematicQueued = null;
-      fetchSchematic(q.svgId, q.wiresId, q.state, q.selId);
+      fetchSchematic(q.svgId, q.wiresId, q.state, q.selId, q.stepN);
     }
   }
 }
@@ -2029,18 +2857,11 @@ async function fetchSchematic(svgId, wiresId, state, selId) {
 function refreshSchematics() {
   if (!learnSid) return;
   refreshFlashPorts();
+  // During the reveal the full-project diagram is loading (or loaded);
+  // a step fetch now would race it and clobber the reveal.
+  if (cookMode && !appRevealed) return;
   if (cookMode) fetchSchematic("cook-schematic-svg", "cook-schematic-wires", cookSchematicState, "cook-schematic-sel");
   else fetchSchematic("schematic-svg", "schematic-wires", schematicState, "schematic-sel");
-}
-
-function stepSketchLabel(n, ports) {
-  // A silent board needs its step sketch flashed: point at the in-app
-  // flash buttons first (they compile + write + release the port), and
-  // keep the manual Arduino IDE route as the fallback.
-  return "Step " + n + " sketch below — flash it with FLASH ESP32" +
-    " (recommended) or FLASH IN BROWSER below, or copy it into Arduino IDE, Upload" +
-    (ports ? " to " + ports : "") +
-    ", close Serial Monitor, then press CHECK NOW.";
 }
 
 // Click a wire to isolate it (rest dim, selection described below);
@@ -2048,6 +2869,10 @@ function stepSketchLabel(n, ports) {
 // from the SVG <title> elements, no JS needed for those.
 function schematicWireId(w) {
   return ("wire-" + w.part + "-" + w.part_pin).replace(/[^A-Za-z0-9_-]+/g, "_");
+}
+
+function schematicPartId(part) {
+  return ("part-" + part).replace(/[^A-Za-z0-9_-]+/g, "_");
 }
 
 // A wire-speech sequence owns narration until it ends or something newer
@@ -2266,16 +3091,14 @@ $("cook-schematic-speak").onclick = () => {
   else if (cookSchematicState.note) cookSpeak(cookSchematicState.note);
 };
 
-// Shared flash guard. FLASH ESP32 is the primary path: it calls the
-// server's native Python esptool at 921600 baud, matching Arduino IDE's
-// auto-reset upload. FLASH IN BROWSER remains the Web Serial fallback.
+// Shared flash guard. Deploy (FLASH FINAL) calls the server's native
+// Python esptool at 921600 baud, matching Arduino IDE's auto-reset
+// upload.
 let flashBusy = false;
 
 function setFlashButtonsDisabled(disabled) {
-  ["web-flash", "cook-web-flash",
-   "web-connect", "cook-web-connect",
-   "flash-esp32", "cook-flash-esp32",
-   "flash-port", "cook-flash-port"].forEach((id) => {
+  ["flash-final", "cook-deploy", "flash-port", "cook-flash-port",
+   "web-connect", "web-flash", "cook-web-connect"].forEach((id) => {
     if ($(id)) $(id).disabled = disabled;
   });
 }
@@ -2290,12 +3113,18 @@ async function refreshFlashPorts() {
     current = (v.current || {}).port || "";
   } catch (e) { /* keep the last options while the server is offline */ }
   if (current && ports.indexOf(current) < 0) ports.unshift(current);
-  if (!ports.length) ports = [current || "COM3"];
+  // No phantom default: the port is always an explicit pick. A
+  // preselected COM3 would sail past validation and 409/500 later;
+  // the placeholder forces the choice up front instead.
   ["flash-port", "cook-flash-port"].forEach((id) => {
     const sel = $(id);
     if (!sel) return;
     const keep = sel.value || current;
     sel.innerHTML = "";
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = ports.length ? "Select port…" : "No ports found";
+    sel.appendChild(ph);
     ports.forEach((p) => {
       const o = document.createElement("option");
       o.value = p;
@@ -2303,88 +3132,157 @@ async function refreshFlashPorts() {
       if (p === keep) o.selected = true;
       sel.appendChild(o);
     });
+    if (!keep || ports.indexOf(keep) < 0) sel.value = "";
   });
 }
 
-async function flashStep(portId, statusId) {
-  if (!learnSid || flashBusy) return;
-  if (busy) {
-    // Same deal as browser flash: a check must never trap this button —
-    // "wait" is a dead end when checks run back-to-back, so stop it and
-    // hand the port over for one more tap.
-    if (checkAbort) { try { checkAbort.abort(); } catch (e) { /* already gone */ } }
-    cancelWireSpeech();
-    $(statusId).textContent = "Stopped what was running — press FLASH ESP32 " +
-      "again to flash.";
+// flash:sse:start
+// Incremental SSE frame parser (pure: no DOM, safe under node).
+// sseParse(buf) splits complete "\n\n"-terminated frames off the
+// front, returning {frames: [{name, data}], rest} with any partial
+// frame kept in rest for the next chunk.
+function sseParse(buf) {
+  const frames = [];
+  let rest = String(buf || "");
+  let cut;
+  while ((cut = rest.indexOf("\n\n")) >= 0) {
+    const frame = rest.slice(0, cut);
+    rest = rest.slice(cut + 2);
+    let name = "", data = "";
+    for (const line of frame.split("\n")) {
+      if (line.indexOf("event:") === 0) name = line.slice(6).trim();
+      else if (line.indexOf("data:") === 0) data += line.slice(5).trim();
+    }
+    if (name || data) frames.push({ name: name, data: data });
+  }
+  return { frames: frames, rest: rest };
+}
+// flash:sse:end
+
+// Flash terminal dialog: one console shared by server flash, browser
+// flash, and final flash. Closing mid-stream aborts the wait (the
+// server-side write runs to its timeout regardless); closing a
+// browser write just hides the dialog while it finishes, with the
+// panel status line carrying the same log.
+let flashDialogAbort = null; // AbortController for the live stream, if any
+function flashDialogOpen(title) {
+  $("flash-title").textContent = title || "Flashing…";
+  $("flash-console").textContent = "";
+  const prog = $("flash-progress");
+  prog.hidden = false;
+  prog.removeAttribute("value"); // indeterminate until bytes flow
+  $("flash-summary").textContent = "";
+  $("flash-dialog").hidden = false;
+}
+function flashDialogLog(line) {
+  if (line === undefined || line === null) return;
+  const pre = $("flash-console");
+  if (!pre) return;
+  pre.textContent += String(line).replace(/\x1b\[[0-9;]*m/g, "") + "\n";
+  const lines = pre.textContent.split("\n");
+  if (lines.length > 400) pre.textContent = lines.slice(-400).join("\n");
+  pre.scrollTop = pre.scrollHeight;
+}
+function flashDialogProgress(frac) {
+  const prog = $("flash-progress");
+  if (!prog) return;
+  if (frac === null || frac === undefined || isNaN(frac)) {
+    prog.removeAttribute("value");
     return;
   }
-  const port = ($(portId) && $(portId).value) || "";
-  if (!port) {
-    $(statusId).textContent = "Pick the ESP32 serial port first, then press FLASH ESP32.";
-    return;
+  prog.value = Math.round(100 * Math.min(1, Math.max(0, frac)));
+}
+function flashDialogDone(ok, summary) {
+  flashDialogAbort = null;
+  if (ok) {
+    const prog = $("flash-progress");
+    if (prog) prog.value = 100;
   }
-  const say = cookMode ? cookSpeak : speak;
-  say("Flashing step " + learnStepN + " to the ESP32 on " + port + ".");
-  const t0 = Date.now();
-  $(statusId).textContent = "Native esptool at 921600 baud: compiling and flashing step " +
-    learnStepN + " to " + port + "...";
-  const tick = setInterval(() => {
-    $(statusId).textContent = "Native esptool at 921600 baud: compiling and flashing step " +
-      learnStepN + " to " + port + "... " +
-      Math.round((Date.now() - t0) / 1000) + "s";
-  }, 1000);
+  if (summary) $("flash-summary").textContent = summary;
+}
+function flashDialogClose() {
+  if (flashDialogAbort) {
+    try { flashDialogAbort.abort(); } catch (e) { /* already settled */ }
+    flashDialogAbort = null;
+  }
+  $("flash-dialog").hidden = true;
+}
+$("flash-close").onclick = () => flashDialogClose();
+
+// Pump one server flash stream into the dialog. Returns {ok, payload}
+// on done, {ok: false, detail} on error/validation failure, or
+// {cancelled: true} when the dialog was closed mid-stream.
+async function pumpFlashStream(url, body) {
+  const ctrl = new AbortController();
+  flashDialogAbort = ctrl;
+  let r;
   try {
-    flashBusy = true;
-    setFlashButtonsDisabled(true);
-    const r = await fetch("/project/" + encodeURIComponent(learnSid) +
-      "/step/" + learnStepN + "/flash", {
+    r = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ port }),
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
     });
-    const v = await r.json().catch(() => null);
-    if (!r.ok) {
-      const detail = (v && v.detail) || "native flash failed";
-      $(statusId).textContent = detail;
-      say(detail.indexOf("busy or blocked") >= 0
-        ? "Flash failed: the port is busy. Close Arduino IDE and Serial Monitor, then try again."
-        : "Flash failed. See the screen for the error.");
-      return;
-    }
-    const ping = (v.verify_ping && v.verify_ping.answered)
-      ? "Board answered PING."
-      : "Board is silent after the flash, which is expected for a step sketch. Press CHECK NOW.";
-    $(statusId).textContent = "Flashed step " + v.n + " to " + v.port +
-      " at 921600 baud (" + (v.cached ? "cached build " : "build ") +
-      (v.build_hash || "") + "). " + ping;
-    say("Flash complete. Press CHECK NOW.");
   } catch (e) {
-    $(statusId).textContent = "Flash failed: " + e.message +
-      " Check that the backend window is still running, then try again.";
-    say("Flash failed. Check that the server is still running.");
-  } finally {
-    clearInterval(tick);
-    flashBusy = false;
-    setFlashButtonsDisabled(false);
+    flashDialogAbort = null;
+    if (ctrl.signal.aborted) return { cancelled: true };
+    throw e;
   }
+  if (!r.ok || !r.body || !r.body.getReader) {
+    flashDialogAbort = null;
+    let detail = "flash failed";
+    try {
+      const v = await r.json();
+      if (v && v.detail) detail = v.detail;
+    } catch (e) { /* fall through with the default */ }
+    return { ok: false, detail: detail, status: r.status };
+  }
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) buf += decoder.decode(value, { stream: true });
+      const parsed = sseParse(buf);
+      buf = parsed.rest;
+      for (const f of parsed.frames) {
+        let data = null;
+        try { data = JSON.parse(f.data || "null"); } catch (e) { /* ignore */ }
+        if (f.name === "log" && data && data.line !== undefined) {
+          flashDialogLog(data.line);
+        } else if (f.name === "progress" && data) {
+          flashDialogProgress(data.fraction);
+        } else if (f.name === "done") {
+          return { ok: true, payload: data };
+        } else if (f.name === "error") {
+          return { ok: false, detail: (data && data.detail) || "flash failed" };
+        }
+      }
+      if (done) break;
+    }
+  } catch (e) {
+    if (ctrl.signal.aborted) return { cancelled: true };
+    throw e;
+  } finally {
+    flashDialogAbort = null;
+  }
+  return { ok: false, detail: "flash stream ended unexpectedly" };
 }
 
-$("flash-esp32").onclick = () => flashStep("flash-port", "flash-status");
-$("cook-flash-esp32").onclick = () => flashStep("cook-flash-port", "cook-flash-status");
-
-// Browser-side flashing (Web Serial + vendored esptool-js bundle):
-// CONNECT BOARD opens the browser's own port picker (Chrome/Edge;
-// localhost counts as a secure context), then FLASH IN BROWSER
-// downloads the server-compiled binaries and flashes locally with a
-// progress bar. The page releases the port when done so
-// CHECK NOW can use it right after.
-let webPort = null;
-
+// Deploy flash: the finished firmware goes on once the wiring is
+// done, via the server's native esptool path. Telemetry proof follows
+// in the monitor; nothing here verifies per step.
+// Browser flash: the finished firmware over Web Serial. Optional —
+// FLASH FINAL stays the recommended path: the server's native
+// esptool at 921600 baud with auto-reset, the same upload path as
+// Arduino IDE. The browser path exists for machines where the
+// server cannot see the USB port (remote browser, missing driver).
+let webPort = null; // held SerialPort across CONNECT + FLASH taps
 function webLog(statusId, line) {
   const el = $(statusId);
   el.textContent = (el.textContent ? el.textContent + "\n" : "") + line;
 }
-
 function u8ToBstr(u8) {
   let s = "";
   const CHUNK = 0x8000;
@@ -2393,7 +3291,6 @@ function u8ToBstr(u8) {
   }
   return s;
 }
-
 // Classify a browser-flash failure so each kind gets its own recovery
 // guidance: expired (server restarted, session gone) / dead (USB gone,
 // re-pick) / busy (another program holds the port) / link (transfer
@@ -2411,7 +3308,6 @@ function flashFailureKind(msg) {
   if (/failed to connect|connect with the device|sync|timed out|timeout|no serial data received|invalid head of packet|serial noise|corruption/i.test(s)) return "sync";
   return "generic";
 }
-
 async function closeWebPortQuiet() {
   if (!webPort) return;
   if (!webPort.readable && !webPort.writable) return; // picked, never opened
@@ -2423,8 +3319,11 @@ async function closeWebPortQuiet() {
   // with no picker round-trip. Only a dead handle (unplugged board)
   // drops the selection — see webFlash's catch.
 }
-
-async function webConnect(statusId) {
+async function webConnect(statusId, flashWord) {
+  // CONNECT BOARD opens the browser's own port picker (Chrome/Edge;
+  // localhost counts as a secure context), then FLASH IN BROWSER
+  // (or DEPLOY, in cook mode) writes the finished firmware through
+  // the vendored esptool-js bundle — no server port needed.
   if (!(navigator.serial && navigator.serial.requestPort)) {
     $(statusId).textContent = "Web Serial needs Chrome or Edge — " +
       "open this page there to flash the board.";
@@ -2434,7 +3333,8 @@ async function webConnect(statusId) {
     // Picker only — the port stays closed here; the flasher opens it
     // itself during main(), and opening twice would throw.
     webPort = await navigator.serial.requestPort();
-    $(statusId).textContent = "Board selected. Press FLASH IN BROWSER. " +
+    $(statusId).textContent = "Board selected. Press " +
+      (flashWord || "FLASH IN BROWSER") + ". " +
       "(Pick the ESP32 entry — CP2102 / USB-to-UART — not Bluetooth.)";
   } catch (e) {
     $(statusId).textContent = (e && e.name === "NotFoundError")
@@ -2442,17 +3342,32 @@ async function webConnect(statusId) {
       : "Connect failed: " + (e && e.message ? e.message : e);
   }
 }
-
+async function startMonitorAfterWebFlash(say) {
+  // The browser owns no COM name, but the monitor needs one: reuse
+  // the last deploy port, else ask the server to adopt the board.
+  if (lastFlashPort) { startMonitor(lastFlashPort); return; }
+  try {
+    const r = await fetch("/api/serial/autodetect", { method: "POST" });
+    const v = await r.json();
+    const port = v.found && (v.serial_live || {}).port;
+    if (port) {
+      lastFlashPort = port;
+      startMonitor(port);
+      return;
+    }
+  } catch (e) { /* fall through to guidance */ }
+  say("Browser flash complete. Open the monitor and pick the board port to prove the build.");
+  setDrawer("right", true);
+}
 async function webFlash(statusId, progId) {
   if (!learnSid || flashBusy) return; // not in a build, or already flashing
   if (busy) {
-    // A check must never trap the flash button: stop it and hand the
-    // port over — one more tap flashes. Screen only: the dying check's
-    // own speech owns the audio right now.
-    if (checkAbort) { try { checkAbort.abort(); } catch (e) { /* already gone */ } }
+    // A turn must never trap the flash button: one more tap flashes
+    // once it lands. Screen only: the turn's own speech owns the
+    // audio right now.
     cancelWireSpeech();
-    $(statusId).textContent = "Stopped what was running — press FLASH IN " +
-      "BROWSER again to flash; your board stays selected.";
+    $(statusId).textContent = "Still working — press FLASH IN BROWSER " +
+      "again in a moment; your board stays selected.";
     return;
   }
   if (!webPort) {
@@ -2464,7 +3379,7 @@ async function webFlash(statusId, progId) {
   $(statusId).textContent = "";
   $(statusId).scrollIntoView({ block: "nearest" });
   const say = cookMode ? cookSpeak : speak;
-  say("Flashing step " + learnStepN + " from the browser.");
+  say("Flashing the finished firmware from the browser.");
   let transport = null;
   let sawProgress = false;
   try {
@@ -2485,7 +3400,7 @@ async function webFlash(statusId, progId) {
     }
     webLog(statusId, "Compiling on server…");
     const r = await fetch("/project/" + encodeURIComponent(learnSid) +
-      "/step/" + learnStepN + "/firmware");
+      "/firmware");
     const v = await r.json();
     if (!r.ok) throw new Error((v && v.detail) || "compile failed");
     const files = v.files || [];
@@ -2509,7 +3424,7 @@ async function webFlash(statusId, progId) {
               " (" + ((e && e.message) || e) + ")");
           }
           webLog(statusId, "Download hiccup on file " + (f.index + 1) +
-            " - retrying.");
+            " — retrying.");
           await new Promise((res) => setTimeout(res, 1000));
         }
       }
@@ -2519,7 +3434,7 @@ async function webFlash(statusId, progId) {
       fileArray.push({ data: u8ToBstr(new Uint8Array(buf)),
                        address: parseInt(f.offset, 16) });
     }
-    // The server probe holds the port persistently once a check adopts
+    // The server probe holds the port persistently once a session adopts
     // it; the browser can't open it until the server lets go (same
     // release the server-side flash does before esptool runs).
     webLog(statusId, "Releasing the server probe's port…");
@@ -2539,7 +3454,7 @@ async function webFlash(statusId, progId) {
     // at anything faster, and the ladder only wasted minutes proving
     // it again on every flash. One re-sync retry at the same speed,
     // since flaky links often succeed on the second connect. Only
-    // sync/link failures retry - anything else throws immediately.
+    // sync/link failures retry — anything else throws immediately.
     const BAUDS = [115200, 115200];
     for (let bi = 0; bi < BAUDS.length; bi++) {
       const baud = BAUDS[bi];
@@ -2576,18 +3491,15 @@ async function webFlash(statusId, progId) {
         } catch (e2) { /* port already gone */ }
         transport = null;
         if (!retryable || last) throw e;
-        if (BAUDS[bi + 1] < baud) {
-          webLog(statusId, baud + " baud is too fast for this cable — retrying slower…");
-        } else {
-          webLog(statusId, baud + " baud failed — trying once more at the same speed…");
-        }
+        webLog(statusId, baud + " baud failed — trying once more at the same speed…");
         $(progId).removeAttribute("value");
       }
     }
     $(progId).value = 100;
-    webLog(statusId, "Done — releasing the port (the board reboots into " +
-      "the new sketch). Press CHECK NOW to verify.");
-    say("Browser flash complete. Press check now to verify.");
+    $(statusId).textContent = "Done — releasing the port (the board reboots " +
+      "into the new firmware). The monitor proves the build.";
+    say("Browser flash complete.");
+    startMonitorAfterWebFlash(say);
   } catch (e) {
     const msg = e && e.message ? e.message : e;
     if (!sawProgress) $(progId).value = 0; // died before bytes: park it empty
@@ -2597,7 +3509,7 @@ async function webFlash(statusId, progId) {
       // The server stopped answering mid-flash (window closed, process
       // crashed, or a --reload restart). Nothing on the board side can
       // fix this; a restarted server also forgets the session build.
-      webLog(statusId, "The server stopped answering - check the backend " +
+      webLog(statusId, "The server stopped answering — check the backend " +
         "window is still running (restart it if it closed or crashed), " +
         "then tap EXIT, start the project fresh, and flash again.");
       say("The server stopped answering. Restart it, start the project " +
@@ -2628,8 +3540,8 @@ async function webFlash(statusId, progId) {
         webLog(statusId, "The board stopped answering: hold its BOOT button, " +
           "press FLASH IN BROWSER again, and release BOOT once flashing " +
           "starts. Also close Arduino IDE and any Serial Monitor. If it " +
-          "keeps failing, try another cable or port — or press FLASH " +
-          "ESP32, the server's native uploader.");
+          "keeps failing, try another cable or port — or press DEPLOY " +
+          "with a picked serial port (the server's native uploader).");
       }
       say("Browser flash failed. See the screen for the error.");
     }
@@ -2637,7 +3549,7 @@ async function webFlash(statusId, progId) {
     try {
       if (transport && transport.disconnect) await transport.disconnect();
     } catch (e2) { /* port already gone */ }
-    // Closed but kept: CHECK NOW works right away, and a retry (e.g.
+    // Closed but kept: the monitor probes right away, and a retry (e.g.
     // while holding BOOT) needs no fresh picker round-trip.
     try {
       if (webPort) await webPort.close();
@@ -2648,16 +3560,102 @@ async function webFlash(statusId, progId) {
     setFlashButtonsDisabled(false);
   }
 }
+async function cookDeploy() {
+  // One DEPLOY for both engines: a connected browser port flashes
+  // from the browser, otherwise the server dialog flashes the
+  // picked COM port. The bar's status line names the engine.
+  if (!cookMode || !learnSid) return;
+  if (webPort) {
+    webFlash("cook-flash-status", "cook-webflash-progress");
+    return;
+  }
+  openDeploy();
+}
+function paintDeployBar() {
+  const show = cookMode && !!learnSid;
+  $("deploy-bar").hidden = !show;
+  document.body.classList.toggle("deploy-on", show);
+}
+async function flashFinal(portId, statusId) {
+  if (!learnSid || flashBusy) return;
+  if (busy) {
+    cancelWireSpeech();
+    $(statusId).textContent = "Still working — press FLASH FINAL " +
+      "again in a moment.";
+    return;
+  }
+  const port = ($(portId) && $(portId).value) || "";
+  if (!port) {
+    $(statusId).textContent = "Pick the ESP32 serial port first, then press FLASH FINAL.";
+    return;
+  }
+  const say = cookMode ? cookSpeak : speak;
+  say("Flashing the finished project to the ESP32 on " + port + ".");
+  flashDialogOpen("Flashing the finished project to " + port);
+  flashDialogProgress(null);
+  try {
+    flashBusy = true;
+    setFlashButtonsDisabled(true);
+    Orb.thinkStart(); // the orb spins while flashing
+    const res = await pumpFlashStream(
+      "/project/" + encodeURIComponent(learnSid) + "/flash/stream",
+      { port });
+    if (res.cancelled) {
+      flashDialogLog("Cancelled — the board may be half-flashed; flash again to be sure.");
+      flashDialogDone(false, "Cancelled.");
+      $(statusId).textContent = "Flash cancelled.";
+      return;
+    }
+    if (!res.ok) {
+      const detail = res.detail || "native flash failed";
+      flashDialogLog(detail);
+      flashDialogDone(false, "Flash failed.");
+      $(statusId).textContent = detail;
+      say(detail.indexOf("busy or blocked") >= 0
+        ? "Flash failed: the port is busy. Close Arduino IDE and Serial Monitor, then try again."
+        : "Flash failed. See the screen for the error.");
+      return;
+    }
+    const v = res.payload || {};
+    const ping = (v.verify_ping && v.verify_ping.answered)
+      ? "Board answered PING."
+      : "Board is silent after the flash — your finished project is running.";
+    const summary = "Flashed the finished project to " + v.port +
+      " at 921600 baud (" + (v.cached ? "cached build " : "build ") +
+      (v.build_hash || "") + "). " + ping;
+    flashDialogLog(summary);
+    flashDialogDone(true, summary);
+    $(statusId).textContent = summary;
+    lastFlashPort = port;
+    say("Final flash complete. Your project is running.");
+    onFinalFlashSuccess(port);
+  } catch (e) {
+    const msg = "Flash failed: " + e.message +
+      " Check that the backend window is still running, then try again.";
+    flashDialogLog(msg);
+    flashDialogDone(false, "Flash failed.");
+    $(statusId).textContent = msg;
+    say("Flash failed. Check that the server is still running.");
+  } finally {
+    flashBusy = false;
+    setFlashButtonsDisabled(false);
+    Orb.thinkEnd();
+  }
+}
 
+$("flash-final").onclick = () => flashFinal("flash-port", "flash-status");
 $("web-connect").onclick = () => webConnect("webflash-status");
-$("cook-web-connect").onclick = () => webConnect("cook-webflash-status");
 $("web-flash").onclick = () => webFlash("webflash-status", "webflash-progress");
-$("cook-web-flash").onclick = () => webFlash("cook-webflash-status", "cook-webflash-progress");
+$("cook-web-connect").onclick = () => webConnect("cook-flash-status", "DEPLOY");
+$("cook-deploy").onclick = () => cookDeploy();
+
+// Deploy uses the server's native esptool path only (flashFinal):
+// browser-side step flashing went away with per-step checks.
 
 // Hands-free voice loop: tap PUSH TO TALK to record (MediaRecorder), tap
 // again to stop, upload to /api/voice/transcribe, show the transcript, and
-// auto-run one loop turn when it contains done / fixed / moved it.
-const TRIGGER_WORDS = ["done", "fixed", "moved it"];
+// advance a step when it contains done / next / move on.
+const TRIGGER_WORDS = ["done", "next", "move on"];
 let pttRec = null, pttChunks = [], pttRecording = false;
 
 async function transcribeUpload(blob) {
@@ -2875,7 +3873,7 @@ if (wakeOn) startWakeWatch();
 function handlePttTranscript(text, tag, error) {
   if (text) lastTranscript = text;
   if (!text) {
-    $("talk-hint").textContent = "Transcription empty" + (error ? ": " + error : "") + " — use CHECK NOW.";
+    $("talk-hint").textContent = "Transcription empty" + (error ? ": " + error : "") + " — tap instead.";
     return;
   }
   if (mode === "LEARNING") {
@@ -2886,17 +3884,19 @@ function handlePttTranscript(text, tag, error) {
   }
   const hit = TRIGGER_WORDS.some((w) => text.toLowerCase().includes(w));
   if (hit && busy) {
-    pendingCheck = text;
-    $("talk-hint").textContent = 'heard: "' + text + '"' + tag + " → queued, will check when ready.";
+    pendingVoiceStep = text;
+    $("talk-hint").textContent = 'heard: "' + text + '"' + tag + " → queued, will advance when ready.";
+  } else if (hit && learnSid) {
+    $("talk-hint").textContent = 'heard: "' + text + '"' + tag + " → next step…";
+    sendNextStep(text);
   } else {
-    $("talk-hint").textContent = 'heard: "' + text + '"' + tag + (hit ? " → checking…" : " — say done / fixed / moved it, or CHECK NOW.");
-    if (hit) checkNow(text);
+    $("talk-hint").textContent = 'heard: "' + text + '"' + tag + " — say done or next, or tap a project card.";
   }
 }
 
 function startPttRecorder(btn) {
   if (!("MediaRecorder" in window) || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
-    $("talk-hint").textContent = "Audio capture unavailable — use CHECK NOW.";
+    $("talk-hint").textContent = "Audio capture unavailable — tap the buttons instead.";
     return;
   }
   navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
@@ -2916,7 +3916,7 @@ function startPttRecorder(btn) {
         const text = (t.text || "").trim();
         const tag = t.note ? " (" + t.note + ")" : "";
         handlePttTranscript(text, tag, t.error || "");
-      } catch (e) { $("talk-hint").textContent = "Transcription failed — use CHECK NOW."; }
+      } catch (e) { $("talk-hint").textContent = "Transcription failed — tap instead."; }
     };
     pttRec.start();
     OrbWave.tapStream(stream); // orb ripples with the mic
@@ -2924,7 +3924,7 @@ function startPttRecorder(btn) {
     pttRecording = true;
     btn.classList.add("rec");
     btn.textContent = "LISTENING — TAP TO STOP";
-  }).catch(() => { $("talk-hint").textContent = "Microphone blocked — use CHECK NOW."; });
+  }).catch(() => { $("talk-hint").textContent = "Microphone blocked — tap the buttons instead."; });
 }
 
 function pttToggle(btn) {
@@ -3085,11 +4085,11 @@ function stopLive(note) {
 // Cook Mode: NYT-style guided step runner for learning projects.
 // One step at a time on a full-screen card (step X of Y, progress bar,
 // parts chips, live camera with SAM boxes), driven by voice: TALK to ask
-// or command (check / repeat / look / exit), everything spoken back.
-// Verification still runs through checkNow: the sensor alone advances.
+// or command (next / repeat / look / exit), everything spoken back.
+// Steps advance on taps; the monitor's telemetry alone proves the build.
 let cookMode = false, cookView = null;
 let cookRec = null, cookChunks = [], cookRecording = false;
-let cookPendingVoice = ""; // cook feedback heard mid-check, answered when free
+let cookPendingVoice = ""; // cook feedback heard mid-turn, answered when free
 let cookListenAuto = false; // this listen was hands-free, not a TALK tap
 const COOK_LISTEN_MS = 6000;
 
@@ -3119,63 +4119,8 @@ function coachSessionId() {
 
 let cookSilentStreak = 0; // consecutive heard-nothings; caps the loop
 
-// Auto-continue: while Cook Mode is open, a CHECK refires every 20s so
-// a PASS flows straight into the next phase with no tap. Repeats of an
-// identical FAIL stay silent (see renderCheckView). Anything that ends
-// the build flow interrupts it: AUTO toggle off, cook EXIT, or DONE.
-const AUTO_CHECK_MS = 20000;
-let autoCheckOn = true;
-let autoTimer = null, autoTick = null;
-let autoFired = false; // this checkNow came from the loop, not the user
-let lastAutoKey = ""; // step:pass/fail of the previous cook verdict
-
-function paintAuto(secs) {
-  const el = $("cook-auto");
-  if (!el) return;
-  el.textContent = !autoCheckOn ? "AUTO OFF"
-    : (secs ? "AUTO ✓ " + secs + "s" : "AUTO ✓");
-}
-
-function clearAutoTimer() {
-  if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
-  if (autoTick) { clearInterval(autoTick); autoTick = null; }
-  paintAuto(0);
-}
-
-function scheduleAutoCheck() {
-  clearAutoTimer();
-  if (!cookMode || !autoCheckOn || !learnSid) return;
-  if (cookView && cookView.state === "DONE") {
-    const el = $("cook-auto");
-    if (el) el.textContent = "AUTO ✓ DONE";
-    return;
-  }
-  let remain = Math.round(AUTO_CHECK_MS / 1000);
-  paintAuto(remain);
-  autoTick = setInterval(() => {
-    remain -= 1;
-    if (remain <= 0) {
-      clearInterval(autoTick);
-      autoTick = null;
-      return;
-    }
-    paintAuto(remain);
-  }, 1000);
-  autoTimer = setTimeout(() => {
-    autoTimer = null;
-    if (!cookMode || !autoCheckOn) return;
-    if (pendingConfirmSid) {
-      scheduleAutoCheck(); // eyeball ask open: wait for the learner
-      return;
-    }
-    if (busy || flashBusy || cookRecording || voiceListening) {
-      scheduleAutoCheck(); // mid-turn: wait for the next slot
-      return;
-    }
-    autoFired = true;
-    checkNow("");
-  }, AUTO_CHECK_MS);
-}
+// No auto-check loop: steps advance on taps (sendNextStep) and the
+// build proves itself once, in the monitor.
 
 function pumpHandsfree(tries) {
   // Hands-free continuation with retries: a busy moment or a dropped
@@ -3221,11 +4166,19 @@ async function heartbeatNudge() {
 }
 
 function renderCook(v) {
-  paintConfirm(v);
+  paintRollcall(v);
   paintFundi(v.fundi);
   cookView = v;
+  maybeOpenDrawer(v);
   if (v.id) learnSid = v.id;
-  learnStepN = (v.step && v.step.n) || (v.step_index || 0) + 1;
+  clampLearnStep(v);
+  if (v.steps_total) learnStepTotal = v.steps_total;
+  // Beats build after the step number settles (painting the coach
+  // bar with the active beat, or the step instruction when beatless);
+  // the explicit repaint keeps the primary action fresh on turns that
+  // keep beat progress (failed checks, confirm asks).
+  buildWireBeats();
+  paintCoachBar();
   lastInstruction = v.instruction || "";
   if (v.speak) lastSpeak = v.speak;
   $("cook-project").textContent = (v.project_title || "Project") + (v.board ? " (" + v.board + ")" : "");
@@ -3245,33 +4198,25 @@ function renderCook(v) {
   let html = ver.test
     ? "test: " + esc(ver.test) + " → " + (ver.passed ? "PASS" : "FAIL") +
       "\nmeasured: " + esc(ver.measured || "")
-    : "no test run yet — press CHECK or say “check”";
+    : "no evidence yet — the monitor proves the finished build";
   const p = v.probe || {};
   if (p.i2c_devices) html += "\nI2C: [" + esc((p.i2c_devices || []).join(", ") || "none") + "]";
   if (v.timings) html += "\n" + esc(fmtTimings(v.timings));
   $("cook-status").innerHTML = html;
-  $("cook-done").hidden = !done;
-  if (done) $("cook-stepcode").hidden = true; // final code panel takes over
+  $("cook-done").hidden = !learnSid; // drafts available anytime, final at DONE
   if (!done) {
-    $("cook-code-out").textContent = "";
+    // A fetched draft survives re-renders; only a new session clears it.
+    if (v.id && codeFetchedSid !== v.id) $("cook-code-out").textContent = "";
   } else if (v.id && codeFetchedSid !== v.id) {
     // DONE: the project code arrives on its own; SEND CODE stays as retry.
     setTimeout(() => {
       if (cookMode && cookView && cookView.state === "DONE" && codeFetchedSid !== cookView.id) cookSendCode(true);
     }, 150);
   }
-  if (v.step_code && v.step_code.code) {
-    // Visible copy: the Final Code panel stays hidden until DONE, so
-    // the step sketch also lands in the always-visible pre under the
-    // instruction - the label below tells the user to copy THIS code.
-    $("cook-code-out").textContent = v.step_code.code;
-    $("cook-step-out").textContent = v.step_code.code;
-    $("cook-stepcode").hidden = false;
-    const cports = String(ver.board_state || "").indexOf("silent:") === 0
-      ? String(ver.board_state).slice(7) : "";
-    $("cook-heard").textContent = stepSketchLabel(v.step_code.n, cports);
-  }
+  paintTroubleshoot("cook-troubleshoot", (v.fundi || {}).troubleshoot);
+  paintStretch("cook-stretch", (v.fundi || {}).stretch);
   refreshSchematics();
+  paintDeployBar();
   fetchGuide();
 }
 
@@ -3421,7 +4366,7 @@ async function handleCookTranscript(text, error) {
   lastTranscript = text;
   markCookActive();
   if (busy) {
-    cookPendingVoice = text; // a check owns the turn; answered right after
+    cookPendingVoice = text; // a turn owns the floor; answered right after
     $("cook-heard").textContent = 'heard: "' + text + '" → queued, will answer when ready.';
     return;
   }
@@ -3429,7 +4374,7 @@ async function handleCookTranscript(text, error) {
   await cookCommand(text);
 }
 
-// A check just closed with cook feedback waiting: answer it now.
+// A turn just closed with cook feedback waiting: answer it now.
 function drainCookVoice() {
   if (!cookMode || !cookPendingVoice) return;
   const v = cookPendingVoice;
@@ -3499,21 +4444,18 @@ function cookListen(auto) {
 
 async function cookCommand(text) {
   const t = text.toLowerCase();
-  // While an eyeball ask is pending, answers belong to it - before
-  // every other phrase, so "yes" never falls through to the coach and
-  // "done" never fires a fresh check that would re-ask the question.
-  if (pendingConfirmSid) {
-    if (/^(yes|yeah|yep|it works|works|confirm|confirmed|correct|blinking|lit|on)\b/.test(t)) {
-      sendConfirm(true);
-      return;
-    }
-    if (/^(no|not yet|nope|not working|isn'?t|doesn'?t)\b/.test(t)) {
-      sendConfirm(false);
-      return;
-    }
+  logCoach("You", text);
+  // The parts roll call owns every transcript until READY: nothing
+  // else may swallow the answer.
+  if (cookView && cookView.state === "ROLLCALL") {
+    sendReady(text);
+    return;
   }
-  if (/(move on|skip( this| the)? step|just continue)/.test(t)) {
-    sendAdvance();
+  // Steps advance on taps or words: move on, done, next — all mean
+  // the wiring is finished and the build moves forward. (The final
+  // step holds server-side: only Deploy finishes the build.)
+  if (/(move on|skip( this| the)? step|just continue|done|finish|complete|ready|next( step| phase)?)/.test(t)) {
+    sendNextStep();
     return;
   }
   if (/(repeat|say again|again)/.test(t)) {
@@ -3521,8 +4463,6 @@ async function cookCommand(text) {
     return;
   }
   if (/(send code|get code|show code|read code)/.test(t)) { cookSendCode(); return; }
-  if (/(done|finish|complete|ready|move on|next (phase|step))/.test(t)) { cookPhaseDone(); return; }
-  if (/(check|next|verify|test)/.test(t)) { cookCheck(); return; }
   if (/(look|describe|what do you see|show)/.test(t)) { cookLook(); return; }
   if (/(exit|quit|close|stop cooking)/.test(t)) { exitCookMode(); return; }
   if (cookKilled) {
@@ -3587,33 +4527,12 @@ async function sendCoachConfirm(confirmed) {
   cookSpeak(v.reply || "");
 }
 
-function cookCheck() {
-  if (!cookMode) return;
-  if (busy) {
-    $("cook-heard").textContent = "Still working — CANCEL, or MOVE ON if I'm stuck.";
-    return;
-  }
-  markCookActive();
-  checkNow("");
-}
-
-// "I'm done with this phase": the explicit manual companion to the
-// auto loop. One tap (or voice phrase) tells the system the wiring
-// is finished — the sensor still verifies and decides, same as CHECK.
-function cookPhaseDone() {
-  if (!cookMode) return;
-  if (busy) {
-    $("cook-heard").textContent = "Still working — CANCEL, or MOVE ON if I'm stuck.";
-    return;
-  }
-  markCookActive();
-  checkNow("phase done");
-}
+// Steps advance on taps (the coach bar's Next Step), never checks.
 
 async function cookLook() {
   if (!cookMode) return;
   if (busy) {
-    $("cook-heard").textContent = "Still working — CANCEL, or MOVE ON if I'm stuck.";
+    $("cook-heard").textContent = "Still working — try again in a moment.";
     return;
   }
   markCookActive();
@@ -3660,34 +4579,35 @@ async function cookSendCode(auto) {
   }
 }
 
-function enterCookMode(v) {
+function enterCookMode(v, opts) {
   if (liveOn) stopLive("Live guide paused — cook mode running.");
   cookMode = true;
   cookView = v;
   $("cook").hidden = false;
   $("learn-sec").hidden = true; // one focused screen while cooking
+  paintResumeBar(); // hidden while cooking
   $("cook-heard").textContent = "";
   $("cook-nudge").hidden = true;
   $("cook-coach-confirm").hidden = true;
   coachPending = null;
   markCookActive();
   renderCook(v);
+  paintDeployBar();
     syncKillState();
   window.scrollTo(0, 0);
+  // Reveal callers speak their own summary.
+  if (opts && opts.quiet) return;
   cookSpeak(v.speak || v.instruction || "");
-  // Prime the loop baseline so the first auto FAIL waits silently
-  // (a first auto PASS still speaks); then start the countdown.
-  lastAutoKey = learnStepN + ":F";
-  autoFired = false;
-  scheduleAutoCheck();
 }
 
 function exitCookMode() {
   cookMode = false;
+  paintDeployBar();
+  cancelBeatSpeech();
+  stopMonitor("Stopped.");
+  exitRescue(false);
   cancelWireSpeech();
   cookPendingVoice = "";
-  clearAutoTimer();
-  autoFired = false;
   $("cook-nudge").hidden = true;
   $("cook-coach-confirm").hidden = true;
   $("cook-killed").hidden = true;
@@ -3699,6 +4619,7 @@ function exitCookMode() {
   $("cook-talk").textContent = "TALK";
   $("cook").hidden = true;
   $("learn-sec").hidden = false;
+  $("cook-done").hidden = true; // learn mode shows code-sec instead
   if (cookView) renderLearning(cookView);
 }
 
@@ -3737,7 +4658,16 @@ async function flipKillswitch(tripped) {
 $("cook-talk").onclick = () => { markCookActive(); cookListen(false); };
 $("cook-coach-yes").onclick = () => sendCoachConfirm(true);
 $("cook-coach-no").onclick = () => sendCoachConfirm(false);
-$("cook-stop").onclick = () => flipKillswitch(true);
+function hushCookSpeech() {
+  // STOP hushes output now: server audio, browser speech, and any
+  // wire/beat narration queued behind it. It never trips the safety
+  // rail — ARM stays for rails tripped outside this button.
+  cancelBeatSpeech();
+  cancelWireSpeech();
+  VoiceEngine.stop();
+  if (cookMode) $("cook-heard").textContent = "Stopped.";
+}
+$("cook-stop").onclick = () => hushCookSpeech();
 $("cook-arm").onclick = () => flipKillswitch(false);
 $("cook-nudge-x").onclick = () => {
   $("cook-nudge").hidden = true;
@@ -3762,33 +4692,35 @@ $("cook-ask-send").onclick = () => cookAskTyped();
 $("cook-ask-input").onkeydown = (e) => {
   if (e.key === "Enter") { e.preventDefault(); cookAskTyped(); }
 };
-$("cook-check").onclick = () => cookCheck();
-$("cook-phase-done").onclick = () => cookPhaseDone();
-$("cook-auto").onclick = () => {
-  autoCheckOn = !autoCheckOn;
-  markCookActive();
-  if (autoCheckOn) scheduleAutoCheck();
-  else clearAutoTimer();
-};
 $("cook-repeat").onclick = () => { markCookActive(); cookSpeak(lastSpeak || (cookView && cookView.instruction) || ""); };
 $("cook-look").onclick = () => cookLook();
 $("cook-exit").onclick = () => exitCookMode();
 $("cook-code").onclick = () => cookSendCode();
-$("cook-step-code").onclick = () => fetchStepCode("cook-code-out", "cook-heard");
-$("cook-fetch-step").onclick = () => {
-  $("cook-stepcode").hidden = false;
-  fetchStepCode("cook-step-out", "cook-heard");
-};
-$("cook-copy-step").onclick = () => copyCode("cook-step-out", "cook-heard");
-$("cook-resume").onclick = async () => {
+// Sticky resume bar: a live session is one tap away without scrolling
+// back through the setup panel. Hidden in cook mode and before any
+// session starts.
+function paintResumeBar() {
+  const bar = $("resume-bar");
+  if (!learnSid || !learnTitle || cookMode) { bar.hidden = true; return; }
+  $("resume-text").textContent = learnDone
+    ? "Finished: " + learnTitle + " — review or flash."
+    : "Continue: " + learnTitle + " — step " +
+      Math.min(learnStepN, learnStepTotal || learnStepN) +
+      " of " + (learnStepTotal || "?") + ".";
+  bar.hidden = false;
+}
+
+async function resumeCook() {
   if (busy) return;
   busy = true;
   try {
     const v = await (await fetch("/api/status")).json();
-    if (v.learning) enterCookMode(v);
+    if (v.learning) { appRevealed = true; enterCookMode(v); }
     else $("talk-hint").textContent = "No learning session to resume.";
   } catch (e) { showError(e.message); } finally { busy = false; }
-};
+}
+$("cook-resume").onclick = () => resumeCook();
+$("resume-go").onclick = () => resumeCook();
 
 // Board handoff: guided/diagnostic fit the ESP32 kit only. When the bench
 // holds another board, CHECK NOW returns a handoff instead of a lecture,
@@ -3864,20 +4796,6 @@ async function refreshSerialPorts() {
   } catch (e) { $("serial-msg").textContent = "Serial list unavailable."; }
 }
 
-async function fetchSketch(auto) {
-  if ($("sketch-code").textContent) { $("sketch-panel").hidden = false; return; }
-  if (!auto) $("serial-msg").textContent = "Loading sketch…";
-  try {
-    const r = await fetch("/api/patient-sketch");
-    const v = await r.json();
-    if (!r.ok) { if (!auto) $("serial-msg").textContent = "Sketch unavailable."; return; }
-    $("sketch-code").textContent = v.code || "";
-    $("sketch-panel").hidden = false;
-    if (!auto) $("serial-msg").textContent = "Sketch ready — copy it into Arduino IDE.";
-  } catch (e) { if (!auto) $("serial-msg").textContent = "Sketch failed: " + e.message; }
-}
-$("show-sketch").onclick = () => fetchSketch(false);
-$("copy-sketch").onclick = () => copyCode("sketch-code", "serial-msg");
 $("save-serial").onclick = async () => {
   $("serial-msg").textContent = "Saving…";
   try {
@@ -3938,6 +4856,8 @@ $("describe").onclick = async () => {
 function updateMuteBtn() {
   $("mute").textContent = muted ? "UNMUTE" : "MUTE";
   $("mute").classList.toggle("muted", muted);
+  const cv = $("coach-voice");
+  if (cv) cv.textContent = muted ? "Unmute" : "Mute";
 }
 $("settings-btn").onclick = () => { $("settings-modal").hidden = false; };
 $("settings-close").onclick = () => { $("settings-modal").hidden = true; };
@@ -3946,6 +4866,7 @@ $("settings-modal").addEventListener("click", (e) => {
 });
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") $("settings-modal").hidden = true;
+  if (e.key === "Escape" && !$("flash-dialog").hidden) flashDialogClose();
 });
 
 // Guided typed path: the same ears as PUSH TO TALK, without a mic.
@@ -3961,16 +4882,11 @@ $("guide-ask-input").onkeydown = (e) => {
   if (e.key === "Enter") { e.preventDefault(); guideAskTyped(); }
 };
 
-$("mute").onclick = () => {
-  muted = !muted;
-  try { localStorage.setItem("fundiloop-muted", muted ? "1" : "0"); } catch (e) { /* private mode */ }
-  if (muted) VoiceEngine.stop();
-  updateMuteBtn();
-};
+$("mute").onclick = () => toggleMute();
 updateMuteBtn();
-$("preview").onerror = () => {
+if ($("preview")) $("preview").onerror = () => {
   const ov = $("cam-overlay");
-  if (ov.hidden) {
+  if (ov && ov.hidden) {
     ov.hidden = false;
     ov.textContent = "Camera preview failed to load — check CAMERA_STREAM_URL / CAMERA_CAPTURE_URL in .env.";
   }

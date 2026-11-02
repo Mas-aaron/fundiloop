@@ -85,6 +85,7 @@ class ProbeReading(BaseModel):
     led_ok: bool | None = None
     mock: bool = False
     raw: str = ""
+    sketch_id: str | None = None
 
 
 class StepCheck(BaseModel):

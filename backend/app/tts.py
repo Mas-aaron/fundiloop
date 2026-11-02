@@ -370,9 +370,13 @@ class KokoroTTSProvider:
         engine = _kokoro_engine()
         started = time.monotonic()
         try:
-            samples, sample_rate = engine.create(
-                clean, voice=use_voice, speed=1.0, lang="en-us")
-            audio = _samples_to_wav(samples, sample_rate)
+            # Single-flight: voices read lazily from one shared npz;
+            # concurrent creates race its zip reader ("Overlapped
+            # entries ... possible zip bomb").
+            with _kokoro_lock:
+                samples, sample_rate = engine.create(
+                    clean, voice=use_voice, speed=1.0, lang="en-us")
+                audio = _samples_to_wav(samples, sample_rate)
         except MetaAPIError:
             raise
         except Exception as exc:

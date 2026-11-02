@@ -340,17 +340,6 @@ def _repair_text(text: str, fact: dict | None) -> str:
     return "".join(out)
 
 
-def repair_text_pins(text: str, plan: list, step_n,
-                     pin_map: dict | None) -> str:
-    """Repair one arbitrary text (hint, answer) against a step's board."""
-    facts = _step_pin_facts(plan, pin_map)
-    try:
-        n = int(step_n)
-    except (TypeError, ValueError):
-        return text
-    return _repair_text(str(text or ""), facts.get(n))
-
-
 def repair_plan_pins(plan: list, pin_map: dict | None) -> list:
     """Copy of the plan with instruction GPIOs matching the schematic."""
     facts = _step_pin_facts(plan, pin_map)
@@ -371,7 +360,7 @@ def repair_plan_pins(plan: list, pin_map: dict | None) -> list:
 
 def repair_chapters_pins(chapters: list, plan: list,
                          pin_map: dict | None) -> list:
-    """Copy of lesson chapters with teach/task GPIOs matching the board."""
+    """Copy of lesson chapters with spoken GPIOs matching the board."""
     facts = _step_pin_facts(plan, pin_map)
     if not facts:
         return [dict(c) if isinstance(c, dict) else c
@@ -382,7 +371,7 @@ def repair_chapters_pins(chapters: list, plan: list,
             out.append(chapter)
             continue
         fixed = dict(chapter)
-        for field in ("teach", "task"):
+        for field in ("teach", "task", "question", "diagnose"):
             if fixed.get(field):
                 fixed[field] = _repair_text(
                     str(fixed[field]), facts.get(fixed.get("n")))

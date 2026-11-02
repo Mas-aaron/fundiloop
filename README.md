@@ -30,7 +30,7 @@ Target circuit (the only one the MVP supports): ESP32 DevKit + BME280 (I2C
 ```mermaid
 flowchart LR
     Tech([Technician]) -->|CHECK NOW / PTT audio| UI[Mobile web UI]
-    UI -->|speaks every instruction| TTS[(Meta Voice TTS + browser fallback)]
+    UI -->|speaks every instruction| TTS[(Kokoro TTS + browser fallback)]
     UI -->|REST + audio upload| API[FastAPI backend]
     API --> ORCH[Agent orchestrator]
     ORCH --> CAM[ESP32-CAM overhead frame]
@@ -51,6 +51,25 @@ The loop is Sense → Reason → Instruct → Verify. Muse proposes; the
 orchestrator runs each `verification_test` on real measurements and only a
 passing sensor result advances a step or ends a session.
 
+## UI
+
+The frontend is a voice-first single-page app with a Trillion-style dark
+design. Key elements:
+
+- **Mesh orb** — a canvas-rendered rotating wireframe globe (fibonacci-sphere
+  geometry, 48 nodes, teal edges). Idle: slow rotation with a gentle breath.
+  Listening: bright cyan, faster spin, nodes ripple outward with mic level.
+  Speaking: purple/pink, strong pulsing vibration driven by live audio RMS.
+  Planning/thinking: amber glow, steady pulse. All states use a synthetic
+  pulse floor so the orb always shows activity even without a Web Audio tap.
+  Clips to a circle via CSS `border-radius: 50%`.
+- **Status chips** — scannable pill row below the orb showing state, mode,
+  step progress, and timings (replaces the old flat "state · mode · step" line).
+- **Instruction panel** — large centred card that shows Fundi's current
+  instruction or question.
+- **Cook Mode** — full-screen step runner with a mini orb in the header,
+  schematic panel, and sticky action row.
+
 ## How each Meta tool is used
 
 - **SAM 3.1** (`MetaSAMAdapter`): segments each *settled* overhead frame
@@ -65,52 +84,54 @@ passing sensor result advances a step or ends a session.
   uploads from `POST /api/voice/transcribe`. Transcripts containing
   "done", "fixed", or "moved it" auto-trigger a loop turn.
 - **Voice TTS** (`backend/app/tts.py` + frontend `VoiceEngine`): every
-  utterance tries `POST /api/voice/speak` (Meta Voice TTS, warm female
-  voice) first and falls back to default browser `speechSynthesis` for
-  that utterance only on failure, retried fresh next turn. Speech never
-  hard-stops on a TTS failure; a replay button re-speaks the last line.
+  utterance tries `POST /api/voice/speak` (Kokoro local neural TTS,
+  `af_heart` American female default) first and falls back to default
+  browser `speechSynthesis` for that utterance only on failure.
+
+## Schematic + ESP32 flash
+
+Each learning step shows its wiring beside its code via a progressive SVG
+schematic (`GET /project/{id}/step/{n}/schematic`). The schematic animates
+wire-by-wire as the tutor speaks — each wire lights up when its name is
+spoken (word-boundary driven on browser speech, chunk-driven on server TTS).
+
+One-tap ESP32 flashing via server esptool (`FLASH ESP32` button) or browser
+Web Serial (`FLASH IN BROWSER`, Chrome/Edge). Both share one busy guard.
+Every flash is audit-logged to `backend/logs/coach_audit.jsonl`.
 
 ## Supported faults
 
-- `SDA_SCL_SWAPPED` — live board, totally silent I2C bus (or swapped
-  `Wire.begin` pins in pasted code).
-- `LOOSE_GND` — no serial signs of life, or present-but-dark OLED.
-- `CODE_PIN_MISMATCH` — firmware drives a different pin than the graph
-  wires (LED or I2C pins).
-- `SENSOR_DISCONNECTED` — OLED on the bus but no BME280 at 0x76/0x77.
-- `LED_REVERSED` — GPIO toggles, LED stays dark, code pin matches.
+- `SDA_SCL_SWAPPED` — live board, totally silent I2C bus
+- `LOOSE_GND` — no serial signs of life, or present-but-dark OLED
+- `CODE_PIN_MISMATCH` — firmware drives a different pin than the graph wires
+- `SENSOR_DISCONNECTED` — OLED on the bus but no BME280 at 0x76/0x77
+- `LED_REVERSED` — GPIO toggles, LED stays dark, code pin matches
 
 ## Safety scope
 
-Low-voltage DC circuits only: USB-powered ESP32 logic at 3V3 (5V-tolerant
-wiring errors are still bugs, not hazards). No mains voltage, no
-high-current loads, no battery charging, no unattended operation. The LED
-loop is current-limited (220 ohm series resistor). If anything smells hot
-or the regulator overheats, unplug USB immediately — the agent cannot see
-that; you are the safety interlock.
+Low-voltage DC circuits only: USB-powered ESP32 logic at 3V3. No mains
+voltage, no high-current loads, no battery charging, no unattended operation.
+If anything smells hot or the regulator overheats, unplug USB immediately —
+the agent cannot see that; you are the safety interlock.
 
 ## Setup
 
-1. Python 3.11+ with the project venv (or `python -m venv .venv`):
+1. Python 3.11+ with the project venv:
    `backend\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt`
 2. `copy .env.example .env` — defaults run the full loop offline in mock mode
    (`MOCK_META=true`, no keys needed).
-3. For real hardware, set in `.env`: `CAMERA_STREAM_URL` (e.g.
-   `http://192.168.1.50:81/stream`), `CAMERA_CAPTURE_URL` (e.g.
-   `http://192.168.1.50/capture`), `SERIAL_PORT` (e.g. `COM3`),
-   `MOCK_META=false`, plus `META_API_KEY` for real Meta calls. The
-   Advanced tab also lists serial ports at runtime: pick one + SAVE
-   SERIAL, or press AUTO-DETECT to adopt the first port answering
-   the patient PING.
+3. For real hardware, set in `.env`: `CAMERA_STREAM_URL`, `CAMERA_CAPTURE_URL`,
+   `SERIAL_PORT`, `MOCK_META=false`, `META_API_KEY`.
+4. For Kokoro TTS (recommended, works offline):
+   `pip install -r backend/requirements-kokoro.txt`, download
+   `kokoro-v1.0.onnx` + `voices-v1.0.bin` into `backend/data/kokoro/`,
+   set `TTS_PROVIDER=kokoro`. Install eSpeak-NG if synthesis warns:
+   `winget install eSpeak-NG.eSpeak-NG`.
 
 Patient board: flash `firmware/patient_board/patient_board.ino` with the
-Arduino ESP32 core + Adafruit BME280 / SSD1306 / GFX libraries. The
-overhead ESP32-CAM is pre-existing — set its still URL in `.env`, no
-camera firmware in this repo.
+Arduino ESP32 core + Adafruit BME280 / SSD1306 / GFX libraries.
 
 ## Run
-
-From the repo root:
 
 ```
 backend\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
@@ -119,58 +140,29 @@ backend\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 0.0.0.0 
 Open `http://<laptop-ip>:8000` on your phone (same Wi-Fi), or
 `http://localhost:8000` on the laptop.
 
-API: `GET /api/status`, `POST /api/session/start`,
-`POST /api/session/check-now` (or `/api/session/check-now/stream` for
-ack + stage events), `GET /api/camera/latest`.
+## Learning mode toolchain (ESP32 flash)
 
-## Test the mock loop (no hardware, no keys)
+One-time install on the laptop (offline after):
 
-Maintained suites (run first, socket-free):
-`backend\.venv\Scripts\python.exe -m unittest backend.tests.test_guided_assembly backend.tests.test_diagnostic -v`
+1. `pip install -r backend/requirements.txt` (includes `esptool`).
+2. Install `arduino-cli`, then `arduino-cli core install esp32:esp32`.
+   Sketch libraries auto-install at first build; to pre-seed:
+   `arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" "Adafruit BME280 Library" "Adafruit Unified Sensor"`.
+3. Set paths in `.env` if non-default: `ARDUINO_CLI_BIN`, `ARDUINO_FQBN`,
+   `ESPTOOL_BIN` (see `.env.example`).
 
-1. Start the server, open the page. Mode: Guided Assembly, step 1 instruction
-   shown and spoken.
-2. Press CHECK NOW (or push-to-talk and say "done") 8 times — each turn
-   captures a settled frame, runs SAM + the step's serial verification test,
-   and advances on pass; the checklist fills with PASS and an Assembly
-   Passport appears.
-3. Inject a fault: Advanced → Simulate fault → `SENSOR_DISCONNECTED` → CHECK
-   NOW stays on the step with a corrective instruction grounded in the
-   measured evidence. Set back to none → CHECK NOW verifies the fix.
-4. Diagnostic mode: toggle Diagnostic (captures a SELFTEST + I2C + camera
-   baseline), optionally paste Arduino code, inject `LED_REVERSED` + paste
-   `#define LED_PIN 4` → CHECK NOW ranks all 5 faults by evidence and
-   reports `CODE_PIN_MISMATCH`. Fix one thing per turn; if a re-test
-   disproves the hypothesis it moves to the next ranked fault. It ends only
-   when READ_SENSOR and CHECK_OLED pass with no fault outstanding, issuing
-   a Repair Passport with before/after evidence.
-5. Camera: `GET /api/camera/latest` serves the live preview frame, or
-   HTTP 502 when the camera is unreachable — there are no synthetic frames.
-6. Every attempt is logged to `backend/logs/attempts.jsonl` and counted on
-   the Passport.
+## Test the mock loop
 
-## 3-minute demo script
+```
+backend\.venv\Scripts\python.exe -m unittest backend.tests.test_frontend_regressions backend.tests.test_guided_assembly backend.tests.test_diagnostic -v
+```
 
-Rehearse offline first: `python scripts/e2e_mock_demo.py` (full guided run
-+ SDA_SCL_SWAPPED diagnostic, hash chains verified).
+Or run the full suite (460+ tests):
+```
+backend\.venv\Scripts\python.exe -m unittest discover -s backend/tests -v
+```
 
-1. **0:00 — Start.** Server up, page open on the phone. "FundiLoop guides
-   a build and proves each step with live measurements."
-2. **0:20 — Hands-free assembly.** Do a real wiring step on camera, hold
-   PUSH TO TALK, say **"done"**. Transcript appears, the turn runs, the
-   step passes, the next instruction is spoken. Hit REPLAY once to show it.
-3. **1:10 — Fault + correction.** Pull the BME280 SDA wire (or pick a fault
-   in Advanced). Say "done": FAULT_FOUND names the fault with measured
-   evidence. Reseat, say "fixed": the re-test verifies the fix.
-4. **2:00 — Diagnostic.** Toggle Diagnostic, inject `SDA_SCL_SWAPPED`,
-   CHECK NOW: ranked fault list, one guided fix, clear, verify → Repair
-   Passport.
-5. **2:40 — Proof.** Open `GET /api/session/<id>/passport` (id is in any
-   response): full hash-chained log, `chain_valid: true`.
-6. **Proof it is real.** The header badge shows LIVE (green) only when
-   the real camera and real Meta models are connected, MOCK (red)
-   otherwise. Any camera/API failure returns the real error with HTTP 502
-   and stops the step — nothing is silently simulated.
+Frontend: `node frontend/test_karaoke.js` (15 checks, no server needed).
 
 ## Rule the code enforces
 
@@ -182,262 +174,31 @@ passing measurement advances the step or completes the session.
 
 There is no fixed project catalog. Discovery is generative:
 
-- `POST /discover/parts` (`{"frame_path": "..."}`) reports what equipment
-  is visible in a saved frame: SAM regions plus a Muse Spark reading.
-- `POST /discover/projects`
-  (`{"visible_parts": [...], "user_project": "...", "constraints": "..."}`)
-  returns model-generated build plans, each step mapped to a real test.
+- `POST /discover/parts` reports what equipment is visible in a saved frame.
+- `POST /discover/projects` returns model-generated build plans, each step
+  mapped to a real verification test.
 - The `AVAILABLE_TESTS` registry (`backend/app/capabilities.py`) lists the
-  only verification tests plans may use: `RUN_I2C_SCAN`, `READ_SENSOR`,
-  `CHECK_OLED`, `CHECK_GPIO`, `CHECK_SERIAL`.
-- Rule: every plan step must map to a real test in `AVAILABLE_TESTS`
-  (bad test names are rejected and the model is retried once with the
-  reasons; rejections land in `rejected_plans` for debugging). Open
-  suggestions must also use visible parts (or `missing_parts` plus an
-  alternative); a user-requested build is planned exactly as asked —
+  only tests plans may use: `RUN_I2C_SCAN`, `READ_SENSOR`, `CHECK_OLED`,
+  `CHECK_GPIO`, `CHECK_SERIAL`.
+- Every plan step must map to a real test (bad names are rejected and
+  retried once). A user-requested build is planned exactly as asked —
   the bench never gates what the user asked to build.
-
-### Scene understanding
-
-- SAM provides precise regions for known part prompts.
-- Muse Spark reads the frame and the SAM regions together and returns
-  visible parts with state, observed connections, and uncertainties.
-- A part Muse names but SAM did not box is marked `sam_confirmed: false`
-  and shown as "unconfirmed" in the UI.
-- A SAM box Muse does not name is shown as "unknown".
-- Scene understanding is appearance only. It never states that the circuit
-  works. The sensor decides correctness.
-
-### Learning mode
-
-There is no fixed project catalog. Plans are generated by the model but
-validated and executed by the backend against the real verification module:
-
-1. See parts with the camera: `POST /discover/capture` grabs a still,
-   `POST /discover/parts` reports visible parts, observed connections,
-   and uncertainties. No camera yet? `POST /discover/upload` (UPLOAD
-   PHOTO in the Learning tab) runs the same pass on a photo file.
-2. Name a project by text or voice, or let the system suggest one:
-   `POST /discover/projects` returns up to 3 plans, each step mapped to
-   an `AVAILABLE_TESTS` key, plus `missing_parts`/`alternatives`. A
-   named request is planned exactly as asked with the parts it needs;
-   open suggestions stick to visible parts.
-3. Start a plan with `POST /diagnose` (`mode: "learning"`), then loop
-   CHECK NOW: the current step's sensor test runs, and the step advances
-   only when the sensor confirms. Failures stay put with a targeted hint.
-4. Code is teach-first: SEND CODE is available from the first step and
-   returns a DRAFT `.ino` (bannered, plan/profile values) until every
-   step passes; when the final step passes, the UI fetches
-   `POST /project/{session_id}/code` automatically and shows the final
-   `.ino` with the pin numbers and addresses the sensors actually
-   confirmed (SDA/SCL/LED, I2C devices), plus a COPY button.
-5. Plain sketches welcome: when the probe reports a GPIO/OLED step as
-   *unverifiable* (no patient protocol on the board — not failed), the
-   turn asks instead of failing, and CONFIRM advances it with a
-   hash-chained `confirmed_by: technician` audit entry counted on the
-   Passport. A measured negative still fails honestly.
-
-The model proposes plans and instructions. The verification module
-disposes: it alone advances steps, declares DONE, and gates firmware.
-
-### Learning schematic + ESP32 flash
-
-Each learning step shows its wiring beside its code, and one tap
-pushes the step sketch to the board. ESP32 only (Uno out of scope).
-
-- `GET /project/{id}/guide` returns the build guide: a parts table
-  (qty + what each part is, jumpers counted from the wiring) and one
-  numbered assembly card per step, each naming exactly the wires it
-  adds plus the SVG ids to highlight them. The Cook Mode "Build
-  guide" panel renders both: tap a card to light up its wires in the
-  diagram and hear it read aloud; the current step's card stays
-  marked as the build advances.
-
-- `GET /project/{id}/step/{n}/schematic` returns the progressive
-  netlist (`{netlist, svg, unresolved[]}`): wiring for every part the
-  plan needs up to step N, so the last step is the full project.
-  Wiring comes from the plan + the ESP32 pin map + `SENSOR_INTERFACES`
-  only; unknown parts render "unresolved" with a reason and are never
-  auto-wired. The UI panel shows the SVG, a wire list (SPEAK WIRES
-  reads it aloud), and an SVG download.
-- `POST /project/{id}/step/{n}/flash` (`{"port": "..."}`) compiles
-  the step sketch (cached by code hash), releases both probe handles,
-  flashes via esptool at the build offsets, and re-probes PING:
-  `{ok, build_hash, port, verify_ping}`. Flashing is Learning-mode
-  only, explicit tap only, always to a user-picked port — never
-  automatic. Every flash (success and failure) audit-logs to
-  `backend/logs/coach_audit.jsonl`. Busy ports answer with
-  close-the-Serial-Monitor guidance instead of a traceback.
-- One-time toolchain install on the laptop (offline after):
-  1. `pip install -r backend/requirements.txt` (includes `esptool`).
-  2. Install `arduino-cli`, then
-     `arduino-cli core install esp32:esp32` (adds the ESP32 core).
-     Sketch libraries (Adafruit SSD1306/GFX/BME280, DHT,
-     ArduinoJson, ...) auto-install at first build; to pre-seed:
-     `arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" "Adafruit BME280 Library" "Adafruit Unified Sensor"`.
-  3. Paths live in `.env`, never hardcoded: `ARDUINO_CLI_BIN`,
-     `ARDUINO_FQBN`, `ESPTOOL_BIN`, timeouts (see `.env.example`).
-- Browser flash (Web Serial, Chrome/Edge): CONNECT BOARD opens the
-  browser's own port picker — select the ESP32 entry (CP2102 /
-  USB-to-UART, not Bluetooth). FLASH IN BROWSER then compiles on
-  the server, downloads the binaries, and flashes locally with a
-  progress bar; the page releases the port after, so CHECK NOW
-  works immediately. No setup: the server fetches the esptool-js
-  ESM bundle once from a pinned release the first time it is used,
-  then serves it locally (override with `ESPTOOL_JS_URL`;
-  `ESPTOOL_JS_TIMEOUT` sets the fetch timeout). Fully offline
-  machines can drop the file at `frontend/esptool-js/bundle.js` by
-  hand instead — it must export `Transport` + `ESPLoader`.
-  (The server-side flash endpoint stays available as an API
-  fallback, but the UI only offers browser flash.)
-  Note: browser flashes run outside the server audit trail — the
-  browser owns the port.
-
-Manual ESP32 flash checklist (run against real hardware before
-trusting a new toolchain install):
-
-1. Board on USB, nothing else holding the port (close Serial
-   Monitor/Plotter). Start a learning session on ESP32 DevKit.
-2. Step 1 schematic shows the expected wires, no surprises in
-   "unresolved". SVG download opens in a browser.
-3. Pick the board's port, press FLASH ESP32: ack speech sounds, the
-   ticker runs, success reports the build hash + PING verdict.
-4. With Serial Monitor open on the same port, FLASH again: the busy
-   guidance names the port and says to close Serial Monitor.
-5. Press FLASH twice unchanged: the second run reports a cached
-   build (no recompile).
-6. `backend/logs/coach_audit.jsonl` holds one `flash` event per
-   attempt with an intact hash chain.
-
-### Cook Mode (voice-guided builds)
-
-Cook Mode is the NYT-Cooking-style runner for learning projects: starting
-a project opens a full-screen step card with step X of Y, a progress bar,
-the parts the step needs, and the live camera with SAM boxes. Everything
-is spoken; the technician answers by voice:
-
-- TALK (or hands-free auto-listen) records a short clip of speech.
-- Say "check" to run the step's sensor verification, "repeat" to hear
-  the step again, "look" to hear what the camera sees, or "exit" to
-  leave. Anything else goes to the Learning coach core
-  (`POST /api/coach/ask/stream`, falling back to `POST /api/coach/ask`),
-  which remembers the conversation across restarts and calls read-only
-  teaching tools — spoken back clause by clause.
-- The ASK box types to the same brain without the microphone (debug
-  path). The sensor still alone advances steps and gates firmware;
-  voice drives, it never declares success.
-- Heartbeat: leave Cook Mode idle mid-step and the coach nudges once
-  (`POST /api/coach/nudge`) — spoken and bannered, dismissible, never
-  during quiet hours, never twice within the cooldown. All thresholds
-  live in `.env` (`COACH_IDLE_NUDGE_SECONDS`,
-  `COACH_NUDGE_COOLDOWN_SECONDS`, `QUIET_HOURS_START/END`).
-- Rails: unsafe tools pause for explicit CONFIRM/DENY
-  (`POST /api/coach/confirm`; `COACH_GATE_STRICT=true` gates even safe
-  tools). Rail events append to hash-chained
-  `backend/logs/coach_audit.jsonl`. The STOP button (or terminal
-  `/stop`) trips the persisted kill switch — all coach turns refuse
-  until ARM (`/arm`).
-
-### Live guide (ambient coaching)
-
-START LIVE GUIDE streams short camera clips over the same socket: SAM 3.1
-tracks parts across each clip and Muse Spark coaches the next action out
-loud. Entering Cook Mode pauses it so the two loops never talk over each
-other. `scripts/vision_video_proof.py` and
-`scripts/voice_realtime_proof.py` prove each live half against the real
-Meta APIs.
-
-## Boards & sensors
-
-FundiLoop is board-general where it matters. `backend/app/boards.py`
-holds one profile per patient board (I2C pins, GPIO/ADC maps, logic
-voltage, serial baud); `SENSOR_INTERFACES` in `capabilities.py` maps
-each sensor to its wiring and the test that verifies it.
-
-- Learning mode (plan, Cook Mode, firmware) is board-general: pick the
-  board in the Learning tab and plans, pin maps, and the generated `.ino`
-  follow that profile. The sensor vocabulary covers DHT11/22, DS18B20,
-  HC-SR04, PIR, MQ-2, LDR, LM35, soil, relay, RGB LED, LCD1602, and more.
-- Guided Assembly and Diagnostic are fixed ESP32-kit flows. If the
-  bench holds another board, the first CHECK NOW runs one cheap glance
-  (cached while the I2C signature is steady) and hands off: it names
-  the board, attaches the visible parts, and offers one-tap START
-  LEARNING on that board instead of demanding an ESP32 swap. A changed
-  bus re-glances automatically; RE-SCAN (Advanced) forces a re-detect
-  on the next turn after swapping equipment.
-- Latency budget per turn is deliberately minimal: guided/diagnostic pay
-  one SAM call plus one Muse call (a second Muse pass only when a test
-  fails); learning CHECK NOW runs on the probe alone and calls Muse only
-  for a failure hint. The sense branches (camera settle, SAM, serial
-  probe, first-turn board glance) overlap in threads, Meta HTTP clients
-  persist across turns, and `POST /api/session/check-now/stream` acks
-  immediately and ticks through sense → reason → verify. Frames are
-  ~6 KB; per-stage latency rides in each view's `timings` (also shown
-  on the state line), per-call latency in
-  `backend/data/logs/model_calls.jsonl`. The serial probe adapts
-  across 115200/9600 baud and short-circuits a silent board instead of
-  burning a timeout per command. The UI stays interactive mid-turn:
-  CANCEL stops waiting, and voice triggers heard while busy queue for
-  the next turn. SHOW EQUIPMENT grounds 16 part prompts (overlapped
-  8 at a time) plus one Muse reading, and runs only on demand.
-- To add a board, add one entry to `BOARD_PROFILES` (label, mcu,
-  voltage, i2c, led_builtin, gpio, adc, serial_baud) plus an option in
-  the Learning tab selector. No other code changes needed.
 
 ## Real Meta API mode
 
-Mocks are the default. For live calls, set in `.env`:
+Mocks are the default. For live calls set in `.env`:
 
 ```
 MOCK_META=false
 META_API_KEY=<key>
-META_API_BASE_URL=https://api.meta.ai/v1   # Muse chat + SAM vision base
-META_API_TIMEOUT=30
+META_API_BASE_URL=https://api.meta.ai/v1
 MUSE_MODEL=muse-spark-1.3
 SAM_MODEL=sam-3.1
 VOICE_MODEL=meta-voice-1
-# META_ASR_URL=                            # override only; default is base + /asr/transcribe
 TTS_PROVIDER=kokoro
 KOKORO_VOICE=af_heart
-# KOKORO_MODEL_DIR=                        # override only; default is backend/data/kokoro
-TTS_MODEL=muse-voice-tts-1.0
-META_TTS_VOICE=warm-female
-# META_TTS_URL=                            # override only; default is base + /tts/synthesize
 ```
 
-Call shapes mirror the legacy clients (`backend/muse_client.py`,
-`backend/sam_client.py`, `backend/transcribe.py`): OpenAI-compatible chat
-for Muse/SAM, multipart POST for voice. Muse output is forced to JSON,
-validated into `AgentDecision`, and retried once; SAM boxes are parsed to
-`{label, box, confidence}` detections.
-
-Failure behavior: any camera error, API error, timeout, or unparseable
-reply raises (`CameraError`/`MetaAPIError`), the API returns HTTP 502 with
-the real error text, and the step stops. Nothing is replaced with mock
-data or a canned instruction. Every model call is logged to
-`backend/data/logs/model_calls.jsonl`, and every analysis still is saved to
-`backend/data/debug_frames/`.
-
-Voice: speech output tries server TTS first (`POST /api/voice/speak`)
-and falls back to default browser `speechSynthesis` for that utterance
-only on failure. `TTS_PROVIDER` picks the engine: `kokoro` (local
-neural voice, `af_heart` American female default — works today) or
-`meta` (Meta Voice TTS, warm female from `META_TTS_VOICE`). Both paths
-speak the same normalized spoken form (`GND->GND` is said as "ground to
-ground", never spelled). NOTE: the Meta Model API lists Transcribe but
-no TTS model (verified live), so meta real mode 502s until Meta ships
-it — Kokoro or the fallback keeps every utterance audible meanwhile.
-Speech input uses the browser's own speech recognition where available
-and falls back to recording + upload to `POST /api/voice/transcribe`
-for Muse Voice Transcribe (WAV conversion via pydub/ffmpeg when
-available, raw upload otherwise).
-
-Kokoro setup (once): `backend\.venv\Scripts\python.exe -m pip install -r
-backend/requirements-kokoro.txt`, then download `kokoro-v1.0.onnx` and
-`voices-v1.0.bin` from the
-[kokoro-onnx model files](https://github.com/thewh1teagle/kokoro-onnx/releases?q=model-files&expanded=true)
-release into `backend/data/kokoro/`, and set `TTS_PROVIDER=kokoro`.
-Fully offline after that — no key, no network. If synthesis complains
-about espeak on Windows, install it once via
-`winget install eSpeak-NG.eSpeak-NG` (the bundled loader usually covers
-it, but a system install is the sure fix).
+Failure behavior: any camera error, API error, timeout, or unparseable reply
+raises, the API returns HTTP 502 with the real error text, and the step
+stops. Nothing is replaced with mock data.

@@ -189,6 +189,60 @@ class KokoroSynthesizeTests(unittest.TestCase):
             KokoroTTSProvider(mock=False).synthesize("hi", voice="af_bella")
         self.assertEqual(FakeKokoro.instances[-1].calls[0]["voice"], "af_bella")
 
+    def test_concurrent_synthesis_never_overlaps_engine(self):
+        import threading
+        import time
+
+        from backend.app.tts import KokoroTTSProvider
+
+        install_fake_kokoro(self)
+        for name in ("kokoro-v1.0.onnx", "voices-v1.0.bin"):
+            with open(os.path.join(self.tmp.name, name), "wb") as fh:
+                fh.write(b"fake")
+        state = {"inside": 0, "max_inside": 0}
+        state_lock = threading.Lock()
+        real_create = FakeKokoro.create
+
+        def tracking_create(engine_self, text, **kw):
+            with state_lock:
+                state["inside"] += 1
+                state["max_inside"] = max(state["max_inside"],
+                                          state["inside"])
+            try:
+                time.sleep(0.05)  # overlap window without the fix
+                return real_create(engine_self, text, **kw)
+            finally:
+                with state_lock:
+                    state["inside"] -= 1
+
+        gate = threading.Event()
+        results = {}
+
+        def work(i):
+            gate.wait(timeout=10)
+            with mock.patch.dict(os.environ, {"MOCK_META": "false",
+                                              "KOKORO_MODEL_DIR": self.tmp.name,
+                                              "KOKORO_VOICE": "af_heart"}):
+                results[i] = KokoroTTSProvider(
+                    mock=False).synthesize("concurrency %d" % i)
+
+        with mock.patch.object(FakeKokoro, "create", tracking_create):
+            threads = [threading.Thread(target=work, args=(i,))
+                       for i in range(4)]
+            for t in threads:
+                t.start()
+            gate.set()
+            for t in threads:
+                t.join(timeout=30)
+        self.assertFalse(any(t.is_alive() for t in threads))
+        self.assertEqual(len(results), 4)
+        self.assertTrue(all(a.startswith(b"RIFF")
+                            for a in results.values()))
+        # The engine's voice table reads lazily from one shared npz:
+        # overlapping creates race its zip reader ("Overlapped
+        # entries ... possible zip bomb"), so synthesis is single-flight.
+        self.assertEqual(state["max_inside"], 1)
+
     def test_numpy_array_samples_convert(self):
         import numpy as np
 

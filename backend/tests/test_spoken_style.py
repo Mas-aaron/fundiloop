@@ -10,7 +10,6 @@ from backend.app.prompts import (
     DESCRIBE_SYSTEM,
     LIVE_SYSTEM,
     fundi_chapters_system,
-    learning_hint_prompt,
 )
 
 
@@ -28,12 +27,6 @@ class SpokenStyleTest(unittest.TestCase):
         self.assertIn("never spoken", prompt)  # title is visual-only
         self.assertIn("no ALL-CAPS words", prompt)
         self.assertIn("sensor test decides", prompt)
-
-    def test_hint_prompt_caps_length(self):
-        text = learning_hint_prompt(
-            {"n": 1, "instruction": "wire it"},
-            {"test": "CHECK_GPIO", "measured": "GPIO13 did not toggle"})
-        self.assertIn("under 25 words", text)
 
     def test_voice_speak_mock_returns_audio_and_route_registered(self):
         # The old 501 contract applied when no TTS provider existed; Meta

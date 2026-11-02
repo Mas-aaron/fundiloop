@@ -5,6 +5,7 @@ Serves the mobile web UI at / and the session API:
   POST /api/session/start    start a guided/diagnostic session
   POST /api/session/check-now run one Sense->Reason->Instruct->Verify turn
   POST /api/session/check-now/stream same turn as server-sent events
+  POST /api/session/telemetry-verified mark DONE on telemetry proof
   POST /api/answer/stream       free-form spoken answer as SSE tokens
   POST /api/coach/ask           one Learning coach turn (memory + tools)
   POST /api/coach/ask/stream    same coach turn as SSE tokens (early speech)
@@ -25,15 +26,15 @@ Serves the mobile web UI at / and the session API:
   POST /discover/projects     validated generated build plans
   POST /discover/upload       save an equipment photo for /discover/parts
   POST /diagnose              start a learning session (mode="learning")
-  POST /project/{id}/code     firmware (final when DONE, draft on request)
-  GET  /project/{id}/step/{n}/code one step's sketch (template, patient, model)
+  POST /project/{id}/code     firmware any time (verified flag when DONE)
   GET  /project/{id}/step/{n}/schematic progressive wiring netlist + SVG
   GET  /project/{id}/guide   parts table + assembly cards linked to the SVG
-  GET  /project/{id}/step/{n}/firmware manifest of binaries for browser flash
-  GET  /project/{id}/step/{n}/firmware/{i} download one binary (build dir only)
   GET  /esptool-js/bundle.js vendored browser flasher (one-time download)
-  POST /project/{id}/step/{n}/flash flash one step sketch to ESP32 (explicit tap)
-  GET  /api/patient-sketch       patient board sketch text for copy-paste flash
+  POST /project/{id}/flash flash finished firmware once wired (explicit tap)
+  GET  /project/{id}/firmware manifest of binaries for browser flash
+  GET  /project/{id}/firmware/{i} download one binary (build dir only)
+  GET  /project/{id}/telemetry/stream live serial lines (SSE) for the monitor
+  POST /project/{id}/telemetry/diagnose model diagnosis for a stalled stream
 
 Run from the repo root:
   uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
@@ -72,7 +73,7 @@ from .coach import (  # noqa: E402
     set_killswitch,
 )
 from .discovery import detect_parts, plan_projects, understand_scene  # noqa: E402
-from .learning import generate_code, generate_step_code, read_patient_sketch  # noqa: E402
+from .learning import generate_code  # noqa: E402
 from .live import LiveGuide, clean_coach_text  # noqa: E402
 from .models import CheckNowRequest, StartSessionRequest  # noqa: E402
 from .prompts import LIVE_SYSTEM, live_guidance_prompt  # noqa: E402
@@ -195,6 +196,10 @@ def api_session_start(req: StartSessionRequest):
 def api_check_now(req: CheckNowRequest | None = None):
     try:
         return orchestrator.check_now(req or CheckNowRequest())
+    except ValueError as exc:
+        # Learning sessions advance/prove elsewhere; check-now is not
+        # their operation.
+        raise HTTPException(status_code=400, detail=str(exc))
     except (CameraError, MetaAPIError) as exc:
         # Real error, surfaced: the step stops, nothing is faked.
         raise HTTPException(status_code=502, detail=str(exc))
@@ -228,6 +233,8 @@ def iter_check_now_events(body: CheckNowRequest):
             yield _sse(stage, detail)
     try:
         view = fut.result()
+    except ValueError as exc:
+        yield _sse("error", {"detail": str(exc)})
     except (CameraError, MetaAPIError) as exc:
         yield _sse("error", {"detail": str(exc)})
     else:
@@ -244,33 +251,48 @@ def api_session_rescan():
     return orchestrator.rescan_boards()
 
 
-@app.post("/api/session/confirm")
-def api_session_confirm(body: dict):
-    """Advance a learning step on technician attestation.
-
-    Body: {"session_id": ..., "confirmed": bool}. Only valid while the
-    session has a pending confirmation (probe reported unverifiable).
-    """
-    session_id = str(body.get("session_id") or "")
-    try:
-        return orchestrator.confirm_learning_step(
-            session_id, bool(body.get("confirmed")))
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-
-
 @app.post("/api/session/advance")
 def api_session_advance(body: dict):
     """Learner said this learning step is done (voice: done / next).
 
-    Body: {"session_id": ..., "transcript": optional str}. Does not wait
-    for a sensor pass; CHECK NOW still sensor-verifies.
+    Body: {"session_id": ..., "transcript": optional str}. Tap-paced:
+    moves on; only telemetry proof (or the explicit escape) finishes
+    the build.
     """
     session_id = str(body.get("session_id") or "")
     try:
         return orchestrator.advance_learning_step(
+            session_id, str(body.get("transcript") or ""))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/session/telemetry-verified")
+def api_session_telemetry_verified(body: dict):
+    """Mark a build DONE on telemetry proof, never on ask.
+
+    Body: {"session_id": ..., "lines": [...trailing monitor lines]}.
+    The deterministic proof rule admits only a healthy streak;
+    anything else returns {"verified": False} (200, not yet).
+    """
+    session_id = str(body.get("session_id") or "")
+    try:
+        return orchestrator.telemetry_verify(
+            session_id, list(body.get("lines") or []))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/session/ready")
+def api_session_ready(body: dict):
+    """Answer the parts roll call (voice: ready / wait).
+
+    Body: {"session_id": ..., "transcript": optional str}. READY begins
+    chapter 1; anything else re-prompts without advancing.
+    """
+    session_id = str(body.get("session_id") or "")
+    try:
+        return orchestrator.answer_rollcall(
             session_id, str(body.get("transcript") or ""))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -677,46 +699,24 @@ def api_diagnose(req: DiagnoseRequest):
 
 @app.post("/project/{session_id}/code")
 def api_project_code(session_id: str, body: dict | None = None):
-    """Return the project's .ino: final when verified, draft on request.
+    """Return the project's .ino firmware any time during the build.
 
-    Body {"draft": true} returns work-in-progress firmware any time (the
-    teach-first path); without it, 409 until every step is verified.
+    Deploy needs the firmware before proof exists, so there is no
+    verification gate here; `verified` honestly reports whether
+    telemetry has proven the build yet (code_ready). A legacy draft
+    flag in the body, if any, is ignored.
     """
     session = orchestrator.sessions.get(session_id)
     if session is None or not session.get("learning"):
         raise HTTPException(status_code=404, detail="unknown learning session id")
     verified = bool(session.get("code_ready"))
-    if not verified and not bool((body or {}).get("draft")):
-        raise HTTPException(
-            status_code=409,
-            detail="project not fully verified: step %d of %d" % (
-                session.get("step_index", 0) + 1, len(session.get("plan", []))))
     try:
-        code = generate_code(session, orchestrator.Muse, draft=not verified)
+        code = generate_code(session, orchestrator.Muse)
     except MetaAPIError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     steps = (session.get("verified") or {}).get("steps", [])
     return {"session_id": session_id, "code": code, "verified": verified,
             "steps_passed": len(steps), "steps_total": len(session.get("plan", []))}
-
-
-@app.get("/project/{session_id}/step/{step_n}/code")
-def api_step_code(session_id: str, step_n: int):
-    """Return one step's sketch: instant template when known, else model."""
-    session = orchestrator.sessions.get(session_id)
-    if session is None or not session.get("learning"):
-        raise HTTPException(status_code=404, detail="unknown learning session id")
-    steps = session.get("plan", []) or []
-    step = next((s for s in steps
-                 if isinstance(s, dict) and s.get("n") == step_n), None)
-    if step is None:
-        raise HTTPException(status_code=404, detail="unknown step %d" % step_n)
-    try:
-        code, source = generate_step_code(session, step, orchestrator.Muse)
-    except MetaAPIError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    return {"session_id": session_id, "n": step_n,
-            "verify": step.get("verify", ""), "code": code, "source": source}
 
 
 @app.get("/project/{session_id}/step/{step_n}/schematic")
@@ -729,7 +729,7 @@ def api_step_schematic(session_id: str, step_n: int):
     """
     from .breadboard_schematic import render_breadboard_svg
     from .schematic import build_netlist
-    from .visual_schematic import render_visual_svg
+    from .visual_schematic import annotate_wires, render_visual_svg
 
     session = orchestrator.sessions.get(session_id)
     if session is None or not session.get("learning"):
@@ -745,6 +745,7 @@ def api_step_schematic(session_id: str, step_n: int):
     if step is None:
         raise HTTPException(status_code=404, detail="unknown step %d" % step_n)
     netlist = build_netlist(steps, step_n, session.get("pin_map", {}) or {})
+    annotate_wires(netlist["wires"])
     svg = render_visual_svg(netlist, step_n)
     breadboard_svg = render_breadboard_svg(netlist, step_n)
     return {"session_id": session_id, "n": step_n,
@@ -776,16 +777,15 @@ def api_project_guide(session_id: str):
     return {"session_id": session_id, **guide}
 
 
-def _resolve_step_build(session_id: str, step_n: int, action: str):
-    """Session + step + code + compiled build for flash-style endpoints.
+def _resolve_final_code(session_id: str, action: str):
+    """Session + final code for the project flash endpoint (pre-stream).
 
-    Shared by server-side flash and the browser-flash firmware
-    endpoints so all three validate identically (404s, ESP32-only
-    400, code-unavailable 409, Meta 502, compile-failed 500).
-    Returns (session, step, code, source, build).
+    Raises 404s, ESP32-only 400, wiring-incomplete 409, Meta 502.
+    Deploy unlocks once the wiring is done (final step reached),
+    before telemetry proof exists. Split from the compile so the SSE
+    endpoint validates eagerly with real HTTP codes, then streams.
+    Returns (session, code).
     """
-    from .firmware_build import compile_sketch
-
     session = orchestrator.sessions.get(session_id)
     if session is None or not session.get("learning"):
         raise HTTPException(status_code=404, detail="unknown learning session id")
@@ -794,37 +794,245 @@ def _resolve_step_build(session_id: str, step_n: int, action: str):
             status_code=400,
             detail="%s supports ESP32 only (session board: %s)"
             % (action, session.get("board") or "?"))
-    steps = session.get("plan", []) or []
-    step = next((s for s in steps
-                 if isinstance(s, dict) and s.get("n") == step_n), None)
-    if step is None:
-        raise HTTPException(status_code=404, detail="unknown step %d" % step_n)
+    plan = session.get("plan", []) or []
+    if session.get("step_index", 0) < len(plan) - 1:
+        raise HTTPException(
+            status_code=409,
+            detail="wire every step first: step %d of %d" % (
+                session.get("step_index", 0) + 1, len(plan)))
     try:
-        code, source = generate_step_code(session, step, orchestrator.Muse)
+        code = generate_code(session, orchestrator.Muse)
     except MetaAPIError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     if not code:
         raise HTTPException(
             status_code=409,
-            detail="step %d code unavailable: nothing to %s" % (step_n, action))
+            detail="final code unavailable: nothing to %s" % action)
+    return session, code
+
+
+def _resolve_final_build(session_id: str, action: str):
+    """Session + final code + compiled build for the project flash endpoint.
+
+    404s, ESP32-only 400, wiring-incomplete 409, Meta 502,
+    compile-failed 500. Returns (session, code, build).
+    """
+    from .firmware_build import compile_sketch
+
+    session, code = _resolve_final_code(session_id, action)
     build = compile_sketch(code)
     if not build["ok"]:
         raise HTTPException(
             status_code=500,
             detail="compile failed: %s" % build["log_excerpt"])
-    return session, step, code, source, build
+    return session, code, build
 
 
-@app.get("/project/{session_id}/step/{step_n}/firmware")
-def api_step_firmware(session_id: str, step_n: int):
+def _require_flash_port(session_id, step_label, body):
+    """Validate the user-picked flash port (audit-logged 409s).
+
+    Refuses a missing, busy, or nonexistent port with guidance.
+    Returns the port string.
+    """
+    from .firmware_flash import (
+        audit_flash,
+        available_ports,
+        busy_port_guidance,
+        check_port,
+    )
+
+    port = str((body or {}).get("port") or "").strip()
+    if not port:
+        raise HTTPException(
+            status_code=400,
+            detail="flash needs an explicit port")
+    pre = check_port(port)
+    if pre["ok"]:
+        return port
+    if pre.get("busy", True):
+        detail = "%s\n(%s)" % (busy_port_guidance(port), pre["detail"])
+        reason = "port_busy"
+    else:
+        found = available_ports()
+        where = ("Available ports: %s." % ", ".join(found)) if found \
+            else ("No serial ports found — plug the board in over USB "
+                  "and install its driver.")
+        detail = ("Port %s does not exist on this computer. %s Pick the "
+                  "board's port from the dropdown (or press AUTO-DETECT "
+                  "in Settings), then FLASH again." % (port, where))
+        reason = "port_missing"
+    audit_flash(session_id, step_label, port, "", False,
+                reason, pre["detail"])
+    raise HTTPException(status_code=409, detail=detail)
+
+
+def _write_build_to_port(session_id, step_label, port, build, source):
+    """Shared flash tail: exclusive port -> esptool -> PING -> audit.
+
+    Busy guidance, silent-PING reporting, audit trail.
+    `step_label` is "final" for project firmware. Raises
+    HTTPException(500) when esptool fails; returns the success
+    payload (without the final marker) otherwise.
+    """
+    from .firmware_flash import (
+        audit_flash,
+        busy_port_guidance,
+        flash_artifacts,
+        is_busy_port,
+        settle_before_ping,
+        verify_ping,
+    )
+
+    # esptool needs the port exclusively: drop both probe handles first.
+    orchestrator.probe.close()
+    live_guide.probe.close()
+    flashed = flash_artifacts(build["artifacts"], port)
+    if flashed["ok"]:
+        settle_before_ping(orchestrator.probe)
+        ping = verify_ping(orchestrator.probe)
+    else:
+        ping = {"answered": False, "reply": "skipped: flash failed"}
+    audit_flash(session_id, step_label, port, build["build_hash"],
+                flashed["ok"], "flashed" if flashed["ok"] else "flash_failed",
+                flashed["log_excerpt"])
+    if not flashed["ok"]:
+        detail = flashed["log_excerpt"]
+        if is_busy_port(detail):
+            detail = busy_port_guidance(port) + "\n" + detail
+        raise HTTPException(status_code=500,
+                            detail="flash failed: %s" % detail)
+    return {"ok": True, "session_id": session_id,
+            "build_hash": build["build_hash"], "port": port,
+            "verify_ping": ping, "cached": build["cached"],
+            "source": source}
+
+
+def _iter_build_flash_events(session_id, step_label, port, code, source,
+                             extra_done):
+    """SSE frames for one server flash: log*/progress*/done|error.
+
+    Streams the compile lines, then the esptool lines, with the same
+    handle release, PING re-probe, and audit trail as the blocking
+    tail. Compile/flash failures arrive as `error` frames (audited);
+    success arrives as `done` with the blocking payload plus extra_done.
+    """
+    from .firmware_build import compile_sketch_stream
+    from .firmware_flash import (
+        audit_flash,
+        busy_port_guidance,
+        flash_artifacts_stream,
+        is_busy_port,
+        settle_before_ping,
+        verify_ping,
+    )
+
+    yield _sse("ack", {"status": "flashing"})
+    build = None
+    for ev in compile_sketch_stream(code):
+        if ev["event"] == "log":
+            yield _sse("log", {"stage": "compile", "line": ev["line"]})
+        else:
+            build = ev["build"]
+    if not build["ok"]:
+        detail = "compile failed: %s" % build["log_excerpt"]
+        audit_flash(session_id, step_label, port, build["build_hash"],
+                    False, "compile_failed", detail)
+        yield _sse("error", {"detail": detail})
+        return
+    yield _sse("log", {"stage": "flash",
+                       "line": "Build %s%s — writing to %s…"
+                               % (build["build_hash"],
+                                  " (cached)" if build["cached"] else "",
+                                  port)})
+    orchestrator.probe.close()
+    live_guide.probe.close()
+    flashed_ok, excerpt = True, ""
+    for ev in flash_artifacts_stream(build["artifacts"], port):
+        if ev["event"] == "log":
+            yield _sse("log", {"stage": "flash", "line": ev["line"]})
+        elif ev["event"] == "progress":
+            yield _sse("progress", {"fraction": ev["fraction"]})
+        else:
+            flashed_ok, excerpt = ev["ok"], ev["log_excerpt"]
+    if flashed_ok:
+        settle_before_ping(orchestrator.probe)
+        ping = verify_ping(orchestrator.probe)
+    else:
+        ping = {"answered": False, "reply": "skipped: flash failed"}
+    audit_flash(session_id, step_label, port, build["build_hash"],
+                flashed_ok, "flashed" if flashed_ok else "flash_failed",
+                excerpt)
+    if not flashed_ok:
+        detail = excerpt
+        if is_busy_port(detail):
+            detail = busy_port_guidance(port) + "\n" + detail
+        yield _sse("error", {"detail": "flash failed: %s" % detail})
+        return
+    done = {"ok": True, "session_id": session_id,
+            "build_hash": build["build_hash"], "port": port,
+            "verify_ping": ping, "cached": build["cached"],
+            "source": source}
+    done.update(extra_done)
+    yield _sse("done", done)
+
+
+def iter_final_flash_events(session_id: str, port: str, code: str):
+    """SSE frames for the final firmware flash (validated code in)."""
+    yield from _iter_build_flash_events(session_id, "final", port, code,
+                                        "final", {"final": True})
+
+
+@app.post("/project/{session_id}/flash")
+def api_project_flash(session_id: str, body: dict | None = None):
+    """Flash the finished firmware to the ESP32 (explicit tap only).
+
+    Deploy unlocks once the wiring is done (409 until the final
+    step): compiles the finished project code (cached by code hash)
+    and flashes it over the native-esptool path — same port
+    validation, PING re-probe, and audit trail.
+    """
+    from .firmware_flash import audit_flash
+
+    port = _require_flash_port(session_id, "final", body)
+    try:
+        _, _, build = _resolve_final_build(session_id, "flash")
+    except HTTPException as exc:
+        if exc.status_code == 500:
+            audit_flash(session_id, "final", port, "", False,
+                        "compile_failed", str(exc.detail))
+        raise
+    out = _write_build_to_port(session_id, "final", port, build, "final")
+    out["final"] = True
+    return out
+
+
+@app.post("/project/{session_id}/flash/stream")
+def api_project_flash_stream(session_id: str, body: dict | None = None):
+    """Final flash as SSE: ack -> log*/progress* -> done|error.
+
+    Same validation and audit trail as the blocking final flash; the
+    terminal dialog consumes the live lines. Port + code validate
+    eagerly with real HTTP codes before the first frame.
+    """
+    port = _require_flash_port(session_id, "final", body)
+    _, code = _resolve_final_code(session_id, "flash")
+    return StreamingResponse(
+        iter_final_flash_events(session_id, port, code),
+        media_type="text/event-stream")
+
+
+@app.get("/project/{session_id}/firmware")
+def api_project_firmware(session_id: str):
     """Firmware manifest for browser-side flashing (Web Serial).
 
-    Compiles the step sketch on demand (cached by code hash) and
-    returns each binary's flash offset, size, and download URL so the
-    page can fetch them and drive esptool-js. Browser flashes run
-    outside the server's audit trail — the browser owns the port.
+    Compiles the finished firmware on demand (cached by code hash)
+    and returns each binary's flash offset, size, and download URL
+    so the page can fetch them and drive esptool-js. Browser
+    flashes run outside the server's audit trail — the browser owns
+    the port. Deploy-gated like the server flash: wire every step
+    first.
     """
-    _, _, _, source, build = _resolve_step_build(session_id, step_n, "flash")
+    _, _, build = _resolve_final_build(session_id, "flash")
     files = []
     for index, artifact in enumerate(build["artifacts"]):
         try:
@@ -835,22 +1043,21 @@ def api_step_firmware(session_id: str, step_n: int):
             "index": index,
             "offset": artifact.get("offset"),
             "size": size,
-            "url": "/project/%s/step/%d/firmware/%d"
-            % (session_id, step_n, index),
+            "url": "/project/%s/firmware/%d" % (session_id, index),
         })
-    return {"session_id": session_id, "n": step_n,
+    return {"session_id": session_id,
             "build_hash": build["build_hash"], "cached": build["cached"],
-            "source": source, "files": files}
+            "source": "final", "files": files}
 
 
-@app.get("/project/{session_id}/step/{step_n}/firmware/{index}")
-def api_step_firmware_file(session_id: str, step_n: int, index: int):
+@app.get("/project/{session_id}/firmware/{index}")
+def api_project_firmware_file(session_id: str, index: int):
     """Download one compiled firmware binary (see the manifest above).
 
-    Only files inside the step's own build directory are served;
+    Only files inside the finished build's own directory are served;
     anything else is a 404, never a path escape.
     """
-    _, _, _, _, build = _resolve_step_build(session_id, step_n, "flash")
+    _, _, build = _resolve_final_build(session_id, "flash")
     artifacts = build["artifacts"] or []
     if index < 0 or index >= len(artifacts):
         raise HTTPException(status_code=404, detail="unknown firmware file")
@@ -861,95 +1068,6 @@ def api_step_firmware_file(session_id: str, step_n: int, index: int):
     return FileResponse(path, media_type="application/octet-stream",
                         filename=os.path.basename(path),
                         headers={"Cache-Control": "no-store"})
-
-
-@app.post("/project/{session_id}/step/{step_n}/flash")
-def api_step_flash(session_id: str, step_n: int, body: dict | None = None):
-    """Flash one step's sketch to the ESP32 (explicit user action only).
-
-    Compile/cache -> release both probe handles -> esptool write_flash
-    at the build offsets -> re-probe PING. Every flash is audit-logged.
-    The port is always user-picked (never automatic); a step sketch is
-    not patient firmware, so a silent PING re-probe is reported, not a
-    failure.
-    """
-    from .firmware_flash import (
-        audit_flash,
-        available_ports,
-        busy_port_guidance,
-        check_port,
-        flash_artifacts,
-        is_busy_port,
-        settle_before_ping,
-        verify_ping,
-    )
-
-    port = str((body or {}).get("port") or "").strip()
-    if not port:
-        raise HTTPException(
-            status_code=400,
-            detail="flash needs an explicit port")
-    pre = check_port(port)
-    if not pre["ok"]:
-        if pre.get("busy", True):
-            detail = "%s\n(%s)" % (busy_port_guidance(port), pre["detail"])
-            reason = "port_busy"
-        else:
-            found = available_ports()
-            where = ("Available ports: %s." % ", ".join(found)) if found \
-                else ("No serial ports found — plug the board in over USB "
-                      "and install its driver.")
-            detail = ("Port %s does not exist on this computer. %s Pick the "
-                      "board's port from the dropdown (or press AUTO-DETECT "
-                      "in Settings), then FLASH again." % (port, where))
-            reason = "port_missing"
-        audit_flash(session_id, step_n, port, "", False,
-                    reason, pre["detail"])
-        raise HTTPException(status_code=409, detail=detail)
-    try:
-        _, _, _, source, build = _resolve_step_build(
-            session_id, step_n, "flash")
-    except HTTPException as exc:
-        if exc.status_code == 500:
-            audit_flash(session_id, step_n, port, "", False,
-                        "compile_failed", str(exc.detail))
-        raise
-    # esptool needs the port exclusively: drop both probe handles first.
-    orchestrator.probe.close()
-    live_guide.probe.close()
-    flashed = flash_artifacts(build["artifacts"], port)
-    if flashed["ok"]:
-        settle_before_ping(orchestrator.probe)
-        ping = verify_ping(orchestrator.probe)
-    else:
-        ping = {"answered": False, "reply": "skipped: flash failed"}
-    audit_flash(session_id, step_n, port, build["build_hash"],
-                flashed["ok"], "flashed" if flashed["ok"] else "flash_failed",
-                flashed["log_excerpt"])
-    if not flashed["ok"]:
-        detail = flashed["log_excerpt"]
-        if is_busy_port(detail):
-            detail = busy_port_guidance(port) + "\n" + detail
-        raise HTTPException(status_code=500,
-                            detail="flash failed: %s" % detail)
-    return {"ok": True, "session_id": session_id, "n": step_n,
-            "build_hash": build["build_hash"], "port": port,
-            "verify_ping": ping, "cached": build["cached"],
-            "source": source}
-
-
-@app.get("/api/patient-sketch")
-def api_patient_sketch():
-    """Serve the patient board sketch text for copy-paste flashing."""
-    try:
-        code = read_patient_sketch()
-    except OSError:
-        raise HTTPException(
-            status_code=404,
-            detail="patient sketch not found in firmware/patient_board")
-    if not code.strip():
-        raise HTTPException(status_code=404, detail="patient sketch is empty")
-    return {"filename": "patient_board.ino", "code": code}
 
 
 @app.post("/discover/upload")
@@ -996,6 +1114,64 @@ def api_serial_release():
     orchestrator.probe.close()
     live_guide.probe.close()
     return {"ok": True}
+
+
+def telemetry_sse_body(port: str, baud: int):
+    """SSE frames for the telemetry monitor (sync generator, tested)."""
+    from .telemetry import iter_telemetry_events
+
+    if not port:
+        yield _sse("error", {"detail": "no serial port selected"})
+        return
+    for event, payload in iter_telemetry_events(port, baud):
+        yield _sse(event, payload)
+
+
+@app.get("/project/{session_id}/telemetry/stream")
+def api_telemetry_stream(session_id: str, port: str = "",
+                         baud: int = 115200):
+    """SSE: live serial lines from the board for the telemetry monitor.
+
+    Takes the port over from the probes (they reopen lazily); the UI
+    pauses auto-checks while monitoring. Frames: ready, line, error.
+    """
+    session = orchestrator.sessions.get(session_id)
+    if session is None or not session.get("learning"):
+        raise HTTPException(status_code=404,
+                            detail="unknown learning session id")
+    use_port = str(port or "").strip() or str(orchestrator.probe.port or "")
+    if use_port:
+        orchestrator.probe.close()
+        live_guide.probe.close()
+    return StreamingResponse(
+        telemetry_sse_body(use_port, baud or 115200),
+        media_type="text/event-stream")
+
+
+@app.post("/project/{session_id}/telemetry/diagnose")
+def api_telemetry_diagnose(session_id: str, body: dict | None = None):
+    """One model diagnosis for a stalled telemetry stream.
+
+    Body {"lines": [...recent device lines]}. Returns {"message",
+    "suspect"}: spoken-safe guidance plus the suspect netlist wire
+    (part, part_pin, board_pin) or null. Always 200: model failure
+    falls back to honest generic guidance.
+    """
+    from .schematic import build_netlist
+    from .telemetry import diagnose_telemetry
+
+    session = orchestrator.sessions.get(session_id)
+    if session is None or not session.get("learning"):
+        raise HTTPException(status_code=404,
+                            detail="unknown learning session id")
+    plan = session.get("plan") or []
+    numbers = [s["n"] for s in plan
+               if isinstance(s, dict) and isinstance(s.get("n"), int)]
+    net = build_netlist(plan, max(numbers) if numbers else 0,
+                        session.get("pin_map", {}) or {})
+    lines = list((body or {}).get("lines") or [])
+    return diagnose_telemetry(lines, net, session.get("project_title", ""),
+                              orchestrator.Muse, session.get("board"))
 
 
 @app.post("/api/config/serial")

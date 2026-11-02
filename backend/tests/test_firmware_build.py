@@ -327,5 +327,67 @@ class LibraryAutoInstallTest(unittest.TestCase):
         self.assertIn("boom", out["log_excerpt"])
 
 
+class CompileStreamTest(unittest.TestCase):
+    """Streaming compile yields log lines, then the same record shape."""
+
+    def test_lines_then_ok_result(self):
+        from backend.tests.test_firmware_flash import FakePopen
+
+        code = "void setup() {}\nvoid loop() {}\n"
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"FIRMWARE_BUILD_DIR": tmp}):
+            outdir = fb.build_dir_for(fb.code_hash(code))
+            os.makedirs(outdir, exist_ok=True)
+            with open(os.path.join(outdir, "step_sketch.ino.bin"),
+                      "wb") as fh:
+                fh.write(b"\x01" * 16)
+            fake = FakePopen(["Sketch uses 1 bytes\n"], 0)
+
+            def boom(*args, **kwargs):
+                raise AssertionError("no libraries needed here")
+
+            events = list(fb.compile_sketch_stream(
+                code, runner=boom, popen=fake))
+        kinds = [e["event"] for e in events]
+        self.assertIn("log", kinds)
+        self.assertEqual(kinds[-1], "result")
+        self.assertTrue(events[-1]["build"]["ok"])
+        self.assertIn("compile", fake.cmd)
+
+    def test_failure_result(self):
+        from backend.tests.test_firmware_flash import FakePopen
+
+        code = "void setup() {}\nvoid loop() {}\n"
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"FIRMWARE_BUILD_DIR": tmp}):
+            fake = FakePopen(["error: boom\n"], 2)
+            events = list(fb.compile_sketch_stream(
+                code, runner=lambda *a, **k: None, popen=fake))
+        self.assertFalse(events[-1]["build"]["ok"])
+        self.assertIn("boom", events[-1]["build"]["log_excerpt"])
+
+    def test_cached_build_streams_no_subprocess(self):
+        from backend.tests.test_firmware_flash import FakePopen
+
+        code = "void setup() {}\nvoid loop() {}\n"
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"FIRMWARE_BUILD_DIR": tmp}):
+            outdir = fb.build_dir_for(fb.code_hash(code))
+            os.makedirs(outdir, exist_ok=True)
+            main = os.path.join(outdir, "step_sketch.ino.bin")
+            with open(main, "wb") as fh:
+                fh.write(b"\x01" * 16)
+            with open(os.path.join(outdir, "build.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"build_hash": fb.code_hash(code),
+                           "artifacts": [{"offset": "0x10000",
+                                          "file": main}]}, fh)
+            fake = FakePopen(["must not run\n"], 0)
+            events = list(fb.compile_sketch_stream(
+                code, runner=lambda *a, **k: None, popen=fake))
+        self.assertIsNone(fake.cmd)
+        self.assertTrue(events[-1]["build"]["cached"])
+
+
 if __name__ == "__main__":
     unittest.main()

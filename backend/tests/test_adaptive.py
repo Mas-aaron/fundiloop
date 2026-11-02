@@ -22,9 +22,7 @@ from unittest import mock
 
 from fastapi import HTTPException
 
-from backend.app.agent_orchestrator import verify_chain
-from backend.app.learning import run_learning_verification
-from backend.app.models import CheckNowRequest, Mode, ProbeReading
+from backend.app.models import CheckNowRequest, Mode
 from backend.app.serial_probe import SerialProbe
 from backend.tests.helpers import use_mock_env
 from backend.tests.test_latency import make_orchestrator
@@ -51,6 +49,29 @@ class SilentHandle:
 
     def close(self):
         pass
+
+
+class SketchHandle(SilentHandle):
+    """Answers PING with a step-sketch identity tag."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self._out = []
+
+    def write(self, data):
+        super().write(data)
+        cmd = bytes(data).decode("ascii", "replace").strip()
+        if cmd == "PING":
+            self._out.append(
+                b'{"cmd": "PING", "status": "OK", "sketch": "step-2"}\n')
+        elif cmd in ("I2C_SCAN", "READ_SENSOR", "SELFTEST"):
+            self._out.append(('{"cmd": "%s"}\n' % cmd).encode("ascii"))
+        return len(data)
+
+    def readline(self):
+        if self._out:
+            return self._out.pop(0)
+        return b""
 
 
 class BaudAwareHandle(SilentHandle):
@@ -123,6 +144,20 @@ class ProbeAdaptivityTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"SERIAL_TIMEOUT": "bogus"}):
             self.assertEqual(
                 SerialProbe(port="X", mock=True).timeout, 4.0)
+
+    def test_read_all_surfaces_sketch_identity(self):
+        install_serial_stub(self, SketchHandle)
+        probe = SerialProbe(port="COM9", baud=115200, mock=False,
+                            timeout=0.5)
+        reading = probe.read_all()
+        self.assertTrue(reading.connected)
+        self.assertEqual(reading.sketch_id, "step-2")
+
+    def test_mock_ping_claims_step_evidence(self):
+        use_mock_env(self)
+        probe = SerialProbe(mock=True)
+        reading = probe.read_all()
+        self.assertEqual(reading.sketch_id, "step")
 
 
 class ProbeFailoverTest(unittest.TestCase):
@@ -293,95 +328,29 @@ GPIO_PLAN = [{"n": 1, "instruction": "Blink the builtin LED.",
               "verify": "CHECK_GPIO", "expect": {},
               "depends_on_parts": []}]
 
-UNVERIFIABLE = ProbeReading(
-    connected=True, i2c_devices=[], temperature_c=None, humidity_pct=None,
-    pressure_hpa=None, oled_ok=None, led_ok=None, mock=False, raw="{}")
-
-
-def start_blink(orc, sid, board="arduino_uno"):
-    return orc.start_learning_session(
-        "blink", [dict(s) for s in GPIO_PLAN],
-        visible_parts=["arduino_uno", "led"], session_id=sid,
-        project_title="Blink", board=board)
-
-
-class ConfirmFlowTest(unittest.TestCase):
+class ReadyEndpointTest(unittest.TestCase):
     def setUp(self):
         use_mock_env(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.orc = make_orchestrator(self.tmp.name)
 
-    def test_unknown_gpio_asks_instead_of_failing(self):
-        start_blink(self.orc, "learn-gpio")
-        with mock.patch.object(self.orc.probe, "read_all",
-                               return_value=UNVERIFIABLE):
-            v = self.orc.check_now(CheckNowRequest())
-        self.assertEqual(v["state"], "VERIFYING")
-        self.assertEqual(v["step_index"], 0)  # nothing advanced on its own
-        self.assertIn("GPIO13", v["confirm_pending"]["question"])
-        self.assertIn("CONFIRM", v["confirm_pending"]["question"])
-
-    def test_confirm_advances_and_audits(self):
-        start_blink(self.orc, "learn-gpio")
-        with mock.patch.object(self.orc.probe, "read_all",
-                               return_value=UNVERIFIABLE):
-            self.orc.check_now(CheckNowRequest())
-        v = self.orc.confirm_learning_step("learn-gpio", True)
-        self.assertEqual(v["state"], "DONE")
-        self.assertTrue(v["code_ready"])
-        steps = self.orc.session["verified"]["steps"]
-        self.assertEqual(steps[-1]["confirmed_by"], "technician")
-        attempts = self.orc.session["attempts"]
-        self.assertEqual(len(attempts), 1)
-        self.assertEqual(attempts[0]["confirmed_by"], "technician")
-        self.assertTrue(verify_chain(attempts))
-        passport = self.orc.get_passport("learn-gpio")
-        self.assertTrue(passport["chain_valid"])
-        self.assertEqual(passport["passport"]["technician_confirmed"], 1)
-
-    def test_decline_stays_without_advancing(self):
-        start_blink(self.orc, "learn-gpio2")
-        with mock.patch.object(self.orc.probe, "read_all",
-                               return_value=UNVERIFIABLE):
-            self.orc.check_now(CheckNowRequest())
-        v = self.orc.confirm_learning_step("learn-gpio2", False)
-        self.assertEqual(v["state"], "VERIFYING")
-        self.assertEqual(v["step_index"], 0)
-        self.assertIsNone(self.orc.session["confirm_pending"])
-        self.assertEqual(self.orc.session["attempts"], [])
-
-    def test_confirm_endpoints_map_errors(self):
+    def test_ready_endpoint_begins_chapters(self):
         import backend.app.main as main_mod
 
         with mock.patch.object(main_mod, "orchestrator", self.orc):
             with self.assertRaises(HTTPException) as ctx:
-                main_mod.api_session_confirm(
-                    {"session_id": "nope", "confirmed": True})
+                main_mod.api_session_ready({"session_id": "nope"})
             self.assertEqual(ctx.exception.status_code, 404)
-            start_blink(self.orc, "learn-empty")
-            with self.assertRaises(HTTPException) as ctx:
-                main_mod.api_session_confirm(
-                    {"session_id": "learn-empty", "confirmed": True})
-            self.assertEqual(ctx.exception.status_code, 409)
-
-    def test_verifier_marks_unknown_not_failed(self):
-        from backend.app.boards import pin_map_for
-
-        arduino = pin_map_for("arduino_uno")
-        gpio_unknown = run_learning_verification(
-            "CHECK_GPIO", {}, UNVERIFIABLE, arduino)
-        self.assertFalse(gpio_unknown["passed"])
-        self.assertTrue(gpio_unknown["needs_confirmation"])
-        gpio_dead = run_learning_verification(
-            "CHECK_GPIO", {},
-            UNVERIFIABLE.model_copy(update={"led_ok": False}), arduino)
-        self.assertFalse(gpio_dead["passed"])
-        self.assertFalse(gpio_dead["needs_confirmation"])
-        self.assertIn("did not toggle", gpio_dead["measured"])
-        oled_unknown = run_learning_verification(
-            "CHECK_OLED", {}, UNVERIFIABLE, arduino)
-        self.assertTrue(oled_unknown["needs_confirmation"])
+            view = self.orc.start_learning_session(
+                "blink", [dict(s) for s in GPIO_PLAN],
+                visible_parts=["arduino_uno", "led"],
+                session_id="learn-ready", project_title="Blink",
+                board="arduino_uno")
+            self.assertEqual(view["state"], "ROLLCALL")
+            answered = main_mod.api_session_ready(
+                {"session_id": "learn-ready", "transcript": "ready"})
+            self.assertEqual(answered["fundi"]["event"], "CHAPTER_START")
 
 
 class ToggleHandle(SilentHandle):

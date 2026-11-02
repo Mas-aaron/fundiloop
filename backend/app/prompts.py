@@ -88,6 +88,10 @@ def plan_system_prompt(available_tests: dict, visible_parts: list[str],
         "[{n, instruction, verify, expect, depends_on_parts}]}].",
         "Rules:",
         "- Every step's verify MUST be one of: %s." % ", ".join(available_tests),
+        "- title is a short build name: at most 6 words, a noun phrase "
+        "like 'Ultrasonic Distance Alert'. Never a question, never a "
+        "sentence, and never the user's words echoed back when they are "
+        "conversational — distill those into a clean build name.",
     ]
     if user_project:
         lines += [
@@ -130,7 +134,8 @@ def fundi_chapters_system(board: str | None = None) -> str:
         "number n, a task instruction, and the sensor test that verifies it. "
         "For EVERY step, in order, write one lesson chapter. Return ONLY "
         "valid JSON, no prose:\n"
-        '{"chapters": [{n, title, teach, task, verify, celebration}]}\n'
+        '{"chapters": [{n, title, teach, why, task, verify, '
+        'celebration, question, answers, diagnose, troubleshoot}]}\n'
         "Rules:\n"
         "- n and verify MUST echo the plan step exactly: same number, same "
         "test name. Never renumber, merge, split, or reorder steps.\n"
@@ -141,13 +146,31 @@ def fundi_chapters_system(board: str | None = None) -> str:
         "one vivid detail, zero filler. Plain spoken English, no ALL-CAPS "
         "words, no code, no parenthetical numbers; say ground for GND and "
         "three v three for 3V3.\n"
-        "- task: under 30 words, spoken right after teach. The physical "
+        "- why: one spoken sentence, under 25 words, said between teach "
+        "and task. The principle this step proves: what the measurement "
+        "means, why the order matters. Same spoken-English rules as "
+        "teach.\n"
+        "- task: under 30 words, spoken right after why. The physical "
         "thing to do now, rephrased from the plan instruction. Never add "
         "wiring the plan does not name.\n"
         "- celebration: under 12 words of pure host energy for when the "
         "sensor verifies this chapter. Vary it every chapter: Boom, Spot "
         "on, Nailed it, Let's go. No claims about what was built, only "
         "cheer.\n"
+        "- question: under 20 words, spoken after the sensor passes to "
+        "check one fact from the task — usually which pin a wire landed "
+        "on. Never give the answer away in the question.\n"
+        "- answers: 2-4 accepted answer sets for the question, each a "
+        "list of lowercase keyword strings the student might say "
+        '(e.g. [["gpio", "5"], ["5"], ["five"]] for a pin question).\n'
+        "- diagnose: under 30 words, spoken when this step's sensor test "
+        "fails: one diagnostic question pointing at the most likely "
+        "cause (swapped wires, loose ground, missing flash).\n"
+        "- troubleshoot: 2-3 ordered fix steps as a JSON list of short "
+        "strings, shown on screen when the step fails (diagnose is "
+        "spoken, these are read). Each is one concrete action: re-seat "
+        "a named wire, re-check a pin number, press CHECK again. Never "
+        "invent parts the plan does not name.\n"
         "- You never declare success: the sensor test decides. You narrate, "
         "it verifies."
         % describe_board(board)
@@ -169,65 +192,116 @@ def fundi_chapters_user(plan: list, project_title: str) -> str:
     )
 
 
-def learning_hint_prompt(step: dict, verification: dict) -> str:
-    """Ask Muse for one targeted fix hint grounded in sensor evidence."""
+def fundi_stretch_system(board: str | None = None) -> str:
+    """System prompt: Fundi dreams up DONE-state stretch goals."""
     return (
-        "A build step just FAILED its sensor verification. Write ONE short "
-        "hint (under 25 words) telling the technician exactly what to check. "
-        "Ground it only in this evidence, no new wiring claims:\n"
-        "step: %s\ninstruction: %s\ntest: %s\nmeasured: %s"
-        % (step.get("n", "?"), step.get("instruction", ""),
-           verification.get("test", "?"), verification.get("measured", ""))
+        "You are Fundi, a high-energy maker host. The student just "
+        "finished a build on: %s. Dream up what they could do next. "
+        "Return ONLY valid JSON, no prose:\n"
+        '{"stretch": [{title, summary}]}\n'
+        "Rules:\n"
+        "- 1-2 ideas only, each a real next step for THIS project, not "
+        "generic maker advice. Ground every idea in the plan and parts "
+        "below: name a reading, a part, or a behavior from this build.\n"
+        "- title: under 8 words, a fun label shown on screen.\n"
+        "- summary: under 40 words, spoken aloud: what to add and what "
+        "it unlocks. Talk TO the student (you), contractions, zero "
+        "filler. Plain spoken English, no ALL-CAPS words, no code.\n"
+        "- Never suggest parts the build already uses for the same job, "
+        "and never declare anything already done."
+        % describe_board(board)
     )
 
 
-def learning_step_code_prompt(step: dict, pin_map: dict) -> str:
-    """Ask Muse for one step's Arduino sketch (unknown verify types)."""
+def fundi_stretch_user(project_title: str, plan: list, visible_parts: list,
+                       missing_parts: list) -> str:
+    """Ask Fundi for stretch goals grounded in this build."""
+    steps = [
+        {"n": s.get("n"), "instruction": s.get("instruction", "")}
+        for s in (plan or []) if isinstance(s, dict)
+    ]
     return (
-        "Write the complete Arduino (.ino) sketch for this single build "
-        "step. Return ONLY code, no prose or fences.\n"
-        "step: %s\ninstruction: %s\nverify: %s\n"
-        "Target board: %s (%s logic); USE THESE EXACT PINS: SDA=%s SCL=%s LED=%s."
-        % (step.get("n", "?"), step.get("instruction", ""),
-           step.get("verify", "?"),
-           pin_map.get("label", pin_map.get("board", "?")),
-           pin_map.get("voltage", "?"), pin_map.get("sda"),
-           pin_map.get("scl"), pin_map.get("led_gpio"))
+        "Project: %s.\nPlan steps: %s\nParts on the bench: %s\n"
+        "Parts never resolved: %s\n"
+        "Write the stretch goals in the required JSON format."
+        % (project_title or "project", json.dumps(steps),
+           json.dumps([str(p) for p in (visible_parts or [])]),
+           json.dumps([str(p) for p in (missing_parts or [])]))
+    )
+
+
+def telemetry_diagnose_system(board: str | None = None) -> str:
+    """System prompt: Fundi diagnoses a stalled telemetry stream."""
+    return (
+        "You are Fundi, a high-energy maker host. The student's build "
+        "on: %s just lost its live telemetry: the serial stream stalled "
+        "or started printing errors. Name the most likely loose wire. "
+        "Return ONLY valid JSON, no prose:\n"
+        '{"message": "...", "suspect": {"part": "...", "part_pin": "..."} '
+        "or null}\n"
+        "Rules:\n"
+        "- message: under 40 words, spoken aloud: what happened and the "
+        "one wire to push home first. Talk TO the student (you), "
+        "contractions, zero filler. Plain spoken English, no ALL-CAPS "
+        "words, no code.\n"
+        "- suspect: exactly one wire from the netlist below, echoed "
+        "part and part_pin verbatim, or null when no single wire stands "
+        "out. Never invent a part, pin, or wire the netlist does not "
+        "contain.\n"
+        "- Ground the call only in the recent lines and the netlist: a "
+        "sensor that stopped answering points at its signal wire, "
+        "silence across everything points at power or ground."
+        % describe_board(board)
+    )
+
+
+def telemetry_diagnose_user(lines: list, wires: list,
+                            project_title: str) -> str:
+    """Ask Fundi which wire to suspect for a stalled stream."""
+    compact = [
+        {"part": w.get("part"), "part_pin": w.get("part_pin"),
+         "board_pin": w.get("board_pin")}
+        for w in (wires or []) if isinstance(w, dict)
+    ]
+    tail = [str(line)[:200] for line in (lines or [])][-30:]
+    return (
+        "Project: %s.\nRecent telemetry lines: %s\nNetlist wires: %s\n"
+        "Write the diagnosis in the required JSON format."
+        % (project_title or "project", json.dumps(tail),
+           json.dumps(compact))
     )
 
 
 def learning_code_prompt(project_title: str, plan: list, visible_parts: list,
-                         verified: dict, pin_map: dict,
-                         draft: bool = False) -> str:
-    """Ask Muse for the project's .ino firmware (final or draft)."""
-    if draft:
-        head = ("Generate the complete Arduino (.ino) firmware for this "
-                "electronics build. The hardware is NOT fully verified yet: "
-                "follow the plan and board profile below, and use measured "
-                "evidence only where present. Return ONLY code, no prose or "
-                "fences.\n")
-        constraint = ("Pin numbers MUST come from the board pin map below; "
-                      "I2C addresses from measured evidence where present, "
-                      "else the interface defaults in the plan.")
-    else:
-        head = ("Generate the complete Arduino (.ino) firmware for this "
-                "VERIFIED electronics build. Return ONLY code, no prose or "
-                "fences.\n")
-        constraint = ("Every pin number and address in the code MUST come "
-                      "from the verified evidence above, never from memory.")
+                         verified: dict, pin_map: dict) -> str:
+    """Ask Muse for the project's .ino firmware.
+
+    The telemetry contract is load-bearing: the build proves itself
+    through live serial lines, so every firmware MUST open Serial at
+    115200 and print readings plus a STATUS heartbeat every loop.
+    """
     return (
-        head +
+        "Generate the complete Arduino (.ino) firmware for this "
+        "electronics build. Return ONLY code, no prose or fences.\n"
+        "Telemetry contract (REQUIRED — the build is verified from "
+        "these lines, and firmware without them is rejected): open "
+        "Serial at 115200 baud in setup(); every loop() MUST print "
+        "the live readings with units (e.g. Distance: 45cm) plus a "
+        "heartbeat line containing STATUS, even for builds with no "
+        "sensor — never run silent.\n"
         "project: %s\ntarget board: %s (%s logic)\nplan: %s\n"
         "visible parts: %s\nmeasured sensor evidence: %s\n"
         "board pin map (USE THESE EXACT NUMBERS): SDA=%s SCL=%s LED=%s. "
         "I2C addresses seen on the bus: %s. "
-        "%s"
+        "Pin numbers MUST come from the board pin map; I2C addresses "
+        "from measured evidence where present, else the interface "
+        "defaults in the plan."
         % (project_title, pin_map.get("label", pin_map.get("board", "?")),
            pin_map.get("voltage", "?"), json.dumps(plan)[:3000],
            ", ".join(visible_parts), json.dumps(verified)[:2000],
            pin_map.get("sda"), pin_map.get("scl"),
            pin_map.get("led_gpio"),
-           ", ".join(verified.get("i2c", [])) or "none", constraint)
+           ", ".join(verified.get("i2c", [])) or "none")
     )
 
 

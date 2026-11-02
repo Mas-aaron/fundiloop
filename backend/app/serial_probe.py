@@ -197,6 +197,7 @@ class SerialProbe:
         connected = ping.get("status") == "OK" and "error" not in ping
         devices = list(scan.get("i2c_devices") or [])
         mock = bool(ping.get("mock") or scan.get("mock"))
+        sketch = ping.get("sketch")
         return ProbeReading(
             connected=connected,
             i2c_devices=devices,
@@ -207,6 +208,7 @@ class SerialProbe:
             led_ok=selftest.get("led_ok"),
             mock=mock,
             raw=json.dumps({"ping": ping, "scan": scan, "sensor": sensor, "selftest": selftest}),
+            sketch_id=str(sketch) if sketch else None,
         )
 
     def close(self) -> None:
@@ -367,7 +369,10 @@ class SerialProbe:
         if command == "PING":
             if fault == "LOOSE_GND":
                 return {**base, "error": "no reply (ground suspect)"}
-            return {**base, "status": "OK", "uptime_ms": 424242}
+            # Mock simulates a cooperative build: the running sketch is
+            # step evidence, never the diagnostic patient sketch.
+            return {**base, "status": "OK", "uptime_ms": 424242,
+                    "sketch": "step"}
         if command == "I2C_SCAN":
             return {**base, "i2c_devices": devices}
         if command == "READ_SENSOR":
