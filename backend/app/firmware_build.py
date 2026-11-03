@@ -48,6 +48,7 @@ HEADER_LIB_MAP = {
     "ArduinoJson.h": "ArduinoJson",
     "PubSubClient.h": "PubSubClient",
     "NTPClient.h": "NTPClient",
+    "ESP32Servo.h": "ESP32Servo",
 }
 
 _INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.M)

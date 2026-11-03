@@ -236,5 +236,27 @@ class BoardHandoffTest(unittest.TestCase):
         self.assertEqual(parse_board_glance("")["parts"], [])
 
 
+class DescribeJsonModeTest(unittest.TestCase):
+    def test_describe_disables_json_mode(self):
+        from types import SimpleNamespace
+
+        from backend.tests.test_project_code import RecordingBrain
+        from backend.tests.helpers import use_mock_env
+
+        use_mock_env(self)
+        orc = make_orc(self)
+        brain = RecordingBrain(["a board on a bench"])
+        orc.Muse = brain
+        sam_result = {"detections": [], "notes": "", "mock": False}
+        orc.sam = SimpleNamespace(
+            analyze=lambda *a, **k: dict(sam_result),
+            get=lambda k, d=None: sam_result.get(k, d))
+        with mock.patch.object(orc, "_capture_settled_frame",
+                               return_value=(b"f", True, "cam", None)):
+            out = orc.describe_view()
+        self.assertEqual(out["description"], "a board on a bench")
+        self.assertIs(brain.kwarg_list[0].get("json_mode"), False)
+
+
 if __name__ == "__main__":
     unittest.main()

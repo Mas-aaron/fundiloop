@@ -8,9 +8,33 @@ never-talking firmware the monitor could never verify.
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 from .prompts import learning_code_prompt
+
+_log = logging.getLogger(__name__)
+
+# Firmware is the longest generation the app asks for (a full .ino):
+# it gets its own model budget instead of the snappy default, so a
+# slow service answers instead of timing out mid-sketch.
+CODEGEN_TIMEOUT_S = 120.0
+
+# AVR-only headers the model emits for ESP32 builds, and their ESP32
+# equivalents (installed via firmware_build.HEADER_LIB_MAP). The
+# rewrite runs on cache write AND read, so sessions that cached the
+# AVR spelling before this fix heal transparently.
+_ESP32_INCLUDE_REWRITES = {"Servo.h": "ESP32Servo.h"}
+
+
+def _rewrite_esp32_includes(code: str) -> str:
+    """Swap AVR-only includes for their ESP32 equivalents (idempotent)."""
+    text = str(code or "")
+    for avr, esp in _ESP32_INCLUDE_REWRITES.items():
+        text = re.sub(r'(^\s*#\s*include\s*[<"])%s([>"])'
+                      % re.escape(avr),
+                      r"\1%s\2" % esp, text, flags=re.M)
+    return text
 
 
 def _model_text_usable(text: str) -> bool:
@@ -51,7 +75,8 @@ def _firmware_has_telemetry(code: str) -> bool:
     return "Serial.begin(" in text and bool(_TELEMETRY_PRINT.search(text))
 
 
-def _complete_with_retry(Muse, system: str, user: str) -> str:
+def _complete_with_retry(Muse, system: str, user: str,
+                         timeout_s: float | None = None) -> str:
     """One immediate retry around a firmware model call.
 
     The adapters run with max_retries=0 (the app owns retry policy);
@@ -60,10 +85,17 @@ def _complete_with_retry(Muse, system: str, user: str) -> str:
     the second failure, propagates to the caller.
     """
     from .adapters import MetaAPIError
+    # Timeout passed only when set: strict test doubles without the
+    # kwarg keep working, the real adapter gets its budget.
+    # json_mode is always off here: this helper is codegen-only, and
+    # the API's json_object format would fight the code-only prompt
+    # until every reply comes back a JSON stub.
+    kwargs = {"timeout_s": timeout_s} if timeout_s else {}
+    kwargs["json_mode"] = False
     try:
-        return Muse.complete_text(system, user)
+        return Muse.complete_text(system, user, **kwargs)
     except MetaAPIError:
-        return Muse.complete_text(system, user)
+        return Muse.complete_text(system, user, **kwargs)
 
 
 def _extract_code_field(text: str):
@@ -107,14 +139,16 @@ def generate_code(session: dict, Muse) -> str:
     key = _project_code_key(session)
     cached = cache.get(key)
     if isinstance(cached, str) and cached:
-        return cached
+        return _rewrite_esp32_includes(cached)
     if getattr(Muse, "mock", False):
         code = _mock_firmware(session)
     else:
         from .adapters import MetaAPIError
 
-        system = ("You write Arduino firmware. Return ONLY Arduino code. "
-                  "No JSON. No markdown fences. No explanations. Start with "
+        system = ("You write Arduino firmware. The build details in "
+                  "the request are input context (they contain JSON) — "
+                  "YOUR REPLY must be Arduino code only: no JSON, no "
+                  "markdown fences, no explanations. Start with "
                   "a comment or #include.")
         user = learning_code_prompt(
             session.get("project_title", session.get("project_id", "project")),
@@ -129,19 +163,31 @@ def generate_code(session: dict, Muse) -> str:
                 return cleaned
             return _extract_code_field(cleaned)
 
-        code = _usable(_complete_with_retry(Muse, system, user))
+        first = _complete_with_retry(Muse, system, user,
+                                     CODEGEN_TIMEOUT_S)
+        code = _usable(first)
+        second = ""
         if code is None:
             # Rut-breaker: the model sometimes answers with a reasoning
             # stub instead of code. One explicit retry before failing
             # loud; a second stub raises below and caches nothing.
-            code = _usable(_complete_with_retry(
+            # Positive framing only: scolding about the last reply or
+            # naming JSON primed a constant {"code": "// placeholder"}
+            # rut in production. Tell it what TO emit instead.
+            second = _complete_with_retry(
                 Muse,
-                system + " Your last reply was not code; reply with "
-                "code only.",
-                user))
+                system + " Now write the complete Arduino sketch. "
+                "Begin with a comment line, then the #include lines, "
+                "then setup() and loop().",
+                user, CODEGEN_TIMEOUT_S)
+            code = _usable(second)
         if code is None:
             # A JSON stub is never firmware: fail loud (502, retryable)
-            # instead of caching poison the compiler chokes on.
+            # instead of caching poison the compiler chokes on. The
+            # rejected text is logged (truncated) for prompt diagnosis.
+            _log.warning("rejected firmware (%d/%d chars): %.300s || %.300s",
+                         len(first or ""), len(second or ""),
+                         first or "", second or "")
             raise MetaAPIError("Muse returned unusable firmware")
         if not _firmware_has_telemetry(code):
             # Telemetry contract: one explicit retry demanding Serial
@@ -150,12 +196,15 @@ def generate_code(session: dict, Muse) -> str:
             code = _usable(_complete_with_retry(
                 Muse,
                 system + " Your firmware MUST open Serial at 115200 and "
-                "print readings plus a STATUS heartbeat every loop; "
-                "reply with code only.",
-                user))
+                "print one DEVICE | METRIC | VALUE | UNIT line per device "
+                "plus a SYS heartbeat every loop; reply with code only.",
+                user, CODEGEN_TIMEOUT_S))
             if code is None or not _firmware_has_telemetry(code):
+                _log.warning("rejected silent firmware (%d chars): %.300s",
+                             len(code or ""), code or "")
                 raise MetaAPIError(
                     "Muse returned firmware without telemetry")
+    code = _rewrite_esp32_includes(code)
     cache[key] = code
     return code
 
@@ -163,7 +212,7 @@ def generate_code(session: dict, Muse) -> str:
 def _mock_firmware(session: dict) -> str:
     """Deterministic mock .ino using the session's pins/addresses.
 
-    Prints a STATUS heartbeat every loop: mock sessions verify
+    Prints a tagged SYS heartbeat every loop: mock sessions verify
     end to end under the same telemetry contract as real ones.
     """
     pin_map = session.get("pin_map", {}) or {}
@@ -185,13 +234,13 @@ def _mock_firmware(session: dict) -> str:
         "  Serial.begin(115200);",
         "  Wire.begin(SDA_PIN, SCL_PIN);",
         "  pinMode(LED_PIN, OUTPUT);",
-        '  Serial.println("STATUS mock build running");',
+        '  Serial.println("SYS | HEARTBEAT | RUNNING | -");',
         "}",
         "",
         "void loop() {",
         "  digitalWrite(LED_PIN, HIGH); delay(500);",
         "  digitalWrite(LED_PIN, LOW); delay(500);",
-        '  Serial.println("STATUS ok");',
+        '  Serial.println("SYS | HEARTBEAT | OK | -");',
         "}",
         "",
     ]

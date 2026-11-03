@@ -95,6 +95,32 @@ class ProofRuleTest(unittest.TestCase):
     def test_proof_line_count_is_five(self):
         self.assertEqual(PROOF_LINES, 5)
 
+    def test_tagged_measurements_verify(self):
+        lines = ["HC-SR04 | DIST | 45.0 | cm"] * 5
+        proof = telemetry_proof(lines)
+        self.assertTrue(proof["verified"])
+        self.assertEqual(proof["healthy"], 5)
+        self.assertEqual(proof["faults"], 0)
+
+    def test_tagged_temperature_counts(self):
+        proof = telemetry_proof(["BME280 | TEMP | 24.5 | C"] * 5)
+        self.assertTrue(proof["verified"])
+        self.assertEqual(proof["healthy"], 5)
+
+    def test_tagged_fault_resets_the_streak(self):
+        lines = (["HC-SR04 | DIST | 45.0 | cm"] * 4
+                 + ["HC-SR04 | DIST | TIMEOUT | cm"]
+                 + ["HC-SR04 | DIST | 45.0 | cm"] * 5)
+        proof = telemetry_proof(lines)
+        self.assertTrue(proof["verified"])
+        self.assertEqual(proof["healthy"], 5)
+        self.assertEqual(proof["faults"], 1)
+
+    def test_tagged_heartbeat_counts(self):
+        proof = telemetry_proof(["SYS | HEARTBEAT | OK | -"] * 5)
+        self.assertTrue(proof["verified"])
+        self.assertEqual(proof["healthy"], 5)
+
 
 class TelemetryVerifyTest(unittest.TestCase):
     """The verified endpoint marks DONE on proof, holds without it."""
@@ -242,6 +268,26 @@ class DiagnoseTest(unittest.TestCase):
         out = diagnose_telemetry(["nan"], self.NET, "W", brain)
         self.assertEqual(brain.calls, [])
         self.assertIsNone(out["suspect"])
+
+    def test_failed_device_scopes_prompt_and_part_wires(self):
+        brain = StubBrain([json.dumps({
+            "message": "ECHO looks loose.",
+            "suspect": {"part": "hc_sr04", "part_pin": "ECHO"}})])
+        out = diagnose_telemetry(["HC-SR04 | DIST | TIMEOUT | cm"],
+                                 self.NET, "Parking", brain,
+                                 device="HC-SR04", healthy=["LED"])
+        self.assertEqual(out["suspect"]["board_pin"], "GPIO27")
+        self.assertIn("HC-SR04", brain.calls[0])
+        self.assertIn("LED", brain.calls[0])
+        wires = out["part_wires"]
+        self.assertEqual(
+            sorted((w["part"], w["part_pin"]) for w in wires),
+            [("hc_sr04", "ECHO"), ("hc_sr04", "TRIG")])
+
+    def test_fallback_carries_empty_part_wires(self):
+        brain = StubBrain([RuntimeError("down")])
+        out = diagnose_telemetry(["nan"], self.NET, "W", brain)
+        self.assertEqual(out["part_wires"], [])
 
 
 class TelemetryEndpointTest(unittest.TestCase):

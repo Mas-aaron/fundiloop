@@ -95,7 +95,7 @@ class LiveGuide:
             text = self.Muse.complete_text(
                 LIVE_SYSTEM, prompt,
                 video_b64=base64.b64encode(clip).decode("ascii") if clip else None,
-                video_mime=clip_mime).strip()
+                video_mime=clip_mime, json_mode=False).strip()
         text = clean_coach_text(text)
         if not text:
             text = ("I could not see or hear that clearly. Hold the board still "

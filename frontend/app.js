@@ -250,9 +250,35 @@ async function fetchServerSpeech(text) {
   return null;
 }
 
+// Prime the server voice while the user reads: the first cold
+// synthesis costs ~10s (model load + first inference), which races
+// the chunk timeout and drops the opening narration to browser
+// speech. Called at first intent (suggest, card tap); the audio is
+// discarded, the warm engine is the point. Repeats are cache hits.
+// Never throws, never blocks speech.
+function warmServerVoice() {
+  try {
+    fetchWithTimeout("/api/voice/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Ready." }),
+    }, 30000).then((r) => {
+      if (r && r.ok && r.blob) r.blob().catch(() => null);
+    }).catch(() => null);
+  } catch (e) { /* warmup must never break speech */ }
+}
+
+// Prime on page boot too: fast tappers outrun the suggest/card primes
+// (cold load is ~10s), but nobody outruns the load itself. Repeats
+// are server cache hits; failures stay silent by design.
+warmServerVoice();
+
 function speakBrowserNow(say, done) {
   // Default browser speech: any fallback voice, never refused.
   const finish = () => { if (done) { try { done(); } catch (e) { console.log("speak onend failed", e); } } };
+  // Mute is total: a leaking ack masks the muted state (acks audible,
+  // narration silent) instead of staying quiet like everything else.
+  if (muted) { finish(); return; }
   try {
     if (!("speechSynthesis" in window)) { finish(); return; }
     // Cancel only when something is actually queued: a bare cancel()
@@ -370,22 +396,23 @@ function splitSpeakChunks(say) {
     // vibrates the orb while nothing is heard, then speech seems to
     // "start midway" on the next chunk.
     .filter((p) => /[A-Za-z0-9]/.test(p));
-  // Pack small sentences into 60-140 char chunks: first audio sounds
-  // after one short synthesis (~36ms/char server-side), and each
-  // chunk's playback (~1s per 15 chars) hides the next chunk's
-  // prefetch. Monster sentences split into even word-gap pieces.
+  // Pack small sentences into 25-55 char chunks: server synthesis
+  // runs ~50ms/char (measured), so first audio sounds after ~2s
+  // instead of ~7s, and each chunk's playback (~1s per 15 chars)
+  // still hides the next chunk's prefetch. Monster sentences split
+  // into even word-gap pieces.
   const chunks = [];
   let cur = "";
   const pushCur = () => { if (cur) { chunks.push(cur); cur = ""; } };
   const pushMonster = (p) => {
     // Evenly spaced word-gap cuts: greedy slicing leaves a tiny tail
     // chunk whose playback can't cover the next chunk's synthesis.
-    const n = Math.ceil(p.length / 140);
+    const n = Math.ceil(p.length / 55);
     let start = 0;
     for (let i = 1; i < n; i++) {
       const target = Math.round((p.length * i) / n);
       let cut = p.lastIndexOf(" ", target);
-      if (cut < start + 40) cut = p.indexOf(" ", target);
+      if (cut < start + 12) cut = p.indexOf(" ", target);
       if (cut < 0 || cut <= start) break; // no usable gap: rest goes whole
       const piece = p.slice(start, cut).trim();
       if (piece) chunks.push(piece);
@@ -395,8 +422,8 @@ function splitSpeakChunks(say) {
     if (tail) chunks.push(tail);
   };
   for (const p of parts) {
-    if (p.length > 140) { pushCur(); pushMonster(p); continue; }
-    if (cur && (cur.length >= 60 || (cur + " " + p).length > 140)) pushCur();
+    if (p.length > 55) { pushCur(); pushMonster(p); continue; }
+    if (cur && (cur.length >= 25 || (cur + " " + p).length > 55)) pushCur();
     cur = cur ? cur + " " + p : p;
   }
   pushCur();
@@ -482,6 +509,11 @@ function playServerChunks(chunks, mySpeech, done) {
       speakBrowserNow(chunks.slice(i).join(" "), done);
     };
     el.onerror = broken;
+    // First audio is about to sound: cut stale browser speech
+    // now. Earlier left quiet; later double-talks.
+    try {
+      if ("speechSynthesis" in window) speechSynthesis.cancel();
+    } catch (e) { /* no speech */ }
     try {
       const play = el.play();
       if (play && play.then) play.then(noteStart).catch(broken);
@@ -508,15 +540,15 @@ const VoiceEngine = {
     clauseStreamSeq++; // a full speak takes over: any live stream goes silent
     stopServerAudio();
     clearServerQueue();
-    // Browser-fallback utterances queued by the previous speak must die
-    // too, or they keep talking under this utterance's server audio.
-    try {
-      if ("speechSynthesis" in window) {
-        speechSynthesis.cancel();
-        if (speechSynthesis.paused) speechSynthesis.resume();
-      }
-    } catch (e) { /* no speech */ }
+    // Browser speech is NOT canceled here: a fallback utterance in
+    // flight finishes instead of clipping, and playUrl cuts it the
+    // moment server audio actually starts. Canceling here opened
+    // a quiet hole; canceling late would double-talk.
     if (!text || muted) {
+      // Nothing will sound: silence now.
+      try {
+        if ("speechSynthesis" in window) speechSynthesis.cancel();
+      } catch (e) { /* no speech */ }
       speechAudible = true;
       speechClockStart = Date.now();
       runParkedSchematicDraw();
@@ -525,8 +557,8 @@ const VoiceEngine = {
     }
     const mySpeech = ++speakSeq;
     armSpeechClock(text, mySpeech);
-    // One tick of delay lets a previous cancel() settle so rapid speaks
-    // never overlap into noise; a superseded speech drops silently.
+    // One tick of delay lets a superseding speak() land first so rapid
+    // speaks never overlap into noise; a superseded speech drops silently.
     setTimeout(() => {
       if (mySpeech !== speakSeq) return;
       playServerChunks(splitSpeakChunks(speakable(text)), mySpeech, done);
@@ -1039,7 +1071,9 @@ function paintRollcall(v) {
   // roll call from the coach bar instead.
   const inCook = (typeof cookMode !== "undefined") && cookMode;
   if (bar) bar.hidden = !roll || inCook;
-  if (ready) ready.hidden = !roll;
+  // cook-ready is the legacy fallback button inside coach-bar;
+  // hide it during REVEAL so coach-primary owns the action.
+  if (ready) ready.hidden = !roll || (typeof appPhase !== "undefined" && appPhase === "REVEAL");
   if (roll) {
     const rc = (v.fundi && v.fundi.rollcall) || {};
     const q = $("rollcall-q");
@@ -1127,6 +1161,8 @@ async function sendNextStep(transcript) {
     waited++;
   }
   if (busy) return;
+  cancelBeatSpeech(); // the old step's summary stops here
+  cancelWireSpeech();
   busy = true;
   const wantSid = learnSid;
   try {
@@ -1219,16 +1255,9 @@ function coachPrimaryAction(ctx) {
   if (c.serverState === "ROLLCALL") {
     return { id: "ready", label: "Ready — Start Building" };
   }
-  const total = c.wiresTotal || 0;
-  if (total > 0 && !c.wireAcked) {
-    return { id: "wire-connected", label: "Wire Connected" };
-  }
-  if (total > 0 && (c.wireIdx || 0) + 1 < total) {
-    return { id: "wire-next", label: "Next Wire" };
-  }
-  // Wiring done (or a beatless step): steps advance on taps, and the
-  // final step deploys. Proof comes later, once, from live telemetry —
-  // there is no per-step check to offer here.
+  // The step summary names every connection at once, so steps
+  // advance on one tap and the final step deploys. Proof comes later,
+  // once, from live telemetry — there is no per-step check to offer.
   const stepN = c.stepN || 0, stepsTotal = c.stepsTotal || 0;
   if (stepsTotal > 0 && stepN >= stepsTotal) {
     return { id: "deploy", label: "Deploy Firmware" };
@@ -1313,7 +1342,7 @@ let appRevealed = false; // Start Building tapped for this session
 let appPhase = "IDEATION";
 let appFault = false; // rescue latched by the monitor
 let monitorOn = false; // telemetry streaming
-let wireBeats = []; // this step's wires, narrated one by one
+let wireBeats = []; // this step's wires, narrated as one summary
 let wireBeatIdx = 0;
 let wireBeatAcked = false;
 let lastFlashPort = ""; // the monitor reuses the deploy port
@@ -1333,10 +1362,23 @@ function paintCoachBar(instruction) {
   const bar = $("coach-bar");
   if (!bar) return;
   bar.hidden = !cookMode;
-  if (!cookMode) return;
+  if (!cookMode) {
+    document.documentElement.style.removeProperty("--coachbar-measured");
+    document.body.classList.remove("hide-narration");
+    return;
+  }
   appPhase = resolveAppPhase(currentPhaseCtx());
+  // Narration runs in the background while building: the voice speaks
+  // the long instruction, the leaf keeps glanceable state only.
+  document.body.classList.toggle("hide-narration",
+    appPhase === "BUILDING" && (cookView && cookView.state) !== "DONE");
   if (instruction !== undefined && instruction !== null) {
-    $("coach-text").textContent = instruction;
+    // Write the current step summary to the slim coach-bar label.
+    // The full instruction lives in #cook-instruction in the left leaf.
+    const barText = $("coach-bar-text") || $("coach-text");
+    if (barText) barText.textContent = instruction;
+    const instrEl = $("cook-instruction");
+    if (instrEl) instrEl.textContent = instruction;
   }
   const action = coachPrimaryAction({
     phase: appPhase,
@@ -1351,20 +1393,40 @@ function paintCoachBar(instruction) {
   if (!action) {
     btn.hidden = true;
     btn.classList.remove("coach-deploy");
+    measureCoachBar();
     return;
   }
   btn.hidden = false;
   btn.textContent = action.label;
   btn.dataset.action = action.id;
   btn.classList.toggle("coach-deploy", action.id === "deploy");
+  measureCoachBar();
+}
+
+function measureCoachBar() {
+  // The stage pads by this height so the diagram never slides under
+  // the fixed bar (re-measured every paint: wrapping changes it).
+  requestAnimationFrame(() => {
+    const bar = $("coach-bar");
+    const h = bar && !bar.hidden && bar.offsetHeight ? bar.offsetHeight : 0;
+    if (h > 0) document.documentElement.style.setProperty("--coachbar-measured", h + "px");
+    else document.documentElement.style.removeProperty("--coachbar-measured");
+  });
 }
 
 function coachTapped() {
   const id = ($("coach-primary").dataset.action) || "";
-  if (id === "start-building") revealToBuilding();
-  else if (id === "ready") sendReady("ready");
-  else if (id === "wire-connected") ackWireBeat();
-  else if (id === "wire-next") nextWireBeat();
+  if (id === "start-building") {
+    // If server already returned ROLLCALL during reveal, skip the
+    // intermediate reveal screen and go straight to Ready/building.
+    const serverState = (cookView && cookView.state) || learnState;
+    if (serverState === "ROLLCALL") {
+      revealToBuilding();
+      sendReady("ready");
+    } else {
+      revealToBuilding();
+    }
+  } else if (id === "ready") sendReady("ready");
   else if (id === "next-step") sendNextStep();
   else if (id === "deploy") openDeploy();
 }
@@ -1387,6 +1449,9 @@ $("coach-voice").onclick = () => toggleMute();
 function setDrawer(which, open) {
   const el = $(which === "left" ? "left-drawer" : "right-drawer");
   if (el) el.hidden = !open;
+  // The monitor picker lists the live ports every time the drawer
+  // opens, so a board plugged in mid-build is pickable on sight.
+  if (which === "right" && open) refreshMonitorPorts();
 }
 
 function toggleDrawer(which) {
@@ -1402,7 +1467,7 @@ function maybeOpenDrawer(v) {
   // The drawer opens itself for moments that live inside it: DONE
   // stretch cards and escalated fix-it chains.
   const fundi = (v || {}).fundi || {};
-  if (fundi.event === "LESSON_DONE") { setDrawer("left", true); return; }
+  if (fundi.event === "LESSON_DONE") { setDrawer("left", true); switchStageTab("code"); return; }
   if (fundi.troubleshoot && fundi.troubleshoot.length) {
     setDrawer("left", true);
   }
@@ -1440,14 +1505,17 @@ async function enterReveal(view, project) {
   appPhase = "REVEAL";
   enterCookMode(view, { quiet: true });
   setSchematicView("cards");
-  // Full-project diagram: the last step's netlist is the whole build.
+  resetSchematicZoom(); // a new project starts at 50%: the whole circuit fits
+  switchStageTab("diagram"); // Phase 1: show the circuit diagram
+  // One voice: the diagram render covers the gap visually, then
+  // the reveal line speaks in the tutor voice (no bridging ack).
+  paintCoachBar("Review the circuit, then tap Start Building.");
   try {
     await fetchSchematic("cook-schematic-svg", "cook-schematic-wires",
       cookSchematicState, "cook-schematic-sel", total);
   } catch (e) { /* the diagram is a bonus; voice carries the reveal */ }
   const line = revealSpeech(project && project.title,
     revealPartTitles(cookSchematicState.wires, learnBoard));
-  paintCoachBar("Review the circuit, then tap Start Building.");
   cookSpeak(line);
 }
 
@@ -1457,12 +1525,14 @@ function revealToBuilding() {
   revealView = null;
   appRevealed = true;
   setSchematicView("breadboard");
+  switchStageTab("breadboard"); // Phase 2: show the breadboard
   renderCook(v);
   tutorBeat(v, cookSpeak, { quiet: false, manual: true });
 }
 
-function openDeploy() {
+async function openDeploy() {
   // DONE primary: flash the finished firmware via the deploy bar's port.
+  await refreshFlashPorts(); // deploy reads a live list, never a stale one
   const port = ($("cook-flash-port") && $("cook-flash-port").value) || "";
   if (!port) {
     $("cook-flash-status").textContent = "Pick the ESP32 serial port first, then DEPLOY — or CONNECT BOARD to flash from the browser.";
@@ -1477,10 +1547,10 @@ let beatSpeech = null; // live beat-narration token
 
 function cancelBeatSpeech() { beatSpeech = null; }
 
-function speakBeat(beat, delayMs) {
-  // Narrate one wire, yielding to speech already in flight (the step
-  // opening): retry briefly, then speak anyway so beats never stall
-  // silent behind a wedged utterance. Any tap cancels the pending one.
+function speakStepSummary(stepN, delayMs) {
+  // Narrate the whole step at once, yielding to speech already in
+  // flight (the step opening): retry briefly, then speak anyway so a
+  // wedged utterance never leaves the step silent. Any tap cancels it.
   const mine = {};
   beatSpeech = mine;
   let tries = 0;
@@ -1491,7 +1561,11 @@ function speakBeat(beat, delayMs) {
       setTimeout(attempt, 500);
       return;
     }
-    cookSpeak(beat.say);
+    const wires = wireBeats.map((b) => b.wire).filter(Boolean);
+    const items = stepSummaryItems(wires, stepN || learnStepN,
+      revealBoardName(learnBoard));
+    if (items.length) speakWireList(items, cookSpeak,
+      "cook-schematic-svg", "cook-schematic-sel");
   };
   setTimeout(attempt, delayMs || 0);
 }
@@ -1503,10 +1577,54 @@ function coachBeatText() {
   return wireBeats[wireBeatIdx].say;
 }
 
+// step:summary:start
+function stepWirePhrase(w, boardTitle) {
+  // One connection inside the flowing step summary: short clause, no
+  // numbering (the transition carries the order).
+  const fromPin = (w && w.board_pin) || "?";
+  const toPin = (w && w.part_pin) || "?";
+  const part = (w && w.part_title) || "the part";
+  const board = boardTitle || "the board";
+  const color = (w && w.color_name) || "";
+  return "connect the " + fromPin + " pin on " + board +
+    " to the " + toPin + " pin on " + part +
+    (color ? ", using " + revealArticle(color) + " " + color + " wire" : "");
+}
+
+function stepSummaryItems(wires, stepN, boardTitle) {
+  // The whole step in one flowing narration: intro + each connection
+  // with a transition + outro. Each wire lights as it is named.
+  const list = (wires || []).filter(Boolean);
+  if (!list.length) return [];
+  const items = [{ id: "", phrase: list.length === 1
+    ? "Step " + stepN + " has one connection."
+    : "Step " + stepN + " has " + list.length + " connections." }];
+  const mid = ["Next", "Then", "After that"];
+  list.forEach((w, i) => {
+    let lead = "";
+    if (list.length > 1) {
+      if (i === 0) lead = "First, ";
+      else if (i === list.length - 1) lead = "Finally, ";
+      else lead = mid[(i - 1) % mid.length] + ", ";
+    }
+    items.push({ id: schematicWireId(w),
+      phrase: lead + stepWirePhrase(w, boardTitle),
+      label: (w.part || "") + "." + (w.part_pin || "") +
+        " → " + (w.board_pin || "") });
+  });
+  const done = cookView && cookView.state === "DONE";
+  items.push({ id: "", phrase: !appRevealed
+    ? "Tap Start Building when ready to wire it up."
+    : (done ? "That is the whole build — nicely wired."
+      : "Tap Next Step when everything is wired.") });
+  return items;
+}
+// step:summary:end
+
 function buildWireBeats() {
-  // (Re)build this step's wire beats from the cook netlist. Step and
-  // session changes reset (and speak the first wire); re-renders and
-  // late-arriving wires keep acked progress.
+  // (Re)build this step's wire list from the cook netlist. Step and
+  // session changes reset and speak the flowing step summary once;
+  // re-renders never re-speak it.
   if (!cookMode) return;
   const key = learnSid + ":" + learnStepN;
   const st = cookSchematicState;
@@ -1514,11 +1632,11 @@ function buildWireBeats() {
   const build = () => {
     wireBeats = wireBeatsForStep(st.wires, learnStepN,
       revealBoardName(learnBoard));
-    wireBeatIdx = 0;
+    wireBeatIdx = wireBeats.length; // summary mode: no per-wire stop
     wireBeatAcked = false;
-    paintWireBeat();
+    paintWireBeat(); // past-end index restores the full diagram
     paintCoachBar(coachBeatText());
-    if (wireBeats.length) speakBeat(wireBeats[0], 500);
+    if (wireBeats.length) speakStepSummary(learnStepN, 500);
   };
   if (key !== beatsKey) {
     cancelBeatSpeech();
@@ -1535,25 +1653,6 @@ function buildWireBeats() {
     return;
   }
   if (!wireBeats.length && fresh && (st.wires || []).length) build();
-}
-
-function ackWireBeat() {
-  if (!wireBeats.length || wireBeatAcked) return;
-  if (wireBeatIdx >= wireBeats.length) return;
-  cancelBeatSpeech();
-  wireBeatAcked = true;
-  paintCoachBar(coachBeatText());
-}
-
-function nextWireBeat() {
-  if (!wireBeats.length || !wireBeatAcked) return;
-  if (wireBeatIdx + 1 >= wireBeats.length) return;
-  cancelBeatSpeech();
-  wireBeatIdx += 1;
-  wireBeatAcked = false;
-  paintWireBeat();
-  paintCoachBar(coachBeatText());
-  speakBeat(wireBeats[wireBeatIdx], 0);
 }
 
 function paintWireBeat() {
@@ -1594,18 +1693,55 @@ const MONITOR_CTX_LINES = 15; // recent lines sent to the tutor on rescue
 const MONITOR_STALL_MS = 8000; // silence that means the stream stalled
 const MONITOR_READOUT_MS = 12000; // slowest spoken telemetry readout
 const MONITOR_PROOF_LINES = 5; // trailing healthy lines that prove the build
+const MONITOR_FAULT_LINES = 3; // consecutive fault lines that trip rescue
 
 // monitor:pure:start
+function parseTaggedTelemetry(line) {
+  // Strict DEVICE | METRIC | VALUE | UNIT split; null unless the
+  // device and metric tokens qualify (prose with "|" stays on the
+  // legacy path). Mirrors the backend's _parse_tagged exactly.
+  const parts = String(line == null ? "" : line).split("|")
+    .map((p) => p.trim());
+  if (parts.length < 3) return null;
+  if (!/^[A-Za-z0-9][A-Za-z0-9 _\-+]*$/.test(parts[0])) return null;
+  if (!/^[A-Za-z0-9 _\-+%]+$/.test(parts[1])) return null;
+  return { device: parts[0], metric: parts[1], value: parts[2],
+    unit: parts.length > 3 ? parts[3] : "" };
+}
+
+function prettyDevice(tag) {
+  return String(tag || "").replace(/[_-]+/g, " ").replace(/\s+/g, " ")
+    .trim() || "the board";
+}
+
+function classifyTaggedLine(t) {
+  // Tagged triage: fault words over metric + value, negatives veto,
+  // any numeric value counts. Mirrors _proof_class exactly.
+  const num = /^-?\d+(?:\.\d+)?$/.test(t.value) ? parseFloat(t.value) : null;
+  const faultWord = /\b(error|timeout|time-out|fail|failed|nan|no echo|no response|not found|disconnect|offline|disconnected)\b/i
+    .test(t.metric + " " + t.value);
+  if (faultWord || (num !== null && num < 0)) {
+    return { device: t.device, value: null, unit: "", fault: true };
+  }
+  let unit = String(t.unit || "").toLowerCase();
+  if (unit === "meter" || unit === "meters") unit = "m";
+  if (unit === "inch" || unit === "inches" || unit === "in") unit = "in";
+  return { device: t.device, value: num, unit: unit, fault: false };
+}
+
 function classifyTelemetryLine(line) {
   // Deterministic triage for one device line: a spoken measurement
   // (value + canonical unit), or a fault flag. Boot chatter never
-  // faults and never speaks; any negative reading is bogus.
+  // faults and never speaks; any negative reading is bogus. Tagged
+  // lines attribute to their device; untagged lines keep device "".
   const text = String(line == null ? "" : line);
-  if (!text.trim()) return { value: null, unit: "", fault: false };
+  if (!text.trim()) return { device: "", value: null, unit: "", fault: false };
   if (/rst:|boot:|load:|entry |ets [A-Z]/i.test(text)) {
-    return { value: null, unit: "", fault: false };
+    return { device: "", value: null, unit: "", fault: false };
   }
-  const faultWord = /\b(error|timeout|time-out|fail|failed|nan|no echo|no response|not found|disconnect)\b/i.test(text);
+  const tagged = parseTaggedTelemetry(text);
+  if (tagged) return classifyTaggedLine(tagged);
+  const faultWord = /\b(error|timeout|time-out|fail|failed|nan|no echo|no response|not found|disconnect|offline|disconnected)\b/i.test(text);
   const sentinel = /(^|:\s*)-1(\D|$)/.test(text);
   let m = text.match(/distance\s*[:=]?\s*(-?\d+(?:\.\d+)?)\s*(cm|mm|meters?|inches?|in|m)?/i);
   let value = null, unit = "";
@@ -1620,18 +1756,22 @@ function classifyTelemetryLine(line) {
   if (unit === "meter" || unit === "meters") unit = "m";
   if (unit === "inch" || unit === "inches" || unit === "in") unit = "in";
   const fault = faultWord || sentinel || (value !== null && value < 0);
-  if (fault) return { value: null, unit: "", fault: true };
-  return { value: value, unit: unit, fault: false };
+  if (fault) return { device: "", value: null, unit: "", fault: true };
+  return { device: "", value: value, unit: unit, fault: false };
 }
 
 function telemetryReadout(c) {
   // One spoken sentence for a classified line, or "" when there is
-  // nothing worth interrupting the tutor for.
+  // nothing worth interrupting the tutor for. Tagged readings name
+  // their device; legacy readings keep the plain sentence.
   if (!c || c.value === null || c.value === undefined || c.fault) return "";
   const word = { cm: "centimeters", mm: "millimeters", m: "meters",
-    in: "inches" }[c.unit] || "";
+    in: "inches", c: "degrees", f: "degrees", pct: "percent",
+    "%": "percent" }[c.unit] || "";
   if (!word) return "";
-  return "You are at " + (Math.round(c.value * 10) / 10) + " " + word + ".";
+  const reading = (Math.round(c.value * 10) / 10) + " " + word + ".";
+  if (c.device) return prettyDevice(c.device) + " reads " + reading;
+  return "You are at " + reading;
 }
 
 function telemetryProvesLife(line) {
@@ -1643,6 +1783,18 @@ function telemetryProvesLife(line) {
   if (c.value !== null && c.value !== undefined) return true;
   return /(status|heartbeat|\bhb\b|^ok\b|alive)/i.test(String(line || ""));
 }
+
+function suspectReconnectSpeech(suspect) {
+  // Spoken reconnect guidance for a suspect netlist wire: which wire
+  // to reseat and where it runs. "" when no wire was named.
+  const part = suspect && suspect.part;
+  const pin = suspect && suspect.part_pin;
+  if (!part || !pin) return "";
+  const name = String(part).replace(/_/g, " ");
+  let say = "Reseat the " + pin + " wire on the " + name;
+  if (suspect.board_pin) say += " — it runs to board " + suspect.board_pin;
+  return say + ". Push both ends firmly home.";
+}
 // monitor:pure:end
 
 let monitorSource = null; // live EventSource, one stream at a time
@@ -1652,6 +1804,28 @@ let monitorCount = 0;
 let lastMonitorLineAt = 0;
 let lastMonitorReadoutAt = 0;
 let monitorStreak = 0; // trailing healthy-shape lines toward proof
+let monitorFaults = 0; // consecutive untagged fault lines toward rescue
+let deviceState = {}; // tag -> {faults, streak, lastSeen} per device
+let rescueDevice = ""; // failed device tag, or "" for a global latch
+
+function deviceStateFor(tag) {
+  return deviceState[tag] ||
+    (deviceState[tag] = { faults: 0, streak: 0, lastSeen: 0 });
+}
+
+function deviceFaultActive() {
+  // Any device holding faults: proof waits until it recovers.
+  return Object.keys(deviceState).some(
+    (t) => (deviceState[t].faults || 0) > 0);
+}
+
+function healthyDevices() {
+  // Observed devices that proved healthy and hold no faults. SYS is
+  // the stream itself, never a device to exonerate aloud.
+  return Object.keys(deviceState).filter((t) =>
+    t.toUpperCase() !== "SYS" && (deviceState[t].faults || 0) === 0 &&
+    (deviceState[t].streak || 0) > 0);
+}
 let monitorVerified = false; // proof accepted (one DONE per session)
 let monitorVerifyCooldownUntil = 0;
 
@@ -1691,12 +1865,42 @@ function onMonitorLine(text) {
   appendMonitorLine(line);
   paintMonitorMeta();
   const c = classifyTelemetryLine(line);
+  const tag = c.device || "";
   if (c.fault) {
     monitorStreak = 0;
-    enterRescue("The board reported: " + line);
+    // Faults count per device: a healthy device's good lines never
+    // mask a sick one's streak. Untagged lines keep the global path.
+    if (tag) {
+      const st = deviceStateFor(tag);
+      st.faults += 1;
+      st.streak = 0;
+      st.lastSeen = Date.now();
+      // A lone fault line is a passing dip (hand out of range), not
+      // a lost device: rescue trips only on consecutive faults.
+      if (st.faults >= MONITOR_FAULT_LINES) {
+        enterRescue("The " + prettyDevice(tag) + " reported: " + line, tag);
+      }
+    } else {
+      monitorFaults += 1;
+      if (monitorFaults >= MONITOR_FAULT_LINES) {
+        enterRescue("The board reported: " + line);
+      }
+    }
     return;
   }
+  if (tag) {
+    const st = deviceStateFor(tag);
+    st.faults = 0;
+    st.lastSeen = Date.now();
+    if (telemetryProvesLife(line)) st.streak += 1;
+  } else {
+    monitorFaults = 0;
+  }
   if (appFault) {
+    // Recovery needs the failed device's own good line; a global
+    // latch still clears on any healthy line. Other devices talking
+    // is not recovery.
+    if (rescueDevice && tag !== rescueDevice) return;
     exitRescue(true);
     // fall through: the recovery line itself may count toward proof
   }
@@ -1705,7 +1909,8 @@ function onMonitorLine(text) {
   if (telemetryProvesLife(line)) {
     monitorStreak += 1;
     if (monitorStreak >= MONITOR_PROOF_LINES && monitorOn &&
-        !monitorVerified && Date.now() >= monitorVerifyCooldownUntil) {
+        !monitorVerified && Date.now() >= monitorVerifyCooldownUntil &&
+        !deviceFaultActive()) {
       monitorVerified = true; // one attempt per streak; a failed
       monitorStreak = 0; // attempt cools down, then the streak rebuilds
       requestTelemetryProof();
@@ -1743,6 +1948,21 @@ function monitorWatchdog() {
   if (Date.now() - lastMonitorLineAt > MONITOR_STALL_MS) {
     enterRescue("No data for " + Math.round(MONITOR_STALL_MS / 1000) +
       " seconds — the stream stalled.");
+    return;
+  }
+  // Per-device silence: the stream flows but a known device went
+  // quiet — its own latch, naming it.
+  const tags = Object.keys(deviceState);
+  for (let i = 0; i < tags.length; i++) {
+    const tag = tags[i];
+    if (tag.toUpperCase() === "SYS") continue;
+    const st = deviceState[tag];
+    if (st.lastSeen && Date.now() - st.lastSeen > MONITOR_STALL_MS) {
+      enterRescue("No data from the " + prettyDevice(tag) + " for " +
+        Math.round(MONITOR_STALL_MS / 1000) +
+        " seconds — it went quiet.", tag);
+      return;
+    }
   }
 }
 
@@ -1753,7 +1973,11 @@ function startMonitor(port) {
   stopMonitor("");
   const usePort = port || lastFlashPort || "";
   if (!usePort) {
-    cookSpeak("Deploy the firmware first, then I will listen.");
+    // START with no board anywhere: say what fixes it (plug in, tap
+    // START again — adoption retries on every tap).
+    const meta = $("monitor-meta");
+    if (meta) meta.textContent = "No board found — plug in USB, pick the board port, and press START.";
+    cookSpeak("I can't find the board. Plug it in over USB, pick the board port, then press START.");
     return;
   }
   monitorOn = true;
@@ -1762,6 +1986,9 @@ function startMonitor(port) {
   lastMonitorLineAt = 0;
   lastMonitorReadoutAt = 0;
   monitorStreak = 0;
+  monitorFaults = 0;
+  deviceState = {};
+  rescueDevice = "";
   monitorVerified = false;
   monitorVerifyCooldownUntil = 0;
   setDrawer("right", true);
@@ -1833,7 +2060,15 @@ async function requestRescueDiagnosis() {
       "/telemetry/diagnose", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lines: monitorCtx.slice(-MONITOR_CTX_LINES) }),
+        body: JSON.stringify({
+          // A device latch sends that device's own trailing lines
+          // plus the healthy set; a global latch sends everything.
+          lines: (rescueDevice ? monitorCtx.filter(
+            (l) => classifyTelemetryLine(l).device === rescueDevice)
+            : monitorCtx).slice(-MONITOR_CTX_LINES),
+          device: rescueDevice || null,
+          healthy: healthyDevices().filter((t) => t !== rescueDevice),
+        }),
       });
     if (r.ok) data = await r.json();
   } catch (e) { data = null; }
@@ -1859,35 +2094,64 @@ async function requestRescueDiagnosis() {
         (suspect.board_pin ? (" (board " + suspect.board_pin + ")") : "") +
         " — check that wire.";
     }
+    // Every wire on the suspect part highlights: the whole failed
+    // device lights up, healthy devices stay dark.
+    ((data && data.part_wires) || []).forEach((w) => {
+      if (!w || !w.part || !w.part_pin) return;
+      const g = document.getElementById(schematicWireId(w));
+      if (g) g.classList.add("wire-fault");
+    });
   } else if (susp) {
     susp.textContent = "No single wire stood out — check power and ground first.";
   }
-  if (message) {
-    logCoach("Coach", message);
-    cookSpeak(message);
-  }
+  // The reconnect is heard, not only read: the suspect wire joins
+  // the spoken guidance, and a bare generic covers the unreachable
+  // tutor (message and suspect both empty) instead of silence.
+  const reconnect = suspectReconnectSpeech(suspect);
+  const say = [message, reconnect].filter(Boolean).join(" ") ||
+    "The stream stopped. Push every wire firmly home — power and " +
+    "ground first — then tap START.";
+  logCoach("Coach", say);
+  cookSpeak(say);
 }
 
-function enterRescue(reason) {
+function enterRescue(reason, device) {
   if (appFault) return;
   appFault = true;
+  rescueDevice = device || "";
   Orb.fault(true);
   Orb.monitor(false);
-  paintCoachBar("I lost the signal — see the Rescue card.");
+  const pretty = rescueDevice ? prettyDevice(rescueDevice) : "";
+  paintCoachBar(rescueDevice
+    ? "I lost the " + pretty + " — see the Rescue card."
+    : "I lost the signal — see the Rescue card.");
   const card = $("rescue-card"), msg = $("rescue-msg"),
     susp = $("rescue-suspect");
   if (card) card.hidden = false;
   if (msg) msg.textContent = reason || "I lost the signal.";
   if (susp) susp.textContent = "Asking the tutor…";
   setDrawer("left", true);
-  logCoach("Coach", "Wait, I lost the signal.");
-  cookSpeak("Wait, I lost the signal. Let me check the last readings.");
+  // A device latch names it and exonerates the healthy ones aloud;
+  // a global latch keeps the plain sentence.
+  let say = "Wait, I lost the signal. Let me check the last readings.";
+  if (rescueDevice) {
+    say = "Wait, I lost the signal from the " + pretty + ".";
+    const healthy = healthyDevices().filter((t) => t !== rescueDevice);
+    if (healthy.length) {
+      say += " " + healthy.map(prettyDevice).join(" and ") +
+        (healthy.length === 1 ? " is" : " are") + " still fine.";
+    }
+    say += " Let me check the last readings.";
+  }
+  logCoach("Coach", say);
+  cookSpeak(say);
   requestRescueDiagnosis();
 }
 
 function exitRescue(backOnline) {
   if (!appFault) return;
   appFault = false;
+  rescueDevice = "";
   Orb.fault(false);
   Orb.monitor(monitorOn);
   document.querySelectorAll("g.wire-fault")
@@ -1907,8 +2171,56 @@ function onFinalFlashSuccess(port) {
   startMonitor(port || lastFlashPort);
 }
 $("monitor-stop").onclick = () => stopMonitor();
-$("monitor-start").onclick = () => startMonitor(lastFlashPort);
+$("monitor-start").onclick = async () => {
+  // Refresh first so a board plugged in since the drawer opened is
+  // listed; the keep-first pick preserves an explicit selection.
+  await refreshMonitorPorts();
+  const sel = $("monitor-port");
+  startMonitor((sel && sel.value) || await adoptMonitorPort());
+};
+$("monitor-refresh").onclick = () => refreshMonitorPorts();
 $("rescue-complete").onclick = () => sendNextStep("mark complete");
+
+async function refreshMonitorPorts() {
+  // The monitor's own port picker. Learning firmware never answers
+  // PING, so adoption alone cannot find a freshly flashed board: the
+  // user picks the USB port they just flashed through. Mirrors the
+  // deploy picker (keep-first, USB-preferred, never a phantom).
+  const sel = $("monitor-port");
+  if (!sel) return;
+  let ports = [];
+  try {
+    const r = await fetch("/api/serial/ports");
+    const v = await r.json();
+    ports = v.ports || [];
+  } catch (e) { /* keep the last options while the server is offline */ }
+  const pick = pickFlashPort(ports, sel.value || lastFlashPort);
+  const nameOf = (p) => (p && p.port) || p;
+  const usable = (p) => usbishPort(p) || nameOf(p) === lastFlashPort;
+  const pickEntry = ports.filter((p) => nameOf(p) === pick)[0];
+  const usablePick = (pickEntry && usable(pickEntry)) ? pick : "";
+  sel.innerHTML = "";
+  const ph = document.createElement("option");
+  ph.value = "";
+  ph.textContent = ports.length ? "Select board port…" :
+    "No ports found — plug in USB";
+  sel.appendChild(ph);
+  ports.forEach((p) => {
+    const name = nameOf(p);
+    if (!name) return;
+    const o = document.createElement("option");
+    o.value = name;
+    const desc = (p && p.description) || "";
+    o.textContent = desc ? name + " — " + desc : name;
+    if (!usable(p)) {
+      o.disabled = true;
+      o.textContent += " (not usb)";
+    }
+    if (name === usablePick) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.value = usablePick;
+}
 // monitor:end
 
 // Check turns are gone: steps advance on taps (sendNextStep) and the
@@ -2309,6 +2621,7 @@ function prefetchPlans() {
 
 async function suggestProjects() {
   if (busy) return;
+  warmServerVoice(); // prime the server voice while planning runs
   const want = ($("learn-project").value || "").trim();
   if (!learnParts.length && !want) {
     $("talk-hint").textContent = "Upload a parts photo or name a project first.";
@@ -2353,9 +2666,8 @@ async function suggestProjects() {
     const label = "Planning projects for " + learnBoard;
     const t0 = Date.now();
     $("instruction").textContent = label + "…";
-    // Instant local ack: server synthesis would leave seconds of quiet
-    // before the first word while the model plans.
-    speakBrowserNow("Planning your projects.");
+    // No bridging ack: the Ns ticker covers the planning wait and
+    // the first word lands in the tutor voice (one voice).
     tick = setInterval(() => {
       $("instruction").textContent = label + "… " +
         Math.round((Date.now() - t0) / 1000) + "s";
@@ -2376,19 +2688,15 @@ async function suggestProjects() {
 
 async function startLearning(project) {
   if (busy) return;
+  warmServerVoice(); // prime the server voice while the reveal renders
   busy = true;
   Orb.thinkStart(); // planning/loading a project
   learnBoard = $("learn-board").value || "esp32_devkit";
   const startLabel = "Starting " + (project.title || "project");
   const startT0 = Date.now();
   $("instruction").textContent = startLabel + "…";
-  // Ack only when the start actually takes a while: a fast start speaks
-  // once (the cook intro), never ack-then-intro back to back.
-  const ackTimer = setTimeout(() => {
-    // Instant local ack: the start already took a while, and server
-    // synthesis would add more quiet before the first word.
-    speakBrowserNow("Getting your project ready.");
-  }, 900);
+  // No bridging ack on tap: the orb + ticker acknowledge it, and
+  // the reveal line arrives in the tutor voice (one voice).
   const startTick = setInterval(() => {
     $("instruction").textContent = startLabel + "… " +
       Math.round((Date.now() - startT0) / 1000) + "s";
@@ -2415,7 +2723,7 @@ async function startLearning(project) {
       (v.speak || v.instruction || "");
     enterReveal(v, project);
   } catch (e) { showError(e.message); }
-  finally { clearTimeout(ackTimer); clearInterval(startTick); busy = false; Orb.thinkEnd(); }
+  finally { clearInterval(startTick); busy = false; Orb.thinkEnd(); }
 }
 
 // choice:prompt:start
@@ -2491,6 +2799,9 @@ function listenForProjectChoice() {
 }
 
 $("learn-suggest").onclick = () => suggestProjects();
+$("learn-project").onkeydown = (e) => {
+  if (e.key === "Enter") { e.preventDefault(); suggestProjects(); }
+};
 $("learn-board").onchange = () => prefetchPlans();
 $("learn-cards").addEventListener("click", (e) => {
   const li = e.target.closest("li[data-p]");
@@ -2510,7 +2821,13 @@ $("learn-cards").addEventListener("click", (e) => {
   }
 });
 async function fetchCode(auto) {
-  if (busy || !learnSid) return;
+  if (!learnSid) return;
+  // A manual tap mid-turn must say something (screen only: the live
+  // turn owns the audio). Auto fetches stay silent on overlap.
+  if (busy) {
+    if (!auto) $("talk-hint").textContent = "Still working — press SEND CODE again in a moment.";
+    return;
+  }
   busy = true;
   try {
     const r = await fetch("/project/" + encodeURIComponent(learnSid) + "/code", {
@@ -2521,6 +2838,7 @@ async function fetchCode(auto) {
     const v = await r.json();
     if (!r.ok) {
       const msg = (v && v.detail) || "code not ready";
+      paintStageCodeError(msg + " — Send to Board retries.");
       if (auto) {
         $("talk-hint").textContent = msg + " — press SEND CODE to retry.";
         speak("Code is not ready yet. Press Send Code to retry.");
@@ -2531,6 +2849,7 @@ async function fetchCode(auto) {
     codeFetchedSid = learnSid;
     const progress = (v.steps_passed || 0) + " of " + (v.steps_total || 0) + " steps verified";
     $("code-kind").textContent = v.verified ? "verified final" : "draft (" + progress + ")";
+    paintStageCode(v.code || "", $("code-kind").textContent);
     if (auto) return;
     speak(v.verified ? "Code ready." :
       "Here's your draft code, " + progress + ". Keep building to verify the rest.");
@@ -2586,8 +2905,17 @@ function wireListText(wires, unresolved, net) {
   return lines.join("\n");
 }
 
-function schematicMarkup(state) {
-  if (schematicView === "breadboard" && state.breadboardSvg) return state.breadboardSvg;
+function schematicMarkup(state, view) {
+  const v = view || schematicView;
+  if (v === "breadboard" && state.breadboardSvg) return state.breadboardSvg;
+  return state.svg || "";
+}
+
+// Per-tab renderer: the Diagram tab always shows pin cards, the
+// Breadboard tab always shows the breadboard view. The legacy global
+// view flag only moves the toggle buttons, never the drawings.
+function schematicMarkupFor(svgId, state) {
+  if (svgId === "cook-schematic-svg") return state.breadboardSvg || state.svg || "";
   return state.svg || "";
 }
 
@@ -2790,18 +3118,32 @@ speechChunkHook = followSpokenChunk;
 function paintSchematic(svgId, selId, state, animate, prevN) {
   const box = $(svgId);
   if (!box) return;
-  box.innerHTML = schematicMarkup(state);
+  box.innerHTML = schematicMarkupFor(svgId, state);
+  applySchematicZoom(svgId); // repaints keep the user's zoom
   box.removeAttribute("data-sel");
   if (selId && $(selId)) $(selId).textContent = "";
+  if (svgId === "schematic-svg" && $("schematic-svg-drawer")) {
+    $("schematic-svg-drawer").innerHTML = box.innerHTML; // drawer mirrors the diagram
+  }
   if (animate) playSchematicDraw(svgId, state.n, prevN || 0);
+  // Hide the empty-state placeholder once an SVG is present
+  const emptyId = svgId === "cook-schematic-svg" ? "breadboard-empty" : "diagram-empty";
+  const emptyEl = document.getElementById(emptyId);
+  if (emptyEl && box.querySelector("svg")) emptyEl.hidden = true;
+  // Also show the toolbar (download/speak buttons)
+  const toolbarId = svgId === "cook-schematic-svg" ? "cook-schematic-toolbar" : "schematic-toolbar";
+  const toolbar = document.getElementById(toolbarId);
+  if (toolbar) toolbar.hidden = false;
 }
 
 function setSchematicView(view) {
   schematicView = (view === "breadboard") ? "breadboard" : "cards";
   try { localStorage.setItem("fundiloop-schematic-view", schematicView); } catch (e) { /* private mode */ }
   syncSchematicViewButtons();
+  // Tabs own the views now: the toggle moves to the matching tab.
+  switchStageTab(schematicView === "breadboard" ? "breadboard" : "diagram");
   if (schematicState.svg) paintSchematic("schematic-svg", "schematic-sel", schematicState, false, 0);
-  if (cookSchematicState.svg) paintSchematic("cook-schematic-svg", "cook-schematic-sel", cookSchematicState, false, 0);
+  if (cookSchematicState.svg || cookSchematicState.breadboardSvg) paintSchematic("cook-schematic-svg", "cook-schematic-sel", cookSchematicState, false, 0);
   paintWireBeat(); // full repaints strip beat classes — restore them
 }
 
@@ -2832,11 +3174,13 @@ async function fetchSchematic(svgId, wiresId, state, selId, stepN) {
     state.svg = v.svg || "";
     state.breadboardSvg = v.breadboard_svg || "";
     state.wires = net.wires || [];
+    state.unresolved = v.unresolved || [];
     state.n = v.n || wantN;
     state.sid = wantSid;
     state.note = ((net.notes || [])[0]) || "";
-    paintSchematic(svgId, selId, state, true, prevN);
+    paintSchematic(svgId, selId, state, svgId === schematicActiveSvgId(), prevN);
     $(wiresId).textContent = wireListText(net.wires, v.unresolved, net);
+    mirrorSchematic(svgId, state);
     if (svgId === "cook-schematic-svg") {
       buildWireBeats();
       paintWireBeat();
@@ -2851,6 +3195,41 @@ async function fetchSchematic(svgId, wiresId, state, selId, stepN) {
       schematicQueued = null;
       fetchSchematic(q.svgId, q.wiresId, q.state, q.selId, q.stepN);
     }
+  }
+}
+
+// One fetch feeds both tabs: same netlist, per-tab renderer. Whichever
+// container fetched, the sibling tab paints the same step immediately,
+// so Diagram and Breadboard can never disagree about the step.
+function schematicActiveSvgId() {
+  // The draw animation parks one job globally: only the visible tab
+  // animates, the hidden one paints statically. Otherwise the second
+  // paint orphans the first job and its fresh wires stay invisible.
+  const active = document.querySelector && document.querySelector(".stage-tab.active");
+  const tab = active && active.getAttribute && active.getAttribute("data-tab");
+  return tab === "diagram" ? "schematic-svg" : "cook-schematic-svg";
+}
+
+function mirrorSchematic(svgId, state) {
+  const snap = { svg: state.svg, breadboardSvg: state.breadboardSvg,
+    wires: state.wires, unresolved: state.unresolved || [], n: state.n,
+    sid: state.sid, note: state.note };
+  const wireText = (st) => wireListText(st.wires, st.unresolved,
+    { notes: st.note ? [st.note] : [] });
+  if (svgId === "cook-schematic-svg") {
+    Object.assign(schematicState, snap);
+    paintSchematic("schematic-svg", "schematic-sel", schematicState,
+      schematicActiveSvgId() === "schematic-svg", 0);
+    if ($("schematic-wires")) $("schematic-wires").textContent = wireText(schematicState);
+    if ($("schematic-wires-drawer")) $("schematic-wires-drawer").textContent = wireText(schematicState);
+  } else if (svgId === "schematic-svg") {
+    Object.assign(cookSchematicState, snap);
+    paintSchematic("cook-schematic-svg", "cook-schematic-sel", cookSchematicState,
+      schematicActiveSvgId() === "cook-schematic-svg", 0);
+    if ($("cook-schematic-wires")) $("cook-schematic-wires").textContent = wireText(cookSchematicState);
+    buildWireBeats();
+    paintWireBeat();
+    paintCoachBar();
   }
 }
 
@@ -2882,6 +3261,23 @@ let wireSpeech = null;
 
 function cancelWireSpeech() { wireSpeech = null; }
 
+// A named wire must always be visible: if a parked draw animation
+// never ran for it (orphaned job, missed cue), its paths sit hidden
+// behind dash-offset while its dots show. Naming it draws it now.
+function ensureWireDrawn(svgId, id) {
+  if (!id) return;
+  const box = $(svgId);
+  const g = box && box.querySelector && box.querySelector('g[id="' + id + '"]');
+  if (!g) return;
+  g.classList.remove("schematic-drawing");
+  g.querySelectorAll("path, line").forEach((p) => {
+    p.style.strokeDasharray = "none";
+    p.style.strokeDashoffset = "0";
+    p.style.animation = "none";
+  });
+  if (followJob) followJob.drawn.add(g);
+}
+
 // Karaoke narration: speak phrases in order, lighting each wire on screen
 // as it is named, so the diagram follows the tutor clause by clause.
 // Later phrases wait for the earlier phrase's audio to finish (onend).
@@ -2904,7 +3300,10 @@ function speakWireList(items, say, svgId, selId) {
       return;
     }
     const it = queue[i++];
-    if (it.id) isolateSchematicWires(svgId, selId, [it.id], it.label || "");
+    if (it.id) {
+      isolateSchematicWires(svgId, selId, [it.id], it.label || "");
+      ensureWireDrawn(svgId, it.id);
+    }
     say(it.phrase, step);
     lastSeq = speakSeq;
   };
@@ -3057,39 +3456,130 @@ function markGuideStep() {
   });
 }
 
-function downloadSchematic(state) {
-  const svg = schematicMarkup(state);
+function downloadSchematic(state, kind) {
+  const svg = kind === "breadboard"
+    ? (state.breadboardSvg || state.svg || "")
+    : (state.svg || "");
   if (!svg) return;
   const blob = new Blob([svg], { type: "image/svg+xml" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "step-" + (state.n || learnStepN) +
-    (schematicView === "breadboard" ? "-breadboard.svg" : "-schematic.svg");
+    (kind === "breadboard" ? "-breadboard.svg" : "-schematic.svg");
   document.body.appendChild(a);
   a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
 }
 
-$("schematic-download").onclick = () => downloadSchematic(schematicState);
-$("cook-schematic-download").onclick = () => downloadSchematic(cookSchematicState);
+$("schematic-download").onclick = () => downloadSchematic(schematicState, "cards");
+$("cook-schematic-download").onclick = () => downloadSchematic(cookSchematicState, "breadboard");
+if ($("schematic-download-drawer")) $("schematic-download-drawer").onclick = () => downloadSchematic(schematicState, "cards");
+if ($("cook-schematic-download-overflow")) $("cook-schematic-download-overflow").onclick = () => downloadSchematic(cookSchematicState, "breadboard");
 document.querySelectorAll(".schematic-view-btn").forEach((btn) => {
   btn.onclick = () => setSchematicView(btn.getAttribute("data-view"));
 });
 syncSchematicViewButtons();
-$("schematic-speak").onclick = () => {
+
+// ── Stage tab switcher ──────────────────────────────────────────────
+// The three tabs (Diagram / Breadboard / Code) switch the right-hand
+// stage panel. switchStageTab() is also called programmatically to
+// auto-navigate as the build progresses.
+let stageCodeSid = ""; // session whose firmware fills the Code tab
+function paintStageCode(code, kindLabel) {
+  if ($("stage-code-out")) $("stage-code-out").textContent = code || "";
+  if ($("stage-code-kind")) $("stage-code-kind").textContent = kindLabel || "";
+  stageCodeSid = learnSid;
+}
+function paintStageCodeError(msg) {
+  // The Code tab explains itself instead of sitting blank; the last
+  // good code (if any) stays on screen and the sid stays stale so the
+  // next open retries.
+  if ($("stage-code-kind")) $("stage-code-kind").textContent = msg;
+}
+function switchStageTab(tabName) {
+  const panels = {
+    diagram:     "stage-diagram",
+    breadboard:  "stage-breadboard",
+    code:        "stage-code-panel",
+  };
+  document.querySelectorAll(".stage-tab").forEach((btn) => {
+    btn.classList.toggle("active", btn.getAttribute("data-tab") === tabName);
+  });
+  Object.entries(panels).forEach(([name, id]) => {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle("active", name === tabName);
+  });
+  // The Code tab fetches its draft on first open (once per session),
+  // so it is never an empty panel mid-build.
+  if (tabName === "code" && learnSid && stageCodeSid !== learnSid) {
+    if (cookMode) cookSendCode(true); else fetchCode(true);
+  }
+}
+document.querySelectorAll(".stage-tab").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    switchStageTab(btn.getAttribute("data-tab"));
+  });
+});
+// The stored view predates tabs: open the matching tab on first load so
+// the toggle highlight and the visible tab agree.
+if (schematicView === "breadboard") switchStageTab("breadboard");
+
+// ── Schematic zoom ────────────────────────────────────────────────
+// Each tab zooms independently; paintSchematic re-applies the zoom so
+// step changes keep the adjustment. Zoom scales the SVG width; the
+// canvas scrolls to pan. Range 50–300%, both tabs come up at 50% so
+// the whole circuit fits, and Fit restores that default.
+const schematicZoom = { "schematic-svg": 0.5, "cook-schematic-svg": 0.5 };
+function schematicZoomLabelId(svgId) {
+  return svgId === "cook-schematic-svg" ? "cook-schematic-zoom-label" : "schematic-zoom-label";
+}
+function applySchematicZoom(svgId) {
+  const z = schematicZoom[svgId] || 0.5;
+  const box = $(svgId);
+  const svg = box && box.querySelector("svg");
+  if (svg) svg.style.width = Math.round(z * 100) + "%";
+  const label = $(schematicZoomLabelId(svgId));
+  if (label) label.textContent = Math.round(z * 100) + "%";
+}
+function setSchematicZoom(svgId, z) {
+  schematicZoom[svgId] = Math.min(3, Math.max(0.5, z));
+  applySchematicZoom(svgId);
+}
+function resetSchematicZoom() {
+  setSchematicZoom("schematic-svg", 0.5);
+  setSchematicZoom("cook-schematic-svg", 0.5);
+}
+$("schematic-zoom-out").onclick = () => setSchematicZoom("schematic-svg", (schematicZoom["schematic-svg"] || 0.5) - 0.25);
+$("schematic-zoom-in").onclick = () => setSchematicZoom("schematic-svg", (schematicZoom["schematic-svg"] || 0.5) + 0.25);
+$("schematic-zoom-fit").onclick = () => setSchematicZoom("schematic-svg", 0.5);
+$("cook-schematic-zoom-out").onclick = () => setSchematicZoom("cook-schematic-svg", (schematicZoom["cook-schematic-svg"] || 0.5) - 0.25);
+$("cook-schematic-zoom-in").onclick = () => setSchematicZoom("cook-schematic-svg", (schematicZoom["cook-schematic-svg"] || 0.5) + 0.25);
+$("cook-schematic-zoom-fit").onclick = () => setSchematicZoom("cook-schematic-svg", 0.5);
+function speakSchematicWires() {
   if (schematicState.wires.length) speakWireList(
     [{ id: "", phrase: "Step " + schematicState.n + " wiring" }]
       .concat(wireSpeechItems(schematicState.wires, schematicState.n)),
     speak, "schematic-svg", "schematic-sel");
   else if (schematicState.note) speak(schematicState.note);
-};
-$("cook-schematic-speak").onclick = () => {
-  if (cookSchematicState.wires.length) speakWireList(
-    [{ id: "", phrase: "Step " + cookSchematicState.n + " wiring" }]
-      .concat(wireSpeechItems(cookSchematicState.wires, cookSchematicState.n)),
-    cookSpeak, "cook-schematic-svg", "cook-schematic-sel");
-  else if (cookSchematicState.note) cookSpeak(cookSchematicState.note);
-};
+}
+function speakCookSchematicWires() {
+  // Replays the flowing step summary; during the reveal (no beats yet)
+  // it narrates the full project the diagram shows.
+  const beatWires = wireBeats.map((b) => b.wire).filter(Boolean);
+  const wires = beatWires.length ? beatWires : (cookSchematicState.wires || []);
+  const items = stepSummaryItems(wires, cookSchematicState.n || learnStepN,
+    revealBoardName(learnBoard));
+  if (items.length) {
+    cancelBeatSpeech();
+    speakWireList(items, cookSpeak, "cook-schematic-svg", "cook-schematic-sel");
+  } else if (cookSchematicState.note) cookSpeak(cookSchematicState.note);
+}
+$("schematic-speak").onclick = speakSchematicWires;
+$("cook-schematic-speak").onclick = speakCookSchematicWires;
+if ($("schematic-speak-drawer")) $("schematic-speak-drawer").onclick = speakSchematicWires;
+if ($("cook-schematic-speak-overflow")) $("cook-schematic-speak-overflow").onclick = speakCookSchematicWires;
+$("stage-copy-code").onclick = () => copyCode("stage-code-out", cookMode ? "cook-heard" : "talk-hint");
+$("stage-send-code").onclick = () => { if (cookMode) cookSendCode(false); else fetchCode(false); };
 
 // Shared flash guard. Deploy (FLASH FINAL) calls the server's native
 // Python esptool at 921600 baud, matching Arduino IDE's auto-reset
@@ -3103,36 +3593,75 @@ function setFlashButtonsDisabled(disabled) {
   });
 }
 
+// flash:ports:start
+function usbishPort(p) {
+  // Mirrors the backend's _is_usb_port: USB enumeration carries
+  // "USB" in the hwid or description; Bluetooth links (BTHENUM)
+  // and legacy UARTs do not. Bare names carry no metadata, so
+  // they stay pickable (explicit/test shapes, never phantoms).
+  if (typeof p === "string") return true;
+  const text = ((p && p.description) || "") + " " + ((p && p.hwid) || "");
+  if (!text.trim()) return true;
+  return /usb/i.test(text);
+}
+function pickFlashPort(ports, keep) {
+  // Dynamic port pick, never a phantom default: keep the selection
+  // while the OS still enumerates it; a lone USB serial adapter
+  // (or lone bare name) is the connected board; a lone Bluetooth
+  // or legacy port is a phantom, not a board; anything ambiguous
+  // stays an explicit pick. ports: [{port, description, hwid}].
+  const nameOf = (p) => (typeof p === "string" ? p : (p && p.port) || "");
+  const names = (ports || []).map(nameOf).filter(Boolean);
+  if (keep && names.indexOf(keep) >= 0) return keep;
+  if (names.length === 1) {
+    const only = (ports || []).filter((p) => nameOf(p))[0];
+    if (usbishPort(only)) return names[0];
+    return "";
+  }
+  const usb = (ports || []).filter((p) => typeof p !== "string" &&
+    /usb/i.test(((p && p.description) || "") + " " + ((p && p.hwid) || "")));
+  if (usb.length === 1) return nameOf(usb[0]);
+  return "";
+}
+// flash:ports:end
+
 async function refreshFlashPorts() {
   if (flashBusy) return;
   let ports = [], current = "";
   try {
     const r = await fetch("/api/serial/ports");
     const v = await r.json();
-    ports = (v.ports || []).map((p) => p.port);
+    ports = v.ports || [];
     current = (v.current || {}).port || "";
   } catch (e) { /* keep the last options while the server is offline */ }
-  if (current && ports.indexOf(current) < 0) ports.unshift(current);
-  // No phantom default: the port is always an explicit pick. A
-  // preselected COM3 would sail past validation and 409/500 later;
-  // the placeholder forces the choice up front instead.
+  const names = ports.map((p) => (p && p.port) || p).filter(Boolean);
+  // The server's current port is a candidate only while the OS
+  // enumerates it on a USB adapter: a stale default — or an
+  // enumerated Bluetooth/legacy phantom — must never preselect.
+  const currentEntry = ports.filter(
+    (p) => ((p && p.port) || p) === current)[0];
+  const serverKeep = (names.indexOf(current) >= 0 &&
+    usbishPort(currentEntry)) ? current : "";
   ["flash-port", "cook-flash-port"].forEach((id) => {
     const sel = $(id);
     if (!sel) return;
-    const keep = sel.value || current;
+    const pick = pickFlashPort(ports, sel.value || serverKeep);
     sel.innerHTML = "";
     const ph = document.createElement("option");
     ph.value = "";
-    ph.textContent = ports.length ? "Select port…" : "No ports found";
+    ph.textContent = names.length ? "Select port…" : "No ports found";
     sel.appendChild(ph);
     ports.forEach((p) => {
+      const name = (p && p.port) || p;
+      if (!name) return;
       const o = document.createElement("option");
-      o.value = p;
-      o.textContent = p;
-      if (p === keep) o.selected = true;
+      o.value = name;
+      const desc = (p && p.description) || "";
+      o.textContent = desc ? name + " — " + desc : name;
+      if (name === pick) o.selected = true;
       sel.appendChild(o);
     });
-    if (!keep || ports.indexOf(keep) < 0) sel.value = "";
+    sel.value = pick;
   });
 }
 
@@ -3240,6 +3769,18 @@ async function pumpFlashStream(url, body) {
   const reader = r.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  // Idle ticker: the server can spend minutes generating firmware
+  // between frames; a line every 5s of silence proves it is alive.
+  // The clock resets on every frame, so a healthy stream stays clean.
+  let lastFrameAt = Date.now();
+  const idleT0 = lastFrameAt;
+  const idleTick = setInterval(() => {
+    if (Date.now() - lastFrameAt >= 5000) {
+      lastFrameAt = Date.now();
+      flashDialogLog("Still working on server… " +
+        Math.round((Date.now() - idleT0) / 1000) + "s");
+    }
+  }, 1000);
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -3247,6 +3788,7 @@ async function pumpFlashStream(url, body) {
       const parsed = sseParse(buf);
       buf = parsed.rest;
       for (const f of parsed.frames) {
+        lastFrameAt = Date.now();
         let data = null;
         try { data = JSON.parse(f.data || "null"); } catch (e) { /* ignore */ }
         if (f.name === "log" && data && data.line !== undefined) {
@@ -3265,6 +3807,7 @@ async function pumpFlashStream(url, body) {
     if (ctrl.signal.aborted) return { cancelled: true };
     throw e;
   } finally {
+    clearInterval(idleTick);
     flashDialogAbort = null;
   }
   return { ok: false, detail: "flash stream ended unexpectedly" };
@@ -3280,8 +3823,10 @@ async function pumpFlashStream(url, body) {
 // server cannot see the USB port (remote browser, missing driver).
 let webPort = null; // held SerialPort across CONNECT + FLASH taps
 function webLog(statusId, line) {
-  const el = $(statusId);
-  el.textContent = (el.textContent ? el.textContent + "\n" : "") + line;
+  // The bar is one ellipsized line by design: it shows the latest
+  // step. The dialog keeps the full terminal beside it.
+  $(statusId).textContent = line;
+  flashDialogLog(line);
 }
 function u8ToBstr(u8) {
   let s = "";
@@ -3342,21 +3887,29 @@ async function webConnect(statusId, flashWord) {
       : "Connect failed: " + (e && e.message ? e.message : e);
   }
 }
-async function startMonitorAfterWebFlash(say) {
-  // The browser owns no COM name, but the monitor needs one: reuse
-  // the last deploy port, else ask the server to adopt the board.
-  if (lastFlashPort) { startMonitor(lastFlashPort); return; }
+async function adoptMonitorPort() {
+  // A COM name for the server-side monitor: reuse the last deploy
+  // port, else ask the server to adopt the answering board. ""
+  // when nothing answers (the caller guides the user).
+  if (lastFlashPort) return lastFlashPort;
   try {
     const r = await fetch("/api/serial/autodetect", { method: "POST" });
     const v = await r.json();
     const port = v.found && (v.serial_live || {}).port;
     if (port) {
       lastFlashPort = port;
-      startMonitor(port);
-      return;
+      return port;
     }
-  } catch (e) { /* fall through to guidance */ }
-  say("Browser flash complete. Open the monitor and pick the board port to prove the build.");
+  } catch (e) { /* the caller guides the user */ }
+  return "";
+}
+async function startMonitorAfterWebFlash(say) {
+  // The browser owns no COM name, but the monitor needs one: adopt
+  // it when possible, else open the drawer on START so one tap
+  // retries the moment the board is plugged in.
+  const port = await adoptMonitorPort();
+  if (port) { startMonitor(port); return; }
+  say("Browser flash complete. Plug the board in over USB, open the monitor, and press START to prove the build.");
   setDrawer("right", true);
 }
 async function webFlash(statusId, progId) {
@@ -3380,6 +3933,8 @@ async function webFlash(statusId, progId) {
   $(statusId).scrollIntoView({ block: "nearest" });
   const say = cookMode ? cookSpeak : speak;
   say("Flashing the finished firmware from the browser.");
+  flashDialogOpen("Flashing from the browser…");
+  flashDialogProgress(null);
   let transport = null;
   let sawProgress = false;
   try {
@@ -3399,9 +3954,21 @@ async function webFlash(statusId, progId) {
         "(needs Transport + ESPLoader exports).");
     }
     webLog(statusId, "Compiling on server…");
-    const r = await fetch("/project/" + encodeURIComponent(learnSid) +
-      "/firmware");
-    const v = await r.json();
+    // The compile is one blocking fetch: a liveness ticker in the
+    // dialog proves it is working instead of sitting static.
+    const compileT0 = Date.now();
+    const compileTick = setInterval(() => {
+      flashDialogLog("Still compiling on server… " +
+        Math.round((Date.now() - compileT0) / 1000) + "s");
+    }, 5000);
+    let r, v;
+    try {
+      r = await fetch("/project/" + encodeURIComponent(learnSid) +
+        "/firmware");
+      v = await r.json();
+    } finally {
+      clearInterval(compileTick);
+    }
     if (!r.ok) throw new Error((v && v.detail) || "compile failed");
     const files = v.files || [];
     if (!files.length) throw new Error("server returned no binaries");
@@ -3466,7 +4033,6 @@ async function webFlash(statusId, progId) {
                                            baudrate: baud,
                                            terminal: terminal });
         await loader.main();
-        const base = $(statusId).textContent;
         await loader.writeFlash({
           fileArray: fileArray,
           flashSize: "keep",
@@ -3478,7 +4044,8 @@ async function webFlash(statusId, progId) {
             const pct = total ? Math.floor((written / total) * 100) : 0;
             sawProgress = true;
             $(progId).value = pct;
-            $(statusId).textContent = base + "\nFlashing file " +
+            flashDialogProgress(total ? written / total : null);
+            $(statusId).textContent = "Flashing file " +
               (fileIndex + 1) + " of " + fileArray.length + "… " + pct + "%";
           },
         });
@@ -3498,12 +4065,14 @@ async function webFlash(statusId, progId) {
     $(progId).value = 100;
     $(statusId).textContent = "Done — releasing the port (the board reboots " +
       "into the new firmware). The monitor proves the build.";
+    flashDialogDone(true, "Browser flash complete.");
     say("Browser flash complete.");
     startMonitorAfterWebFlash(say);
   } catch (e) {
     const msg = e && e.message ? e.message : e;
     if (!sawProgress) $(progId).value = 0; // died before bytes: park it empty
     webLog(statusId, "Browser flash failed: " + msg);
+    flashDialogDone(false, "Browser flash failed.");
     const kind = flashFailureKind(msg);
     if (kind === "unreachable") {
       // The server stopped answering mid-flash (window closed, process
@@ -3575,6 +4144,17 @@ function paintDeployBar() {
   const show = cookMode && !!learnSid;
   $("deploy-bar").hidden = !show;
   document.body.classList.toggle("deploy-on", show);
+  // The coach bar floats above the deploy bar: measure the real height
+  // (it wraps on narrow screens) so the two never overlap.
+  requestAnimationFrame(() => {
+    const bar = $("deploy-bar");
+    const h = (!show || !bar || !bar.offsetHeight) ? 0 : bar.offsetHeight;
+    document.documentElement.style.setProperty("--deploybar-h", h + "px");
+  });
+}
+if (typeof window !== "undefined" && window.addEventListener) {
+  // Wrapping changes bar heights: re-measure so the bars never overlap.
+  window.addEventListener("resize", () => { paintDeployBar(); paintCoachBar(); });
 }
 async function flashFinal(portId, statusId) {
   if (!learnSid || flashBusy) return;
@@ -3593,6 +4173,7 @@ async function flashFinal(portId, statusId) {
   say("Flashing the finished project to the ESP32 on " + port + ".");
   flashDialogOpen("Flashing the finished project to " + port);
   flashDialogProgress(null);
+  flashDialogLog("Flashing to " + port + " — preparing firmware on server…");
   try {
     flashBusy = true;
     setFlashButtonsDisabled(true);
@@ -3643,7 +4224,7 @@ async function flashFinal(portId, statusId) {
   }
 }
 
-$("flash-final").onclick = () => flashFinal("flash-port", "flash-status");
+$("flash-final").onclick = async () => { await refreshFlashPorts(); flashFinal("flash-port", "flash-status"); };
 $("web-connect").onclick = () => webConnect("webflash-status");
 $("web-flash").onclick = () => webFlash("webflash-status", "webflash-progress");
 $("cook-web-connect").onclick = () => webConnect("cook-flash-status", "DEPLOY");
@@ -4184,12 +4765,20 @@ function renderCook(v) {
   $("cook-project").textContent = (v.project_title || "Project") + (v.board ? " (" + v.board + ")" : "");
   const idx = v.step_index || 0, total = v.steps_total || 1;
   const done = v.state === "DONE";
+  if (done && wireBeats.length) {
+    wireBeats = []; wireBeatIdx = 0; wireBeatAcked = false;
+    cancelBeatSpeech();
+    paintWireBeat(); // restore the full diagram
+    paintCoachBar(); // refresh the primary action (deploy)
+  }
   $("cook-step").textContent = done
     ? "DONE — all " + total + " steps verified"
     : "STEP " + Math.min(idx + 1, total) + " OF " + total;
   $("cook-bar").style.width = Math.round(100 * (done ? total : idx) / total) + "%";
   const box = $("cook-instruction");
-  box.textContent = v.instruction || "(no instruction)";
+  // Beats own the bubble while wiring: only a beatless (or finished)
+  // step shows the raw server instruction.
+  if (done || !wireBeats.length) box.textContent = v.instruction || "(no instruction)";
   box.classList.toggle("fault", v.state === "VERIFYING");
   box.classList.toggle("done", done);
   const deps = (v.step && v.step.depends_on_parts) || [];
@@ -4550,7 +5139,13 @@ async function cookLook() {
 }
 
 async function cookSendCode(auto) {
-  if (!cookMode || busy || !learnSid) return;
+  if (!cookMode || !learnSid) return;
+  // A manual tap mid-turn must say something (screen only: the live
+  // turn owns the audio). Auto fetches stay silent on overlap.
+  if (busy) {
+    if (!auto) $("cook-heard").textContent = "Still working — press SEND CODE again in a moment.";
+    return;
+  }
   busy = true;
   try {
     const r = await fetch("/project/" + encodeURIComponent(learnSid) + "/code", {
@@ -4560,7 +5155,9 @@ async function cookSendCode(auto) {
     });
     const v = await r.json();
     if (!r.ok) {
-      $("cook-heard").textContent = ((v && v.detail) || "code not ready") + " — SEND CODE retries.";
+      const msg = (v && v.detail) || "code not ready";
+      $("cook-heard").textContent = msg + " — SEND CODE retries.";
+      paintStageCodeError(msg + " — Send to Board retries.");
       cookSpeak("Code is not ready yet. Press Send Code to retry.");
       return;
     }
@@ -4568,6 +5165,7 @@ async function cookSendCode(auto) {
     codeFetchedSid = learnSid;
     const progress = (v.steps_passed || 0) + " of " + (v.steps_total || 0) + " steps verified";
     $("cook-heard").textContent = v.verified ? "Final code below." : "Draft code below (" + progress + ").";
+    paintStageCode(v.code || "", v.verified ? "verified final" : "draft (" + progress + ")");
     if (auto) return;
     cookSpeak(v.verified ? "Code ready. It is shown on screen." :
       "Here's your draft code, " + progress + " so far.");
@@ -4582,9 +5180,13 @@ async function cookSendCode(auto) {
 function enterCookMode(v, opts) {
   if (liveOn) stopLive("Live guide paused — cook mode running.");
   cookMode = true;
+  document.body.classList.add("cooking", "coach-active"); // hide home chrome + mic
   cookView = v;
-  $("cook").hidden = false;
-  $("learn-sec").hidden = true; // one focused screen while cooking
+  if ($("cook")) $("cook").hidden = false; // legacy shim
+  $("learn-sec").hidden = true;
+  // Show the learning leaf in the left panel
+  if ($("cook-leaf")) $("cook-leaf").hidden = false;
+  if ($("guide-hero")) $("guide-hero").hidden = true;
   paintResumeBar(); // hidden while cooking
   $("cook-heard").textContent = "";
   $("cook-nudge").hidden = true;
@@ -4602,8 +5204,10 @@ function enterCookMode(v, opts) {
 
 function exitCookMode() {
   cookMode = false;
+  document.body.classList.remove("cooking", "coach-active"); // restore home chrome
+  document.body.classList.remove("hide-narration");
   paintDeployBar();
-  cancelBeatSpeech();
+  cancelBeatSpeech(); // a pending summary must not sound after exit
   stopMonitor("Stopped.");
   exitRescue(false);
   cancelWireSpeech();
@@ -4617,9 +5221,13 @@ function exitCookMode() {
   VoiceEngine.stop();
   $("cook-talk").classList.remove("rec");
   $("cook-talk").textContent = "TALK";
-  $("cook").hidden = true;
+  if ($("cook")) $("cook").hidden = true; // legacy shim
   $("learn-sec").hidden = false;
+  if ($("guide-hero")) $("guide-hero").hidden = false;
+  // Hide learning leaf, restore home
+  if ($("cook-leaf")) $("cook-leaf").hidden = true;
   $("cook-done").hidden = true; // learn mode shows code-sec instead
+  switchStageTab("diagram");
   if (cookView) renderLearning(cookView);
 }
 
@@ -4667,7 +5275,7 @@ function hushCookSpeech() {
   VoiceEngine.stop();
   if (cookMode) $("cook-heard").textContent = "Stopped.";
 }
-$("cook-stop").onclick = () => hushCookSpeech();
+if ($("cook-stop")) $("cook-stop").onclick = () => hushCookSpeech();
 $("cook-arm").onclick = () => flipKillswitch(false);
 $("cook-nudge-x").onclick = () => {
   $("cook-nudge").hidden = true;
@@ -4694,7 +5302,7 @@ $("cook-ask-input").onkeydown = (e) => {
 };
 $("cook-repeat").onclick = () => { markCookActive(); cookSpeak(lastSpeak || (cookView && cookView.instruction) || ""); };
 $("cook-look").onclick = () => cookLook();
-$("cook-exit").onclick = () => exitCookMode();
+if ($("cook-exit")) $("cook-exit").onclick = () => exitCookMode();
 $("cook-code").onclick = () => cookSendCode();
 // Sticky resume bar: a live session is one tap away without scrolling
 // back through the setup panel. Hidden in cook mode and before any

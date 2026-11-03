@@ -36,7 +36,8 @@ class StubBrain:
     def complete_text(self, system, user, image_b64=None, video_b64=None,
                       video_mime=None, **kwargs):
         self.calls.append({"system": system, "user": user,
-                           "video_b64": video_b64, "video_mime": video_mime})
+                           "video_b64": video_b64, "video_mime": video_mime,
+                           "kwargs": kwargs})
         item = self.script.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -92,6 +93,13 @@ class LiveGuideTest(unittest.TestCase):
         self.assertIn("Wire the BME280.", call["user"])
         self.assertIn("0x76", call["user"])  # probe truth in the prompt
         self.assertEqual(voice.spoken, ["Seat the BME280."])
+
+    def test_live_guidance_disables_json_mode(self):
+        sam, brain, voice = (StubSAM(TRACKS), StubBrain(["Seat it."]),
+                             StubVoice())
+        guide = make_guide(self, sam, brain, voice)
+        guide.guide(clip=b"x", transcript="where now")
+        self.assertIs(brain.calls[0]["kwargs"].get("json_mode"), False)
 
     def test_empty_guidance_falls_back_to_audible_prompt(self):
         guide = make_guide(self, StubSAM(TRACKS), StubBrain(["   "]),

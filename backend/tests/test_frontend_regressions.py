@@ -42,6 +42,41 @@ class SingleSpeechAtProjectStartTest(unittest.TestCase):
         self.assertIn("speechSynthesis.cancel()", body)
 
 
+class SpeechBridgeTest(unittest.TestCase):
+    """The opening narration starts in the server voice with no quiet hole.
+
+    Cold Kokoro costs ~10s (model load + first inference), which used to
+    race the chunk timeout and drop the opening to browser speech after
+    seconds of quiet. Two fixes: the app primes the server voice at
+    boot and first intent (suggest, card tap) while the user reads,
+    and playUrl cuts stale browser speech when server audio actually
+    starts — never at speak time (quiet hole) and never late
+    (double talk). There are no bridging acks; taps acknowledge
+    visually.
+    """
+
+    def test_server_voice_primed_at_first_intent(self):
+        self.assertIn("function warmServerVoice()", APP_JS)
+        boot = _block("function warmServerVoice() {",
+                      "function speakBrowserNow")
+        self.assertIn("\nwarmServerVoice();", boot)
+        suggest = _block("async function suggestProjects() {",
+                         "async function startLearning(")
+        self.assertIn("warmServerVoice()", suggest)
+        start = _block("async function startLearning(",
+                       "// choice:prompt:start")
+        self.assertIn("warmServerVoice()", start)
+
+    def test_speak_cuts_stale_browser_on_first_audio(self):
+        speak_body = _block("  speak(text, onend) {", "  streamStart() {")
+        self.assertGreater(
+            speak_body.index("speechSynthesis.cancel()"),
+            speak_body.index("if (!text || muted)"))
+        chunks = _block("function playServerChunks(chunks, mySpeech, done) {",
+                        "const VoiceEngine = {")
+        self.assertIn("speechSynthesis.cancel()", chunks)
+
+
 class DynamicProjectPromptTest(unittest.TestCase):
     """The pick-a-project prompt must match how many projects exist."""
 
@@ -141,6 +176,14 @@ class CookButtonAuditTest(unittest.TestCase):
         body = _block("async function cookLook", "async function cookSendCode")
         self.assertNotIn("/api/vision/describe", body)
         self.assertIn("speakWireList", body)
+
+    def test_send_code_nags_when_busy(self):
+        fetch = _block("async function fetchCode(auto) {",
+                       '$("send-code").onclick')
+        self.assertIn("Still working", fetch)
+        cook = _block("async function cookSendCode(auto) {",
+                      "function enterCookMode(v, opts) {")
+        self.assertIn("Still working", cook)
 
 
 class LearningFirstUiTest(unittest.TestCase):
@@ -322,6 +365,7 @@ class DeployBarTest(unittest.TestCase):
                       "// flash:sse:start")
         self.assertIn("Select port", body)
         self.assertNotIn('"COM3"', body)
+        self.assertIn("usbishPort(currentEntry)", body)
         self.assertNotIn("'COM3'", body)
 
 
@@ -339,6 +383,16 @@ class FlashDialogTest(unittest.TestCase):
                       '$("flash-final").onclick')
         self.assertIn("flashDialogOpen(", body)
         self.assertIn("/flash/stream", body)
+
+    def test_deploy_logs_instantly_and_ticks_while_idle(self):
+        final = _block("async function flashFinal(",
+                       '$("flash-final").onclick')
+        self.assertIn("preparing firmware on server", final)
+        pump = _block("async function pumpFlashStream(url, body) {",
+                      "// Deploy flash:")
+        self.assertIn("Still working on server", pump)
+        self.assertIn("lastFrameAt", pump)
+        self.assertIn("clearInterval(idleTick)", pump)
 
 
 class RollcallFlowTest(unittest.TestCase):
@@ -548,19 +602,26 @@ class NoCheckinQuestionTest(unittest.TestCase):
         self.assertNotIn("tutorFollowup", body)
 
 
-class InstantAckTest(unittest.TestCase):
-    """Slow paths ack instantly via local browser speech: the tutor is
-    never quiet for seconds before its first word."""
+class OneVoiceTest(unittest.TestCase):
+    """No bridging acks: taps acknowledge visually (orb + tickers)
+    and speech stays one voice — server first, browser fallback only
+    when the server path fails."""
 
-    def test_suggest_acks_instantly(self):
-        body = _block("async function suggestProjects() {",
-                      "async function startLearning(project) {")
-        self.assertIn("speakBrowserNow", body)
+    def test_no_bridging_ack_calls(self):
+        for ack in ("speakBrowserNow(\"Let's go.\")",
+                    "speakBrowserNow(\"Moving on.\")",
+                    "speakBrowserNow(\"Let's wire it up.\")",
+                    "speakBrowserNow(\"Planning your projects.\")",
+                    "speakBrowserNow(\"Starting \"",
+                    "speakBrowserNow(\"Let's build \""):
+            self.assertNotIn(ack, APP_JS)
 
-    def test_start_ack_sounds_instantly(self):
-        body = _block("async function startLearning(project) {",
-                      "// choice:prompt:start")
-        self.assertIn("speakBrowserNow", body)
+    def test_fallback_path_survives(self):
+        # The failure fallback is not an ack: server-audio failures
+        # still speak the utterance in the browser voice.
+        chunks = _block("function playServerChunks(chunks, mySpeech, done) {",
+                        "const VoiceEngine = {")
+        self.assertIn("speakBrowserNow(chunks.slice(i).join(\" \")", chunks)
 
 class PaintGuardsTest(unittest.TestCase):
     """Rollcall, troubleshoot, and stretch paints never throw on a stale
@@ -647,16 +708,12 @@ class CoachActionTest(unittest.TestCase):
 const cases = [
   [{phase: "REVEAL"}, "start-building"],
   [{phase: "BUILDING", serverState: "ROLLCALL"}, "ready"],
-  [{phase: "BUILDING", wiresTotal: 4, wireIdx: 0, wireAcked: false},
-   "wire-connected"],
-  [{phase: "BUILDING", wiresTotal: 4, wireIdx: 0, wireAcked: true},
-   "wire-next"],
-  [{phase: "BUILDING", wiresTotal: 1, wireIdx: 0, wireAcked: true,
-    stepN: 1, stepsTotal: 4}, "next-step"],
+  [{phase: "BUILDING", wiresTotal: 4, wireIdx: 4, wireAcked: false,
+    stepN: 2, stepsTotal: 4}, "next-step"],
+  [{phase: "BUILDING", wiresTotal: 4, wireIdx: 4, wireAcked: false,
+    stepN: 4, stepsTotal: 4}, "deploy"],
   [{phase: "BUILDING", wiresTotal: 0, stepN: 2, stepsTotal: 4},
    "next-step"],
-  [{phase: "BUILDING", wiresTotal: 1, wireIdx: 0, wireAcked: true,
-    stepN: 4, stepsTotal: 4}, "deploy"],
   [{phase: "BUILDING", wiresTotal: 0, stepN: 4, stepsTotal: 4},
    "deploy"],
   [{phase: "BUILDING", serverState: "DONE"}, "deploy"],
@@ -674,7 +731,7 @@ for (const [ctx, want] of cases) {
             ["node", "-e", script], capture_output=True, text=True,
             timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(out.stdout.strip().splitlines(), ["ok"] * 13)
+        self.assertEqual(out.stdout.strip().splitlines(), ["ok"] * 11)
 
     def test_coach_bar_paint_dispatches_primary(self):
         paint = _block("function paintCoachBar(", "function coachTapped(")
@@ -683,9 +740,10 @@ for (const [ctx, want] of cases) {
         self.assertIn("stepN", paint)
         self.assertIn("stepsTotal", paint)
         tap = _block("function coachTapped(", "function toggleCoachMore(")
-        for action in ("start-building", "ready", "wire-connected",
-                       "wire-next", "next-step", "deploy"):
+        for action in ("start-building", "ready", "next-step", "deploy"):
             self.assertIn(action, tap)
+        self.assertNotIn("wire-connected", tap)
+        self.assertNotIn("wire-next", tap)
         self.assertIn("sendNextStep()", tap)
 
 
@@ -750,14 +808,32 @@ class CoachLayoutTest(unittest.TestCase):
                       "rescue-card", "coach-log"):
             self.assertIn('id="%s"' % ident, INDEX_HTML)
 
+    def test_drawers_slide_in_when_opened(self):
+        self.assertIn(".drawer.left:not([hidden])", STYLE_CSS)
+        self.assertIn(".drawer.right:not([hidden])", STYLE_CSS)
+        self.assertNotIn(".drawer-tab { display: none; }", STYLE_CSS)
+        self.assertIn("top: var(--topbar-h)", STYLE_CSS)
+
     def test_code_and_fixit_live_in_left_drawer(self):
         start = INDEX_HTML.index('id="left-drawer"')
         end = INDEX_HTML.index("<!-- /left-drawer -->")
-        for ident in ("code-sec", "learn-troubleshoot",
-                      "cook-troubleshoot", "learn-stretch",
-                      "cook-stretch", "rescue-card"):
+        for ident in ("code-sec", "learn-troubleshoot", "learn-stretch"):
             at = INDEX_HTML.index('id="%s"' % ident)
             self.assertTrue(start < at < end, ident)
+
+    def test_cook_fixit_lives_in_cook_leaf(self):
+        start = INDEX_HTML.index('id="cook-leaf"')
+        end = INDEX_HTML.index("<!-- /cook-leaf -->")
+        for ident in ("cook-troubleshoot", "cook-stretch", "rescue-card",
+                      "rescue-msg", "rescue-suspect", "rescue-complete"):
+            at = INDEX_HTML.index('id="%s"' % ident)
+            self.assertTrue(start < at < end, ident)
+
+    def test_fixit_ids_are_unique(self):
+        for ident in ("cook-troubleshoot", "cook-stretch", "rescue-card",
+                      "rescue-msg", "rescue-suspect", "rescue-complete",
+                      "learn-troubleshoot", "learn-stretch"):
+            self.assertEqual(INDEX_HTML.count('id="%s"' % ident), 1, ident)
 
     def test_cook_flash_moved_to_deploy_bar(self):
         start = INDEX_HTML.index('id="deploy-bar"')
@@ -781,14 +857,15 @@ class CoachLayoutTest(unittest.TestCase):
         self.assertIn('$("cook-done").hidden = !learnSid', body)
         panel = INDEX_HTML[INDEX_HTML.index('id="cook-done"'):
                            INDEX_HTML.index('id="cook-code-out"')]
-        self.assertIn("Project Code", panel)
+        self.assertIn("Project firmware", panel)
 
     def test_secondary_actions_moved_to_overflow(self):
         start = INDEX_HTML.index('id="coach-overflow"')
         end = INDEX_HTML.index("<!-- /coach-overflow -->")
         overflow = INDEX_HTML[start:end]
         for ident in ("cook-repeat", "cook-look",
-                      "cook-schematic-download", "cook-schematic-speak"):
+                      "cook-schematic-download-overflow",
+                      "cook-schematic-speak-overflow"):
             self.assertIn('id="%s"' % ident, overflow)
         for ident in ("cook-check", "cook-phase-done", "cook-auto",
                       "cook-confirm", "cook-move-on"):
@@ -803,9 +880,9 @@ class CoachLayoutTest(unittest.TestCase):
 
 
 class WireBeatsTest(unittest.TestCase):
-    """Each step's new wires narrate one by one: pin endpoints, wire
-    color, and position in the step — from netlist data, never
-    invented."""
+    """Each step's new wires narrate as one flowing summary: pin
+    endpoints and wire color with transitions — from netlist data,
+    never invented."""
 
     @unittest.skipUnless(shutil.which("node"), "node not available")
     def test_beats_narrate_each_wire(self):
@@ -851,11 +928,14 @@ console.log(wireBeatsForStep(wires, 9, "ESP32 DevKit").length);
         self.assertEqual(key, "hc_sr04:VCC")
         self.assertEqual(none, "0")
 
-    def test_beat_stepper_wired(self):
-        for name in ("buildWireBeats", "ackWireBeat", "nextWireBeat",
-                     "paintWireBeat", "speakBeat", "cancelBeatSpeech",
+    def test_summary_wired(self):
+        for name in ("buildWireBeats", "speakStepSummary",
+                     "stepSummaryItems", "stepWirePhrase",
+                     "paintWireBeat", "cancelBeatSpeech",
                      "coachBeatText", "schematicPartId"):
             self.assertIn("function %s(" % name, APP_JS)
+        for gone in ("ackWireBeat", "nextWireBeat", "speakBeat"):
+            self.assertNotIn("function %s(" % gone, APP_JS)
         fetch = _block("async function fetchSchematic(",
                        "function refreshSchematics()")
         self.assertIn("buildWireBeats", fetch)
@@ -909,8 +989,9 @@ class OrbPhaseTest(unittest.TestCase):
 
 class MonitorRescueTest(unittest.TestCase):
     """Live verification after the final flash: telemetry triage is
-    deterministic, stalls and board errors latch rescue, the tutor
-    names a suspect wire, and healthy lines bring us back online."""
+    deterministic and per device, stalls and persistent device errors
+    latch rescue naming the device, the tutor speaks the reconnect,
+    and the failed device's own healthy lines bring us back online."""
 
     @unittest.skipUnless(shutil.which("node"), "node not available")
     def test_telemetry_triage(self):
@@ -991,12 +1072,12 @@ for (const line of cases) {
         self.assertIn("onMonitorLine", start)
         self.assertIn("Listening to your board", start)
         diag = _block("async function requestRescueDiagnosis() {",
-                      "function enterRescue(reason) {")
+                      "function enterRescue(reason, device) {")
         self.assertIn("telemetry/diagnose", diag)
         self.assertIn("wire-fault", diag)
         self.assertIn("schematicWireId(", diag)
         self.assertIn("rescue-msg", diag)
-        enter = _block("function enterRescue(reason) {",
+        enter = _block("function enterRescue(reason, device) {",
                        "function exitRescue(backOnline) {")
         self.assertIn("Orb.fault(true)", enter)
         self.assertIn("rescue-card", enter)
@@ -1048,6 +1129,186 @@ for (const line of cases) {
         esc = _block('$("rescue-complete").onclick',
                      "// monitor:end")
         self.assertIn("mark complete", esc)
+
+    def test_monitor_ids_are_unique(self):
+        for ident in ("monitor-meta", "monitor-out", "monitor-start",
+                      "monitor-stop"):
+            self.assertEqual(INDEX_HTML.count('id="%s"' % ident), 1, ident)
+
+    def test_monitor_start_adopts_port(self):
+        self.assertIn("async function adoptMonitorPort() {", APP_JS)
+        body = _block("async function adoptMonitorPort() {",
+                      "async function startMonitorAfterWebFlash(say) {")
+        self.assertIn("/api/serial/autodetect", body)
+        self.assertIn("lastFlashPort", body)
+        self.assertIn("|| await adoptMonitorPort()", APP_JS)
+
+    def test_monitor_picker_lists_ports(self):
+        self.assertIn('id="monitor-port"', INDEX_HTML)
+        body = _block("async function refreshMonitorPorts() {",
+                      "// flash:sse:start")
+        self.assertIn("/api/serial/ports", body)
+        self.assertIn(
+            "pickFlashPort(ports, sel.value || lastFlashPort)", body)
+        self.assertIn("await refreshMonitorPorts()", APP_JS)
+
+    def test_monitor_guidance_names_the_picker(self):
+        # Learning firmware never answers PING, so adoption alone
+        # cannot find it: the picker is how a flashed board gets
+        # heard, and the guidance must say so.
+        self.assertIn("pick the board port", APP_JS)
+
+    def test_transient_faults_do_not_trip_rescue(self):
+        # One timeout line is a passing dip (hand out of range), not
+        # a lost board: rescue trips only on consecutive faults, so
+        # the tutor stops flapping lost-signal/back-online chatter.
+        self.assertIn("const MONITOR_FAULT_LINES = 3", APP_JS)
+        line = _block("function onMonitorLine(text) {",
+                      "async function requestTelemetryProof() {")
+        self.assertIn("monitorFaults", line)
+        self.assertIn("MONITOR_FAULT_LINES", line)
+        self.assertIn("enterRescue(", line)
+
+    @unittest.skipUnless(shutil.which("node"), "node not available")
+    def test_reconnect_speech_names_the_wire(self):
+        # The suspect wire is spoken, not just painted: the tutor
+        # tells the user exactly which wire to reseat and where it
+        # runs, or stays silent when no wire was named.
+        body = _block("// monitor:pure:start", "// monitor:pure:end")
+        script = body + """
+const cases = [
+  [{part: "hc_sr04", part_pin: "TRIG", board_pin: "GPIO4"}, "wire"],
+  [{part: "servo", part_pin: "SIG"}, "pin"],
+  [null, "none"],
+  [{part: "hc_sr04"}, "none"],
+  [{part_pin: "TRIG"}, "none"],
+];
+for (const [suspect, kind] of cases) {
+  console.log(JSON.stringify({kind: kind,
+    say: suspectReconnectSpeech(suspect)}));
+}
+"""
+        out = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True,
+            timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        got = [json.loads(row) for row in out.stdout.strip().splitlines()]
+        by_kind = {}
+        for g in got:
+            by_kind.setdefault(g["kind"], []).append(g["say"])
+        wire = by_kind["wire"][0]
+        self.assertIn("TRIG", wire)
+        self.assertIn("GPIO4", wire)
+        self.assertTrue(wire.strip().endswith("."))
+        self.assertIn("SIG", by_kind["pin"][0])
+        for say in by_kind["none"]:
+            self.assertEqual(say, "")
+
+    def test_diagnosis_speaks_the_reconnect(self):
+        # The spoken rescue guidance carries the reconnect sentence:
+        # the wire to reseat is heard, not only read on the card.
+        diag = _block("async function requestRescueDiagnosis() {",
+                      "function enterRescue(reason, device) {")
+        self.assertIn("suspectReconnectSpeech(suspect)", diag)
+        self.assertIn("cookSpeak(say)", diag)
+
+    @unittest.skipUnless(shutil.which("node"), "node not available")
+    def test_tagged_telemetry_attributes_devices(self):
+        # Tagged lines attribute to their device; untagged lines keep
+        # the legacy global shape (device "") and sentence.
+        body = _block("// monitor:pure:start", "// monitor:pure:end")
+        script = body + """
+const cases = [
+  "HC-SR04 | DIST | 45.0 | cm",
+  "BME280 | TEMP | 24.5 | C",
+  "HC-SR04 | DIST | TIMEOUT | cm",
+  "SYS | HEARTBEAT | OK | -",
+  "LED | STATE | HIGH | -",
+  "Distance: 45cm",
+];
+for (const line of cases) {
+  const c = classifyTelemetryLine(line);
+  console.log(JSON.stringify({line: line, device: c.device,
+    value: c.value, unit: c.unit, fault: c.fault,
+    say: telemetryReadout(c), proof: telemetryProvesLife(line)}));
+}
+"""
+        out = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True,
+            timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        got = [json.loads(row) for row in out.stdout.strip().splitlines()]
+        by_line = {g["line"]: g for g in got}
+        dist = by_line["HC-SR04 | DIST | 45.0 | cm"]
+        self.assertEqual(dist["device"], "HC-SR04")
+        self.assertEqual((dist["value"], dist["unit"], dist["fault"]),
+                         (45, "cm", False))
+        self.assertIn("45 centimeters", dist["say"])
+        self.assertIn("HC", dist["say"])
+        self.assertTrue(dist["proof"])
+        temp = by_line["BME280 | TEMP | 24.5 | C"]
+        self.assertEqual(temp["device"], "BME280")
+        self.assertEqual(temp["value"], 24.5)
+        self.assertFalse(temp["fault"])
+        self.assertIn("24.5", temp["say"])
+        self.assertIn("degrees", temp["say"])
+        self.assertTrue(temp["proof"])
+        bad = by_line["HC-SR04 | DIST | TIMEOUT | cm"]
+        self.assertEqual(bad["device"], "HC-SR04")
+        self.assertTrue(bad["fault"])
+        self.assertIsNone(bad["value"])
+        self.assertFalse(bad["proof"])
+        beat = by_line["SYS | HEARTBEAT | OK | -"]
+        self.assertEqual(beat["device"], "SYS")
+        self.assertFalse(beat["fault"])
+        self.assertEqual(beat["say"], "")
+        self.assertTrue(beat["proof"])
+        led = by_line["LED | STATE | HIGH | -"]
+        self.assertEqual(led["device"], "LED")
+        self.assertFalse(led["fault"])
+        self.assertEqual(led["say"], "")
+        legacy = by_line["Distance: 45cm"]
+        self.assertFalse(legacy["device"])
+        self.assertIn("You are at 45 centimeters", legacy["say"])
+
+    def test_faults_tracked_per_device(self):
+        # A healthy device's good lines must not mask a sick one's
+        # faults: faults, streaks, and the rescue latch are per
+        # device, and proof waits while any device is faulted.
+        self.assertIn("let deviceState = {}", APP_JS)
+        line = _block("function onMonitorLine(text) {",
+                      "async function requestTelemetryProof() {")
+        self.assertIn("deviceState", line)
+        self.assertIn("rescueDevice", line)
+        self.assertIn("deviceFaultActive()", line)
+
+    def test_device_rescue_names_the_device(self):
+        # Rescue carries the failed device: the spoken latch names
+        # it, recovery needs its own good line, and the global latch
+        # keeps the plain sentence.
+        self.assertIn("function enterRescue(reason, device) {", APP_JS)
+        enter = _block("function enterRescue(reason, device) {",
+                       "function exitRescue(backOnline) {")
+        self.assertIn("lost the signal from the", enter)
+        self.assertIn("rescueDevice", enter)
+
+    def test_diagnosis_sends_device_lines(self):
+        # The diagnosis payload is device-scoped: trailing lines from
+        # the failed device plus the healthy set, and every wire of
+        # the suspect part highlights — not just the one pin.
+        diag = _block("async function requestRescueDiagnosis() {",
+                      "function enterRescue(reason, device) {")
+        self.assertIn("rescueDevice", diag)
+        self.assertIn("part_wires", diag)
+        self.assertIn("healthy", diag)
+
+    def test_quiet_device_trips_silence_rescue(self):
+        # The bonus check: a device that spoke and then went quiet
+        # while the stream flows is a silence fault naming it.
+        watch = _block("function monitorWatchdog() {",
+                       "function startMonitor(port) {")
+        self.assertIn("deviceState", watch)
+        self.assertIn("went quiet", watch)
 
 
 class FlowStructureTest(unittest.TestCase):
@@ -1108,6 +1369,21 @@ console.log(JSON.stringify([
         self.assertIn("$(\"cook-stop\").onclick = () => hushCookSpeech();",
                       APP_JS)
         self.assertNotIn("flipKillswitch(true)", APP_JS)
+
+
+class BindingTargetTest(unittest.TestCase):
+    """Every unguarded `$("id").onX = ...` binding must name an id that
+    exists in index.html. A restyle that drops a button (cook-stop,
+    cook-exit) otherwise throws TypeError at load and kills every
+    binding after it. Bindings guarded by `if ($(id))` are exempt."""
+
+    def test_unguarded_binding_targets_exist_in_html(self):
+        bound = re.findall(
+            r'^\s*\$\("([^"]+)"\)\.(?:onclick|onchange|onkeydown)\s*=',
+            APP_JS, re.M)
+        missing = sorted({i for i in bound
+                           if 'id="%s"' % i not in INDEX_HTML})
+        self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":

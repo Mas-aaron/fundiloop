@@ -35,7 +35,18 @@ function makeEl(tag) {
     get(o, k) {
       if (k in o) return o[k];
       if (k === "classList") {
-        return { add() {}, remove() {}, toggle() {}, contains() { return false; } };
+        if (!o._cls) o._cls = new Set();
+        const s = o._cls;
+        return {
+          add(...c) { c.forEach((x) => s.add(x)); },
+          remove(...c) { c.forEach((x) => s.delete(x)); },
+          toggle(c, f) {
+            const on = f !== undefined ? !!f : !s.has(c);
+            if (on) s.add(c); else s.delete(c);
+            return on;
+          },
+          contains(c) { return s.has(c); },
+        };
       }
       if (k === "querySelectorAll") return () => [];
       if (k === "querySelector") return () => null;
@@ -60,6 +71,7 @@ globalThis.document = {
   querySelectorAll: () => [],
   querySelector: () => null,
   body: makeEl("body"),
+  documentElement: { style: { setProperty() {}, removeProperty() {} } },
   addEventListener: () => {},
   removeEventListener: () => {},
 };
@@ -81,6 +93,24 @@ globalThis.Audio = class {
   pause() {}
 };
 globalThis.Audio.instances = [];
+// Controllable browser speech: utterances are recorded with a sync
+// onend (same timing as the old no-speechSynthesis early return).
+globalThis.__spoken = [];
+globalThis.SpeechSynthesisUtterance = class {
+  constructor(text) { this.text = text; }
+};
+globalThis.window.speechSynthesis = {
+  speaking: false, pending: false, paused: false,
+  getVoices: () => [],
+  cancel() { this.speaking = false; this.pending = false; },
+  resume() {},
+  speak(u) {
+    globalThis.__spoken.push(u && u.text !== undefined ? u.text : String(u));
+    if (u && u.onend) u.onend();
+  },
+};
+// Browsers alias window props to globals; app.js uses both spellings.
+globalThis.speechSynthesis = globalThis.window.speechSynthesis;
 
 // --- Probe: appended to the real app source, same scope. ---
 const probe = `
@@ -354,6 +384,240 @@ const probe = `
   globalThis.fetch = realFetch2;
   console.log = realConsoleLog2;
   console.log("PASS speak-retry");
+
+  // 15. Schematic tabs: the Diagram tab always shows pin cards, the
+  // Breadboard tab always shows the breadboard view, and one fetch
+  // feeds both tabs so they can never disagree about the step.
+  schematicState.svg = "<svg>cards</svg>";
+  schematicState.breadboardSvg = "<svg>bb</svg>";
+  cookSchematicState.svg = "<svg>cards</svg>";
+  cookSchematicState.breadboardSvg = "<svg>bb</svg>";
+  paintSchematic("schematic-svg", "schematic-sel", schematicState, false, 0);
+  paintSchematic("cook-schematic-svg", "cook-schematic-sel", cookSchematicState, false, 0);
+  assert.equal($("schematic-svg").innerHTML, "<svg>cards</svg>");
+  assert.equal($("cook-schematic-svg").innerHTML, "<svg>bb</svg>");
+  setSchematicView("breadboard"); // the legacy toggle must not leak across tabs
+  assert.equal($("schematic-svg").innerHTML, "<svg>cards</svg>");
+  assert.equal($("cook-schematic-svg").innerHTML, "<svg>bb</svg>");
+  setSchematicView("cards");
+  const realFetch3 = globalThis.fetch;
+  learnSid = "tab-sid";
+  learnStepN = 2;
+  schematicState.sid = "";
+  cookSchematicState.sid = "";
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({
+    n: 2, svg: "<svg>cards2</svg>", breadboard_svg: "<svg>bb2</svg>",
+    netlist: { wires: [], notes: [] }, unresolved: [] }) });
+  await fetchSchematic("cook-schematic-svg", "cook-schematic-wires",
+    cookSchematicState, "cook-schematic-sel", 2);
+  assert.equal(cookSchematicState.n, 2);
+  assert.equal(schematicState.n, 2); // sibling tab shares the step
+  assert.equal($("schematic-svg").innerHTML, "<svg>cards2</svg>");
+  assert.equal($("cook-schematic-svg").innerHTML, "<svg>bb2</svg>");
+  globalThis.fetch = realFetch3;
+  learnSid = "";
+  console.log("PASS schematic-tabs");
+
+  // 16. Schematic zoom: each tab zooms independently (50-300%), both
+  // come up at 50% so the whole circuit fits, and repaints keep the
+  // adjustment until Fit resets it.
+  assert.equal(schematicZoom["schematic-svg"], 0.5); // default 50%
+  assert.equal(schematicZoom["cook-schematic-svg"], 0.5);
+  setSchematicZoom("schematic-svg", 1.5);
+  assert.equal($("schematic-zoom-label").textContent, "150%");
+  setSchematicZoom("cook-schematic-svg", 0.5);
+  assert.equal($("cook-schematic-zoom-label").textContent, "50%");
+  setSchematicZoom("schematic-svg", 9); // clamps to 300%
+  assert.equal($("schematic-zoom-label").textContent, "300%");
+  paintSchematic("schematic-svg", "schematic-sel", schematicState, false, 0);
+  assert.equal($("schematic-zoom-label").textContent, "300%"); // repaint keeps zoom
+  resetSchematicZoom();
+  assert.equal($("schematic-zoom-label").textContent, "50%");
+  assert.equal($("cook-schematic-zoom-label").textContent, "50%");
+  setSchematicZoom("schematic-svg", 2);
+  $("schematic-zoom-fit").onclick();
+  assert.equal($("schematic-zoom-label").textContent, "50%"); // Fit restores 50%
+  setSchematicZoom("cook-schematic-svg", 2);
+  $("cook-schematic-zoom-fit").onclick();
+  assert.equal($("cook-schematic-zoom-label").textContent, "50%");
+  console.log("PASS schematic-zoom");
+
+  // 17. Step summary: one flowing narration with transitions, ids
+  // matching the diagram, and a single Next Step action per step.
+  appRevealed = true;
+  cookView = { state: "BUILDING", instruction: "wire it" };
+  const sumWires = [
+    { part: "bme280", part_pin: "SDA", board_pin: "GPIO21", step_added: 2,
+      part_title: "BME280 Sensor", color_name: "red" },
+    { part: "bme280", part_pin: "SCL", board_pin: "GPIO22", step_added: 2,
+      part_title: "BME280 Sensor", color_name: "" },
+    { part: "oled", part_pin: "SDA", board_pin: "GPIO21", step_added: 2,
+      part_title: "OLED Display", color_name: "blue" },
+  ];
+  const summary = stepSummaryItems(sumWires, 2, "ESP32 DevKit");
+  assert.equal(summary.length, 5); // intro + 3 wires + outro
+  assert.equal(summary[0].phrase, "Step 2 has 3 connections.");
+  assert.ok(summary[1].phrase.indexOf("First, connect the GPIO21") === 0);
+  assert.ok(summary[1].phrase.indexOf("using a red wire") >= 0);
+  assert.equal(summary[1].id, schematicWireId(sumWires[0]));
+  assert.ok(summary[2].phrase.indexOf("Next, connect the GPIO22") === 0);
+  assert.ok(summary[3].phrase.indexOf("Finally, connect the GPIO21") === 0);
+  assert.equal(summary[4].phrase, "Tap Next Step when everything is wired.");
+  const single = stepSummaryItems([sumWires[0]], 1, "ESP32 DevKit");
+  assert.equal(single.length, 3);
+  assert.equal(single[0].phrase, "Step 1 has one connection.");
+  assert.ok(single[1].phrase.indexOf("connect the GPIO21") === 0); // no lead word
+  assert.deepEqual(stepSummaryItems([], 1, "ESP32 DevKit"), []);
+  // The primary action skips per-wire stops: one tap per step.
+  assert.deepEqual(
+    coachPrimaryAction({ phase: "BUILDING", serverState: "BUILDING",
+      wiresTotal: 4, wireIdx: 4, wireAcked: false, stepN: 2, stepsTotal: 4 }),
+    { id: "next-step", label: "Next Step" });
+  assert.deepEqual(
+    coachPrimaryAction({ phase: "BUILDING", serverState: "DONE",
+      wiresTotal: 0, wireIdx: 0, wireAcked: false, stepN: 4, stepsTotal: 4 }),
+    { id: "deploy", label: "Deploy Firmware" });
+  assert.deepEqual(
+    coachPrimaryAction({ phase: "BUILDING", serverState: "BUILDING",
+      wiresTotal: 0, wireIdx: 0, wireAcked: false, stepN: 4, stepsTotal: 4 }),
+    { id: "deploy", label: "Deploy Firmware" });
+  console.log("PASS step-summary");
+
+  // 18. Code tab + visible-tab animation: the stage code panel fills
+  // from any fetch, and only the active tab's diagram animates.
+  learnSid = "code-sid";
+  paintStageCode("void setup() {}", "draft (1 of 4 steps verified)");
+  assert.equal($("stage-code-out").textContent, "void setup() {}");
+  assert.equal($("stage-code-kind").textContent, "draft (1 of 4 steps verified)");
+  assert.equal(stageCodeSid, "code-sid");
+  learnSid = "";
+  assert.equal(schematicActiveSvgId(), "cook-schematic-svg"); // no tabs under stubs
+  console.log("PASS code-panel");
+
+  // 19. Narration self-heals: naming a wire clears any parked dash
+  // hiding so dots-without-wires can never strand a step.
+  ensureWireDrawn("nope-svg", "wire-x"); // missing box: silent no-op
+  ensureWireDrawn("svg", ""); // empty id: silent no-op
+  const drawBox = $("draw-svg");
+  const hiddenPath = { style: { strokeDasharray: "180",
+    strokeDashoffset: "180", animation: "none" } };
+  const drawGroup = { classList: { remove() {}, add() {}, toggle() {},
+      contains() { return false; } },
+    querySelectorAll: () => [hiddenPath] };
+  drawBox.querySelector = () => drawGroup;
+  ensureWireDrawn("draw-svg", "wire-bme280-SDA");
+  assert.equal(hiddenPath.style.strokeDasharray, "none");
+  assert.equal(hiddenPath.style.strokeDashoffset, "0");
+  console.log("PASS ensure-drawn");
+
+  // 20. Background narration: the leaf bubble hides while building
+  // (voice carries it), returns for reveal/done, clears on exit.
+  cookMode = true;
+  learnSid = "narr-sid";
+  appRevealed = true;
+  appFault = false;
+  monitorOn = false;
+  flashBusy = false;
+  $("flash-dialog").hidden = true;
+  learnStepN = 2;
+  learnStepTotal = 4;
+  cookView = { state: "BUILDING", steps_total: 4, instruction: "wire it" };
+  paintCoachBar();
+  assert.equal(document.body.classList.contains("hide-narration"), true);
+  cookView = { state: "DONE", steps_total: 4, instruction: "done" };
+  paintCoachBar();
+  assert.equal(document.body.classList.contains("hide-narration"), false);
+  cookMode = false;
+  paintCoachBar();
+  assert.equal(document.body.classList.contains("hide-narration"), false);
+  learnSid = "";
+  cookView = null;
+  console.log("PASS hide-narration");
+
+  // 21. Dynamic port pick: keep live selections, auto-pick a lone
+  // (or lone-USB) board, never invent a phantom default.
+  const portList = [
+    { port: "COM3", description: "Communications Port", hwid: "ACPI" },
+    { port: "COM4", description: "USB-SERIAL CH340", hwid: "USB VID:PID=1A86" },
+  ];
+  assert.equal(pickFlashPort(portList, "COM4"), "COM4"); // live keep wins
+  assert.equal(pickFlashPort(portList, ""), "COM4"); // lone USB board
+  assert.equal(pickFlashPort([{ port: "COM9" }], ""), "COM9"); // lone port
+  assert.equal(pickFlashPort(portList, "COM7"), "COM4"); // stale keep reseats
+  assert.equal(pickFlashPort([], ""), "");
+  const twoUsb = [{ port: "COM4", description: "USB Serial", hwid: "USB" },
+    { port: "COM5", description: "USB Serial", hwid: "USB" }];
+  assert.equal(pickFlashPort(twoUsb, ""), ""); // ambiguous stays explicit
+  assert.equal(pickFlashPort(["COM3"], ""), "COM3"); // plain names work
+  const loneBt = [{ port: "COM3",
+    description: "Standard Serial over Bluetooth link",
+    hwid: "BTHENUM\\VID&0000\\0" }];
+  assert.equal(pickFlashPort(loneBt, ""), ""); // lone BT phantom never auto-picks
+  const loneLegacy = [{ port: "COM1", description: "Communications Port",
+    hwid: "ACPI\\PNP0501\\0" }];
+  assert.equal(pickFlashPort(loneLegacy, ""), ""); // lone legacy UART never auto-picks
+  assert.equal(pickFlashPort(portList, "COM3"), "COM3"); // explicit keep wins
+  console.log("PASS pick-port");
+
+  // 22. Enter in the project box suggests, like the button.
+  busy = false;
+  $("learn-project").value = "";
+  $("talk-hint").textContent = "";
+  $("learn-project").onkeydown({ key: "Enter", preventDefault() {} });
+  assert.equal($("talk-hint").textContent,
+    "Upload a parts photo or name a project first.");
+  $("talk-hint").textContent = "";
+  $("learn-project").onkeydown({ key: "x", preventDefault() {} });
+  assert.equal($("talk-hint").textContent, "");
+  console.log("PASS enter-suggest");
+
+  // 23. Browser flash is visible: the bar shows the latest step, the
+  // dialog keeps the terminal, progress drives both meters.
+  $("flash-console").textContent = "";
+  webLog("cook-flash-status", "Compiling on server…");
+  assert.equal($("cook-flash-status").textContent, "Compiling on server…");
+  assert.ok($("flash-console").textContent.indexOf("Compiling on server…") >= 0);
+  webLog("cook-flash-status", "Build abc123 — downloading 2 file(s)…");
+  assert.equal($("cook-flash-status").textContent,
+    "Build abc123 — downloading 2 file(s)…");
+  flashDialogOpen("Flashing from the browser…");
+  assert.equal($("flash-console").textContent, "");
+  assert.equal($("flash-dialog").hidden, false);
+  flashDialogProgress(0.5);
+  assert.equal($("flash-progress").value, 50);
+  flashDialogDone(true, "Browser flash complete.");
+  assert.equal($("flash-progress").value, 100);
+  assert.equal($("flash-summary").textContent, "Browser flash complete.");
+  console.log("PASS webflash-dialog");
+
+  // 24. Chunk sizing: server synthesis runs ~50ms/char, so chunks stay
+  // small enough that first audio sounds in ~2s warm; monster
+  // sentences split at word gaps and silent pieces stay dropped.
+  const sized = splitSpeakChunks("Nice work. Next: wire the sensor to GPIO4 " +
+    "and ground, then flash the firmware and watch the monitor.");
+  assert.ok(sized.length >= 2);
+  assert.ok(sized.every((c) => c.length <= 60),
+    "chunk over 60 chars: " + JSON.stringify(sized));
+  assert.ok(sized[0].length <= 55);
+  const monster = splitSpeakChunks(
+    "Wire the HC-SR04 above the bin opening facing forward for hand " +
+    "detection with VCC to VIN and ground to ground and TRIG to GPIO4.");
+  assert.ok(monster.length >= 2);
+  assert.ok(monster.every((c) => c.length <= 60));
+  assert.deepEqual(splitSpeakChunks("Okay... ... Yes."), ["Okay... Yes."]);
+  console.log("PASS chunk-sizing");
+
+  // 25. Mute is total: fallback speech never sounds while muted (a
+  // leaking utterance masks the muted state), and sounds again after
+  // unmuting.
+  const spokenBefore = globalThis.__spoken.length;
+  muted = true;
+  speakBrowserNow("You should not hear this.");
+  assert.equal(globalThis.__spoken.length, spokenBefore);
+  muted = false;
+  speakBrowserNow("Audible.");
+  assert.equal(globalThis.__spoken.length, spokenBefore + 1);
+  console.log("PASS mute-total");
 })();
 `;
 

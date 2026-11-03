@@ -106,7 +106,7 @@ class LearningLoopTest(unittest.TestCase):
                     "weather", PLAN_2STEP, visible_parts=["esp32", "bme280"],
                     session_id="learn-fast", project_title="Weather station")
         # Zero model calls on the start path: the roll call answers
-        # now, chapters warm in the background.
+        # now, chapters and firmware warm in the background.
         self.assertEqual(calls, [])
         self.assertEqual(view["state"], "ROLLCALL")
         self.assertIn("READY", view["speak"])
@@ -115,7 +115,7 @@ class LearningLoopTest(unittest.TestCase):
         self.assertEqual(len(self.orc.session["chapters"]), 2)
         self.assertEqual(self.orc.session["chapters"][0]["teach"], "")
         self.assertEqual({t["name"] for t in threads},
-                         {"fundiloop-chapters"})
+                         {"fundiloop-chapters", "fundiloop-firmware"})
         self.assertTrue(all(t["daemon"] for t in threads))
         fill = next(t for t in threads
                     if t["name"] == "fundiloop-chapters")
@@ -220,7 +220,10 @@ class LearningLoopTest(unittest.TestCase):
         text = learning_code_prompt("t", [], [], {}, {})
         self.assertIn("Serial", text)
         self.assertIn("115200", text)
-        self.assertIn("STATUS", text)
+        # Tagged per-device telemetry is the mandated shape; legacy
+        # STATUS lines stay parseable only as a fallback.
+        self.assertIn("DEVICE | METRIC | VALUE | UNIT", text)
+        self.assertIn("HEARTBEAT", text)
 
     def test_done_stays_done(self):
         self.orc.start_learning_session(

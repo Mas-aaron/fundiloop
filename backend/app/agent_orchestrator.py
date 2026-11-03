@@ -329,6 +329,11 @@ class AgentOrchestrator:
         }
         self.sessions[sid] = self.session
         self.current_id = sid
+        # Firmware warms in the background from the tap: by the time
+        # the learner opens the Code tab or deploys, checked firmware
+        # is already cached (failures stay silent here; the fetch
+        # retries honestly on demand).
+        self._start_firmware_warmup(self.session)
         # Instant start: the parts roll call answers now with zero
         # model calls on the critical path, while a proven-real adapter
         # enriches every chapter in the background and swaps the full
@@ -446,6 +451,47 @@ class AgentOrchestrator:
             name="fundiloop-stretch", daemon=True)
         worker.start()
 
+    def _warm_firmware(self, session: dict) -> None:
+        """Generate the session's firmware ahead of need (worker).
+
+        Runs off the request path after session start and every step
+        advance. generate_code applies every gate (usable output,
+        telemetry contract) and caches only passing firmware; any
+        failure leaves the cache empty and the on-demand fetch stays
+        the honest path (it retries and surfaces the error then).
+        """
+        try:
+            from .adapters import MetaAPIError
+            from .learning import generate_code
+
+            generate_code(session, self.Muse)
+        except MetaAPIError as exc:
+            # Routine model failure (timeout, stub): one line, no
+            # traceback flood — the on-demand fetch retries honestly.
+            _log.warning("firmware warmup failed (%s); on-demand fetch stands",
+                         exc)
+        except Exception:
+            _log.exception("firmware warmup failed; on-demand fetch stands")
+        finally:
+            try:
+                session["_warming"] = False
+            except Exception:
+                pass
+
+    def _start_firmware_warmup(self, session: dict) -> None:
+        """Fire _warm_firmware on a daemon thread (off the request).
+
+        One warmer per session at a time; it caches under the key it
+        computes, so a step taken mid-warm simply refetches on demand.
+        """
+        if session.get("_warming"):
+            return
+        session["_warming"] = True
+        worker = threading.Thread(
+            target=self._warm_firmware, args=(session,),
+            name="fundiloop-firmware", daemon=True)
+        worker.start()
+
     def advance_learning_step(self, session_id: str,
                               transcript: str = "") -> dict:
         """Advance because the learner said they finished this step.
@@ -523,6 +569,8 @@ class AgentOrchestrator:
                           "passed": True,
                           "measured": "%d consecutive healthy lines"
                                       % proof["healthy"]})
+            # Proof evidence changes the firmware key: rewarm for it.
+            self._start_firmware_warmup(s)
         verification = {"test": "TELEMETRY", "passed": True,
                         "measured": "%d consecutive healthy lines"
                                     % proof["healthy"]}
@@ -552,6 +600,8 @@ class AgentOrchestrator:
         self._log_learning_confirmation(s, step, verification, confirmed_by)
         idx = s["step_index"] + 1
         s["step_index"] = idx
+        # Evidence grew, so the firmware key changed: rewarm for it.
+        self._start_firmware_warmup(s)
         if idx >= len(s["plan"]):
             s["completed_at"] = _now()
             s["code_ready"] = True
@@ -956,7 +1006,8 @@ class AgentOrchestrator:
 
         text = self.Muse.complete_text(
             DESCRIBE_SYSTEM, describe_scene_prompt(sam.get("detections", [])),
-            image_b64=base64.b64encode(frame).decode("ascii")).strip()
+            image_b64=base64.b64encode(frame).decode("ascii"),
+            json_mode=False).strip()
         if not text:
             return "Muse returned an empty description for this frame."
         return text

@@ -777,14 +777,14 @@ def api_project_guide(session_id: str):
     return {"session_id": session_id, **guide}
 
 
-def _resolve_final_code(session_id: str, action: str):
-    """Session + final code for the project flash endpoint (pre-stream).
+def _resolve_final_session(session_id: str, action: str):
+    """Fast pre-stream checks for the project flash endpoints (no model calls).
 
-    Raises 404s, ESP32-only 400, wiring-incomplete 409, Meta 502.
-    Deploy unlocks once the wiring is done (final step reached),
-    before telemetry proof exists. Split from the compile so the SSE
-    endpoint validates eagerly with real HTTP codes, then streams.
-    Returns (session, code).
+    Raises 404s, ESP32-only 400, wiring-incomplete 409. Split from the
+    slow firmware generation so the SSE endpoint validates eagerly
+    with real HTTP codes, then streams the generation live instead of
+    sitting silent until the first frame.
+    Returns the session.
     """
     session = orchestrator.sessions.get(session_id)
     if session is None or not session.get("learning"):
@@ -800,6 +800,20 @@ def _resolve_final_code(session_id: str, action: str):
             status_code=409,
             detail="wire every step first: step %d of %d" % (
                 session.get("step_index", 0) + 1, len(plan)))
+    return session
+
+
+def _resolve_final_code(session_id: str, action: str):
+    """Session + final code for the project flash endpoint (pre-stream).
+
+    Raises 404s, ESP32-only 400, wiring-incomplete 409, Meta 502.
+    Deploy unlocks once the wiring is done (final step reached),
+    before telemetry proof exists. Blocking endpoints resolve code
+    eagerly; the SSE endpoint streams it (see below) so the dialog
+    never sits empty during generation.
+    Returns (session, code).
+    """
+    session = _resolve_final_session(session_id, action)
     try:
         code = generate_code(session, orchestrator.Muse)
     except MetaAPIError as exc:
@@ -809,6 +823,26 @@ def _resolve_final_code(session_id: str, action: str):
             status_code=409,
             detail="final code unavailable: nothing to %s" % action)
     return session, code
+
+
+def _iter_flash_stream_with_code(session_id: str, port: str, session: dict):
+    """SSE frames for the final flash, generating code live in-stream.
+
+    The first frame announces generation immediately, so the dialog
+    fills before the slow model call; a model failure becomes an
+    error frame (the frontend already renders those), never a hang.
+    """
+    yield _sse("log", {"line": "Generating firmware on server…"})
+    try:
+        code = generate_code(session, orchestrator.Muse)
+    except MetaAPIError as exc:
+        yield _sse("error", {"detail": str(exc)})
+        return
+    if not code:
+        yield _sse("error",
+                   {"detail": "final code unavailable: nothing to flash"})
+        return
+    yield from iter_final_flash_events(session_id, port, code)
 
 
 def _resolve_final_build(session_id: str, action: str):
@@ -1011,13 +1045,16 @@ def api_project_flash_stream(session_id: str, body: dict | None = None):
     """Final flash as SSE: ack -> log*/progress* -> done|error.
 
     Same validation and audit trail as the blocking final flash; the
-    terminal dialog consumes the live lines. Port + code validate
-    eagerly with real HTTP codes before the first frame.
+    terminal dialog consumes the live lines. Port + session checks
+    validate eagerly with real HTTP codes before the first frame; the
+    slow firmware generation runs inside the stream (announced first)
+    so the dialog never sits empty, and a model failure arrives as an
+    error frame instead of a hang.
     """
     port = _require_flash_port(session_id, "final", body)
-    _, code = _resolve_final_code(session_id, "flash")
+    session = _resolve_final_session(session_id, "flash")
     return StreamingResponse(
-        iter_final_flash_events(session_id, port, code),
+        _iter_flash_stream_with_code(session_id, port, session),
         media_type="text/event-stream")
 
 
@@ -1152,10 +1189,12 @@ def api_telemetry_stream(session_id: str, port: str = "",
 def api_telemetry_diagnose(session_id: str, body: dict | None = None):
     """One model diagnosis for a stalled telemetry stream.
 
-    Body {"lines": [...recent device lines]}. Returns {"message",
-    "suspect"}: spoken-safe guidance plus the suspect netlist wire
-    (part, part_pin, board_pin) or null. Always 200: model failure
-    falls back to honest generic guidance.
+    Body {"lines": [...recent device lines], "device": tag or null,
+    "healthy": [...]}. Returns {"message", "suspect", "part_wires"}:
+    spoken-safe guidance plus the suspect netlist wire (part,
+    part_pin, board_pin) or null, plus every wire on the suspect's
+    part. Always 200: model failure falls back to honest generic
+    guidance.
     """
     from .schematic import build_netlist
     from .telemetry import diagnose_telemetry
@@ -1170,8 +1209,11 @@ def api_telemetry_diagnose(session_id: str, body: dict | None = None):
     net = build_netlist(plan, max(numbers) if numbers else 0,
                         session.get("pin_map", {}) or {})
     lines = list((body or {}).get("lines") or [])
+    device = (body or {}).get("device") or None
+    healthy = list((body or {}).get("healthy") or [])
     return diagnose_telemetry(lines, net, session.get("project_title", ""),
-                              orchestrator.Muse, session.get("board"))
+                              orchestrator.Muse, session.get("board"),
+                              device, healthy)
 
 
 @app.post("/api/config/serial")

@@ -315,7 +315,13 @@ def _samples_to_wav(samples, sample_rate: int) -> bytes:
 
 
 def _kokoro_engine():
-    """Load (once per model dir) the kokoro-onnx engine. Never partially built."""
+    """Load (once per model dir) the kokoro-onnx engine. Never partially built.
+
+    The ~5s model load runs OUTSIDE the lock (double-checked): a first
+    speak racing server-startup warmup otherwise waits behind the load
+    and times out to browser speech. Two threads racing the load both
+    build, then setdefault keeps one — a wasted load, never a torn one.
+    """
     try:
         from kokoro_onnx import Kokoro
     except ImportError as exc:
@@ -334,13 +340,14 @@ def _kokoro_engine():
     key = (model_path, voices_path)
     with _kokoro_lock:
         engine = _kokoro_engines.get(key)
-        if engine is None:
-            try:
-                engine = Kokoro(model_path, voices_path)
-            except Exception as exc:
-                raise MetaAPIError("kokoro failed to load: %s" % exc) from exc
-            _kokoro_engines[key] = engine
-        return engine
+    if engine is None:
+        try:
+            fresh = Kokoro(model_path, voices_path)
+        except Exception as exc:
+            raise MetaAPIError("kokoro failed to load: %s" % exc) from exc
+        with _kokoro_lock:
+            engine = _kokoro_engines.setdefault(key, fresh)
+    return engine
 
 
 class KokoroTTSProvider:

@@ -651,7 +651,7 @@ def render_breadboard_svg(netlist: dict, step_n: int) -> str:
         % escape("Step %s breadboard layout (%s)" % (step_n, board)),
         '<rect width="100%" height="100%" fill="#0a0a0c"/>',
         '<text x="24" y="22" font-family="sans-serif" font-size="12" '
-        'fill="#71717a">Step %s — breadboard (toggle pin cards anytime)'
+        'fill="#71717a">Step %s — breadboard view'
         "</text>" % step_n,
         '<g id="breadboard" transform="translate(%d %d)">' % (bb_x, bb_y),
     ]
@@ -662,22 +662,22 @@ def render_breadboard_svg(netlist: dict, step_n: int) -> str:
     out.append('<g id="part-esp32" class="schematic-part" data-step="1">')
     out.append("<title>ESP32 DevKit v1 (Board)</title>")
     out.append(
-        '<rect x="%d" y="%d" width="%d" height="%d" rx="16" fill="#141418" '
+        '<rect x="%d" y="%d" width="%d" height="%d" rx="12" fill="#141418" '
         'stroke="#2a2a32" stroke-width="1.4"/>'
         % (esp_x, esp_y, CARD_W, esp_h))
-    out.append(_icon("esp32", esp_x + 26, esp_y + 30))
+    out.append(_icon("esp32", esp_x + 22, esp_y + 26))
     out.append(
-        '<text x="%d" y="%d" font-family="sans-serif" font-size="13" '
+        '<text x="%d" y="%d" font-family="sans-serif" font-size="12" '
         'font-weight="700" fill="#f4f4f5">ESP32 DevKit v1</text>'
-        % (esp_x + 44, esp_y + 28))
+        % (esp_x + 40, esp_y + 24))
     out.append(
-        '<text x="%d" y="%d" font-family="sans-serif" font-size="10" '
-        'fill="#9ca3af">Board</text>' % (esp_x + 44, esp_y + 44))
+        '<text x="%d" y="%d" font-family="sans-serif" font-size="9" '
+        'fill="#9ca3af">Board</text>' % (esp_x + 40, esp_y + 38))
     for pin, py in esp_pins:
         out.append(
-            '<text x="%d" y="%d" font-family="sans-serif" font-size="11" '
+            '<text x="%d" y="%d" font-family="sans-serif" font-size="10" '
             'fill="#d4d4d8">%s</text>'
-            % (esp_x + 16, py + 4, escape(pin)))
+            % (esp_x + 12, py + 4, escape(pin)))
         out.append(
             '<circle cx="%d" cy="%d" r="3.2" fill="#3f3f46"/>'
             % (esp_x + CARD_W - 10, py))
@@ -693,7 +693,7 @@ def render_breadboard_svg(netlist: dict, step_n: int) -> str:
                 out.extend(_card(
                     "part-usb_c", 1, x, y, CARD_W, h,
                     "USB-C 5V Adapter", "Power",
-                    _icon("usb_c", x + 26, y + 30), pins, pin_side))
+                    _icon("usb_c", x + 22, y + 26), pins, pin_side))
                 placed[name] = {"x": x, "y": y, "h": h, "pins": {
                     "+5V": pins[0][1], "GND": pins[1][1]}}
             else:
@@ -709,7 +709,7 @@ def render_breadboard_svg(netlist: dict, step_n: int) -> str:
                 out.extend(_card(
                     "part-" + name, step, x, y, CARD_W, h,
                     _title(name), _kind(name),
-                    _icon(name, x + 26, y + 30), pins, pin_side))
+                    _icon(name, x + 22, y + 26), pins, pin_side))
                 placed[name] = {"x": x, "y": y, "h": h, "pins": pin_map}
             y += h + 16
         return placed

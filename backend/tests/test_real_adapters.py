@@ -481,7 +481,7 @@ class RealAdapterTests(unittest.TestCase):
             "mock": False, "detections": [], "notes": "SAM 3.1: 0 regions",
             "wires_ok": None}
 
-        def fake_complete(system, user, image_b64=None):
+        def fake_complete(system, user, image_b64=None, **kwargs):
             seen["system"] = system
             seen["user"] = user
             seen["image"] = image_b64

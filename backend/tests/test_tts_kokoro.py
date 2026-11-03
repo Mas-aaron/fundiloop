@@ -342,6 +342,27 @@ class KokoroSynthesizeTests(unittest.TestCase):
                                           "KOKORO_MODEL_DIR": self.tmp.name}):
             self.assertFalse(tts_mod.warmup_kokoro())
 
+    def test_engine_load_does_not_hold_lock(self):
+        from backend.app import tts as tts_mod
+
+        module = install_fake_kokoro(self)
+        for name in ("kokoro-v1.0.onnx", "voices-v1.0.bin"):
+            with open(os.path.join(self.tmp.name, name), "wb") as fh:
+                fh.write(b"fake")
+        held = []
+        real_kokoro = module.Kokoro
+
+        class SpyKokoro(real_kokoro):
+            def __init__(self, *args, **kwargs):
+                held.append(tts_mod._kokoro_lock.locked())
+                super().__init__(*args, **kwargs)
+
+        module.Kokoro = SpyKokoro
+        with mock.patch.dict(os.environ,
+                             {"KOKORO_MODEL_DIR": self.tmp.name}):
+            tts_mod._kokoro_engine()
+        self.assertEqual(held, [False])
+
 
 class KokoroNormalizationTests(unittest.TestCase):
     def _frames(self, samples):

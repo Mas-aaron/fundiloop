@@ -250,6 +250,12 @@ class LibraryAutoInstallTest(unittest.TestCase):
         self.assertEqual(fb.needed_libraries("void setup(){} void loop(){}"),
                          [])
 
+    def test_needed_libraries_maps_esp32_servo(self):
+        self.assertEqual(
+            fb.needed_libraries("#include <ESP32Servo.h>\n"
+                                "void setup(){} void loop(){}"),
+            ["ESP32Servo"])
+
     def test_installs_only_missing_before_compile(self):
         calls = []
         out = fb.compile_sketch(

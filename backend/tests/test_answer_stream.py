@@ -223,5 +223,24 @@ class AnswerEventsTest(unittest.TestCase):
         self.assertIn(("/api/answer/stream", ("POST",)), routes)
 
 
+class CompleteTextJsonModeTest(unittest.TestCase):
+    def test_prose_mode_omits_response_format(self):
+        with mock.patch.dict(os.environ, {"META_API_KEY": "test"}):
+            comp = stream_client(self, fallback_text="raw code here")
+            out = MetaClaudeAdapter(model="m", mock=False).complete_text(
+                "sys", "user", json_mode=False)
+        self.assertEqual(out, "raw code here")
+        self.assertNotIn("response_format", comp.calls[0])
+
+    def test_default_keeps_json_object(self):
+        with mock.patch.dict(os.environ, {"META_API_KEY": "test"}):
+            comp = stream_client(self, fallback_text='{"a": 1}')
+            out = MetaClaudeAdapter(model="m", mock=False).complete_text(
+                "sys", "user")
+        self.assertEqual(out, '{"a": 1}')
+        self.assertEqual(comp.calls[0]["response_format"],
+                         {"type": "json_object"})
+
+
 if __name__ == "__main__":
     unittest.main()

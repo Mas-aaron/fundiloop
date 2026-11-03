@@ -29,6 +29,50 @@ def _mock_enabled() -> bool:
 BME_ADDRS = ("0x76", "0x77")
 OLED_ADDR = "0x3C"
 
+_PLAN_MARKER = "You plan verifiable electronics builds."
+_REQUEST_MARKER = "The user asked to build: "
+
+
+def _mock_plan_payload(system: str) -> str | None:
+    """Canned planning answer so the UI path runs offline in mock mode.
+
+    Returns None for non-planning prompts (those keep the "{}" stub).
+    The title echoes the sanitized request behind a fixed "Mock build"
+    lead so it is always a short noun phrase, never a question, and
+    always shares a content word with the request (no miss-hint).
+    """
+    if _PLAN_MARKER not in (system or ""):
+        return None
+    request = ""
+    for line in (system or "").splitlines():
+        if line.startswith(_REQUEST_MARKER):
+            request = line[len(_REQUEST_MARKER):].rstrip().rstrip(".")
+            break
+    words = [w for w in re.findall(r"[A-Za-z0-9']+", request)][:5]
+    if words:
+        title = "Mock build " + " ".join(words)
+        deps: list = ["hc_sr04", "jumper_wire"]
+    else:
+        title = "Mock sensor project"
+        deps = []
+    return json.dumps({"projects": [{
+        "id": "mock-plan-1", "title": title,
+        "summary": "Mock plan for offline UI verification.",
+        "steps": [
+            {"n": 1,
+             "instruction": "Wire the HC-SR04: VCC to VIN, GND to GND, "
+                            "TRIG to GPIO4, ECHO to GPIO5.",
+             "verify": "CHECK_GPIO", "expect": "echo pulse on GPIO5",
+             "depends_on_parts": deps},
+            {"n": 2,
+             "instruction": "Flash the firmware and open the serial "
+                            "monitor at 115200 baud.",
+             "verify": "CHECK_SERIAL",
+             "expect": "distance lines on serial",
+             "depends_on_parts": []},
+        ],
+        "missing_parts": [], "alternatives": []}]})
+
 SYSTEM_PROMPT = """You are FundiLoop, a verifiable assembly and diagnostic agent for embedded hardware.
 The target circuit is an ESP32 DevKit with a BME280 sensor over I2C (0x76 or 0x77), an SSD1306 OLED over I2C (0x3C), and an LED on GPIO 2.
 A technician builds or repairs this circuit while you see the overhead frame photo, SAM vision regions, serial probe measurements, and an optional code snippet.
@@ -82,18 +126,30 @@ class MetaClaudeAdapter:
     def complete_text(self, system: str, user: str,
                       image_b64: str | None = None,
                       video_b64: str | None = None,
-                      video_mime: str = "video/mp4") -> str:
+                      video_mime: str = "video/mp4",
+                      timeout_s: float | None = None,
+                      json_mode: bool = True) -> str:
         """Free-form Muse Spark completion for discovery/live (raw text out).
 
         A still goes in as image_url; a clip as a video_url part (Muse Spark
         reads frames and any embedded audio). Callers own JSON parsing and
-        retry policy. Mock mode returns "{}".
+        retry policy. Mock mode returns a canned plan for planning
+        prompts and "{}" otherwise. Long generations (firmware)
+        pass timeout_s to outlast the snappy default; None keeps it.
+        json_mode defaults True for the JSON callers (planning,
+        chapters, telemetry); prose callers (firmware, guidance,
+        describe) MUST pass False, or the API's json_object format
+        fights the prompt and every reply comes back a JSON stub.
         """
         if self.mock:
             if not mock_meta_enabled():
                 raise MetaAPIError("mock Muse adapter called with MOCK_META=false")
+            plan = _mock_plan_payload(system)
+            if plan is not None:
+                return plan
             return "{}"
-        return self._real_complete(system, user, image_b64, video_b64, video_mime)
+        return self._real_complete(system, user, image_b64, video_b64,
+                                   video_mime, timeout_s, json_mode)
 
     def complete_text_stream(self, system: str, user: str,
                              image_b64: str | None = None,
@@ -208,31 +264,34 @@ class MetaClaudeAdapter:
                        image_b64: str | None = None,
                        video_b64: str | None = None,
                        video_mime: str = "video/mp4",
+                       timeout_s: float | None = None,
                        json_mode: bool = True) -> str:
         return self._real_chat(self._complete_messages(system, user, image_b64,
                                                        video_b64, video_mime),
-                               json_mode)
+                               json_mode, timeout_s)
 
-    def _real_chat(self, messages: list, json_mode: bool = True) -> str:
+    def _real_chat(self, messages: list, json_mode: bool = True,
+                   timeout_s: float | None = None) -> str:
         """POST one chat message list; parse, log, and return the text."""
         import time
 
         if not api_key():
             raise MetaAPIError("META_API_KEY is not set")
         started = time.monotonic()
+        timeout = timeout_s or api_timeout()
         try:
             client = self._api_client()
             if json_mode:
                 try:
                     raw_resp = client.chat.completions.with_raw_response.create(
-                        model=self.model, messages=messages,
+                        model=self.model, messages=messages, timeout=timeout,
                         response_format={"type": "json_object"})
                 except Exception:
                     raw_resp = client.chat.completions.with_raw_response.create(
-                        model=self.model, messages=messages)
+                        model=self.model, messages=messages, timeout=timeout)
             else:
                 raw_resp = client.chat.completions.with_raw_response.create(
-                    model=self.model, messages=messages)
+                    model=self.model, messages=messages, timeout=timeout)
             status = getattr(raw_resp, "status_code", "?")
             headers = getattr(raw_resp, "headers", {}) or {}
             request_id = (

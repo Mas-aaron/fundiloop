@@ -99,12 +99,12 @@ KINDS = {
     "potentiometer": "Input",
 }
 
-CARD_W = 188
-PIN_H = 26
-HEADER_H = 64
-PAD = 14
-ESP_W = 220
-GAP = 56
+CARD_W = 168
+PIN_H = 22
+HEADER_H = 52
+PAD = 10
+ESP_W = 188
+GAP = 48
 
 
 def _color(signal: object) -> str:
@@ -182,11 +182,11 @@ def _icon(name: str, cx: int, cy: int) -> str:
         )
     if name == "hc_sr04":
         return (
-            '<circle cx="%d" cy="%d" r="7" fill="none" stroke="#9ca3af" '
+            '<circle cx="%d" cy="%d" r="6" fill="none" stroke="#9ca3af" '
             'stroke-width="1.6"/>'
-            '<circle cx="%d" cy="%d" r="7" fill="none" stroke="#9ca3af" '
+            '<circle cx="%d" cy="%d" r="6" fill="none" stroke="#9ca3af" '
             'stroke-width="1.6"/>'
-            % (cx - 10, cy, cx + 10, cy)
+            % (cx - 8, cy, cx + 8, cy)
         )
     return (
         '<rect x="%d" y="%d" width="20" height="14" rx="2" fill="none" '
@@ -202,28 +202,28 @@ def _card(gid: str, step: int, x: int, y: int, w: int, h: int,
         '<g id="%s" class="schematic-part" data-step="%d">'
         % (svg_id(gid), step),
         "<title>%s</title>" % escape("%s (%s)" % (title, kind)),
-        '<rect x="%d" y="%d" width="%d" height="%d" rx="16" fill="#141418" '
+        '<rect x="%d" y="%d" width="%d" height="%d" rx="12" fill="#141418" '
         'stroke="#2a2a32" stroke-width="1.4"/>' % (x, y, w, h),
         icon,
-        '<text x="%d" y="%d" font-family="sans-serif" font-size="13" '
+        '<text x="%d" y="%d" font-family="sans-serif" font-size="12" '
         'font-weight="700" fill="#f4f4f5">%s</text>'
-        % (x + 44, y + 28, escape(title)),
-        '<text x="%d" y="%d" font-family="sans-serif" font-size="10" '
-        'fill="#9ca3af">%s</text>' % (x + 44, y + 44, escape(kind)),
+        % (x + 40, y + 24, escape(title)),
+        '<text x="%d" y="%d" font-family="sans-serif" font-size="9" '
+        'fill="#9ca3af">%s</text>' % (x + 40, y + 38, escape(kind)),
     ]
     for label, py in pins:
         if pin_side == "left":
             rows.append(
-                '<circle cx="%d" cy="%d" r="3.2" fill="#3f3f46"/>' % (x + 10, py))
+                '<circle cx="%d" cy="%d" r="3.2" fill="#3f3f46"/>' % (x + 8, py))
             rows.append(
-                '<text x="%d" y="%d" font-family="sans-serif" font-size="11" '
+                '<text x="%d" y="%d" font-family="sans-serif" font-size="10" '
                 'fill="#d4d4d8">%s</text>'
-                % (x + 22, py + 4, escape(label)))
+                % (x + 18, py + 4, escape(label)))
         else:
             rows.append(
-                '<text x="%d" y="%d" font-family="sans-serif" font-size="11" '
+                '<text x="%d" y="%d" font-family="sans-serif" font-size="10" '
                 'fill="#d4d4d8">%s</text>'
-                % (x + 16, py + 4, escape(label)))
+                % (x + 12, py + 4, escape(label)))
             rows.append(
                 '<circle cx="%d" cy="%d" r="3.2" fill="#3f3f46"/>'
                 % (x + w - 10, py))
@@ -345,31 +345,31 @@ def render_visual_svg(netlist: dict, step_n: int) -> str:
     out.append('<g id="part-esp32" class="schematic-part" data-step="1">')
     out.append("<title>ESP32 DevKit v1 (Board)</title>")
     out.append(
-        '<rect x="%d" y="%d" width="%d" height="%d" rx="16" fill="#141418" '
+        '<rect x="%d" y="%d" width="%d" height="%d" rx="12" fill="#141418" '
         'stroke="#2a2a32" stroke-width="1.4"/>' % (esp_x, esp_y, ESP_W, esp_h))
-    out.append(_icon("esp32", esp_x + 26, esp_y + 30))
+    out.append(_icon("esp32", esp_x + 22, esp_y + 26))
     out.append(
-        '<text x="%d" y="%d" font-family="sans-serif" font-size="13" '
+        '<text x="%d" y="%d" font-family="sans-serif" font-size="12" '
         'font-weight="700" fill="#f4f4f5">ESP32 DevKit v1</text>'
-        % (esp_x + 44, esp_y + 28))
+        % (esp_x + 40, esp_y + 24))
     out.append(
-        '<text x="%d" y="%d" font-family="sans-serif" font-size="10" '
-        'fill="#9ca3af">Board</text>' % (esp_x + 44, esp_y + 44))
+        '<text x="%d" y="%d" font-family="sans-serif" font-size="9" '
+        'fill="#9ca3af">Board</text>' % (esp_x + 40, esp_y + 38))
     for pin, py in esp_pins:
         out.append(
-            '<circle cx="%d" cy="%d" r="3.2" fill="#3f3f46"/>' % (esp_x + 10, py)
+            '<circle cx="%d" cy="%d" r="3.2" fill="#3f3f46"/>' % (esp_x + 8, py)
         )
         out.append(
-            '<text x="%d" y="%d" font-family="sans-serif" font-size="11" '
-            'fill="#d4d4d8">%s</text>' % (esp_x + 22, py + 4, escape(pin)))
+            '<text x="%d" y="%d" font-family="sans-serif" font-size="10" '
+            'fill="#d4d4d8">%s</text>' % (esp_x + 18, py + 4, escape(pin)))
         out.append(
             '<circle cx="%d" cy="%d" r="3.2" fill="#3f3f46"/>'
             % (esp_x + ESP_W - 10, py)
         )
         out.append(
-            '<text x="%d" y="%d" font-family="sans-serif" font-size="11" '
+            '<text x="%d" y="%d" font-family="sans-serif" font-size="10" '
             'fill="#d4d4d8" text-anchor="end">%s</text>'
-            % (esp_x + ESP_W - 22, py + 4, escape(pin)))
+            % (esp_x + ESP_W - 18, py + 4, escape(pin)))
     out.append("</g>")
 
     def _stack(names: list[str], x: int) -> dict[str, dict]:
@@ -382,7 +382,7 @@ def render_visual_svg(netlist: dict, step_n: int) -> str:
                 out.extend(_card(
                     "part-usb_c", 1, x, y, CARD_W, h,
                     "USB-C 5V Adapter", "Power",
-                    _icon("usb_c", x + 26, y + 30), pins))
+                    _icon("usb_c", x + 22, y + 26), pins))
                 placed[name] = {"x": x, "y": y, "h": h, "pins": {
                     "+5V": pins[0][1], "GND": pins[1][1]}}
             else:
@@ -398,7 +398,7 @@ def render_visual_svg(netlist: dict, step_n: int) -> str:
                 out.extend(_card(
                     "part-" + name, step, x, y, CARD_W, h,
                     _title(name), _kind(name),
-                    _icon(name, x + 26, y + 30), pins,
+                    _icon(name, x + 22, y + 26), pins,
                     "left" if x > esp_x else "right"))
                 placed[name] = {"x": x, "y": y, "h": h, "pins": pin_map}
             y += h + 16

@@ -330,6 +330,70 @@ class ProjectFlashEndpointTest(unittest.TestCase):
                                    "compile_failed"))
 
 
+class FlashStreamEndpointTest(unittest.TestCase):
+    def setUp(self):
+        import backend.app.main as app_main
+
+        self.app_main = app_main
+        self.session = {
+            "learning": True, "board": "esp32_devkit",
+            "project_title": "Blink", "project_id": "blink",
+            "pin_map": pin_map_for("esp32_devkit"),
+            "plan": [{"n": 1, "instruction": "Blink.",
+                      "verify": "CHECK_GPIO", "expect": {},
+                      "depends_on_parts": ["led"]}],
+            "visible_parts": ["esp32", "led"],
+            "verified": {"i2c": [], "steps": [{"n": 1}]},
+            "step_index": 1, "code_ready": True}
+        fake_orc = SimpleNamespace(sessions={"s1": self.session},
+                                   Muse=SimpleNamespace(mock=True))
+        patcher = mock.patch.object(app_main, "orchestrator", fake_orc)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        port = mock.patch("backend.app.main._require_flash_port",
+                          return_value="COM3")
+        port.start()
+        self.addCleanup(port.stop)
+
+    def test_fast_checks_still_raise_eagerly(self):
+        from fastapi import HTTPException
+
+        with self.assertRaises(HTTPException) as ctx:
+            self.app_main.api_project_flash_stream("nope", {"port": "COM3"})
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_first_frame_announces_generation(self):
+        frames = ["event: log\ndata: {\"line\": \"Compiling\"}\n\n",
+                  "event: done\ndata: {}\n\n"]
+        code = "void setup(){}void loop(){}"
+        with mock.patch("backend.app.main.generate_code",
+                        return_value=code) as gen:
+            with mock.patch("backend.app.main.iter_final_flash_events",
+                            return_value=iter(frames)) as it:
+                out = list(self.app_main._iter_flash_stream_with_code(
+                    "s1", "COM3", self.session))
+        self.assertTrue(out[0].startswith("event: log\n"))
+        self.assertIn("Generating firmware", out[0])
+        self.assertEqual(out[1:], frames)
+        gen.assert_called_once_with(self.session,
+                                    self.app_main.orchestrator.Muse)
+        it.assert_called_once_with("s1", "COM3", code)
+
+    def test_model_failure_is_error_frame_not_raise(self):
+        from backend.app.adapters import MetaAPIError
+
+        def fail(*args, **kwargs):
+            raise MetaAPIError("api down")
+
+        with mock.patch("backend.app.main.generate_code", side_effect=fail):
+            out = list(self.app_main._iter_flash_stream_with_code(
+                "s1", "COM3", self.session))
+        self.assertIn("Generating firmware", out[0])
+        self.assertTrue(out[1].startswith("event: error\n"))
+        self.assertIn("api down", out[1])
+        self.assertEqual(len(out), 2)
+
+
 class EnsureBundleTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

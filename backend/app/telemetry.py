@@ -21,13 +21,32 @@ _PROOF_BOOT = re.compile(r"rst:|boot:|load:|entry |ets [A-Z]",
                            re.IGNORECASE)
 _PROOF_FAULT_WORD = re.compile(
     r"\b(error|timeout|time-out|fail|failed|nan|no echo|no response|"
-    r"not found|disconnect)\b", re.IGNORECASE)
+    r"not found|disconnect|offline|disconnected)\b", re.IGNORECASE)
 _PROOF_SENTINEL = re.compile(r"(^|:\s*)-1(\D|$)")
 _PROOF_DISTANCE = re.compile(
     r"distance\s*[:=]?\s*(-?\d+(?:\.\d+)?)\s*"
     r"(cm|mm|meters?|inches?|in|m)?", re.IGNORECASE)
 _PROOF_UNIT = re.compile(
     r"(-?\d+(?:\.\d+)?)\s*(cm|mm|meters?|inches?|in|m)\b", re.IGNORECASE)
+_TAGGED_DEVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _\-+]*\Z")
+_TAGGED_METRIC = re.compile(r"[A-Za-z0-9 _\-+%]+\Z")
+_TAGGED_NUMBER = re.compile(r"-?\d+(?:\.\d+)?\Z")
+
+
+def _parse_tagged(text: object) -> dict | None:
+    """Split a DEVICE | METRIC | VALUE | UNIT line, or None.
+
+    Mirrors the browser's parseTaggedTelemetry exactly: strict device
+    and metric tokens keep prose containing "|" on the legacy path.
+    """
+    parts = [p.strip() for p in str(text or "").split("|")]
+    if len(parts) < 3:
+        return None
+    device, metric = parts[0], parts[1]
+    if not _TAGGED_DEVICE.match(device) or not _TAGGED_METRIC.match(metric):
+        return None
+    return {"device": device, "metric": metric, "value": parts[2],
+            "unit": parts[3] if len(parts) > 3 else ""}
 _PROOF_HEARTBEAT = re.compile(r"status|heartbeat|\bhb\b|^ok\b|alive",
                               re.IGNORECASE)
 
@@ -86,10 +105,25 @@ def _proof_class(line: object) -> str | None:
 
     Mirrors the browser classifier exactly (same shapes, same order):
     boot chatter never counts, fault words/sentinels/negatives veto,
-    measurements and heartbeat tokens count.
+    measurements and heartbeat tokens count. Tagged lines triage on
+    their metric + value; any numeric tagged value counts.
     """
     text = str(line or "")
     if not text.strip() or _PROOF_BOOT.search(text):
+        return None
+    tagged = _parse_tagged(text)
+    if tagged is not None:
+        num = None
+        if _TAGGED_NUMBER.match(tagged["value"]):
+            num = float(tagged["value"])
+        if (_PROOF_FAULT_WORD.search(
+                tagged["metric"] + " " + tagged["value"])
+                or (num is not None and num < 0)):
+            return "fault"
+        if num is not None:
+            return "healthy"
+        if _PROOF_HEARTBEAT.search(text):
+            return "healthy"
         return None
     value = None
     m = _PROOF_DISTANCE.search(text)
@@ -167,13 +201,28 @@ def _strip_fences(text: str) -> str:
     return text
 
 
+def _part_wires(wires: list, part: str | None) -> list:
+    """Every netlist wire on one part, for highlighting the whole
+    device — not just the suspect pin."""
+    if not part:
+        return []
+    return [{"part": w.get("part"), "part_pin": w.get("part_pin"),
+             "board_pin": w.get("board_pin")}
+            for w in wires or []
+            if isinstance(w, dict) and w.get("part") == part]
+
+
 def diagnose_telemetry(lines: list, netlist: dict, project_title: str,
-                       brain, board: str | None = None) -> dict:
+                       brain, board: str | None = None,
+                       device: str | None = None,
+                       healthy: list | None = None) -> dict:
     """One model diagnosis for a stalled telemetry stream.
 
-    Returns {"message", "suspect"}: the message is always spoken-safe
-    guidance, the suspect is a netlist wire (part, part_pin, board_pin)
-    or None. Model-written when possible, grounded fallback otherwise.
+    Returns {"message", "suspect", "part_wires"}: the message is
+    always spoken-safe guidance, the suspect is a netlist wire (part,
+    part_pin, board_pin) or None, and part_wires carries every wire
+    on the suspect's part for highlighting the whole device.
+    Model-written when possible, grounded fallback otherwise.
     Never raises.
     """
     from .prompts import (telemetry_diagnose_system,
@@ -182,9 +231,11 @@ def diagnose_telemetry(lines: list, netlist: dict, project_title: str,
     wires = [w for w in (netlist or {}).get("wires", []) or []
              if isinstance(w, dict)]
     if getattr(brain, "mock", False):
-        return {"message": _DIAGNOSE_FALLBACK, "suspect": None}
+        return {"message": _DIAGNOSE_FALLBACK, "suspect": None,
+                "part_wires": []}
     system = telemetry_diagnose_system(board)
-    base_user = telemetry_diagnose_user(lines, wires, project_title)
+    base_user = telemetry_diagnose_user(lines, wires, project_title,
+                                        device, healthy)
     user_msg = base_user
     for _ in (1, 2):
         try:
@@ -195,9 +246,12 @@ def diagnose_telemetry(lines: list, netlist: dict, project_title: str,
             message = str(data.get("message") or "").strip()
             if not message:
                 raise ValueError("diagnosis has no message")
-            return {"message": message,
-                    "suspect": _match_suspect(data.get("suspect"), wires)}
+            suspect = _match_suspect(data.get("suspect"), wires)
+            return {"message": message, "suspect": suspect,
+                    "part_wires": _part_wires(
+                        wires, (suspect or {}).get("part"))}
         except Exception as exc:
             user_msg = (base_user + "\nYour last reply was rejected:\n- %s\n"
                         "Reply with ONLY the corrected JSON object." % exc)
-    return {"message": _DIAGNOSE_FALLBACK, "suspect": None}
+    return {"message": _DIAGNOSE_FALLBACK, "suspect": None,
+            "part_wires": []}

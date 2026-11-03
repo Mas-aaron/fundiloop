@@ -3,281 +3,356 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FundiLoop | AI Assistant</title>
+<title>FundiLoop</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:,">
 </head>
 <body>
+
+<!-- ═══ TOP BAR ═════════════════════════════════════════════════════ -->
 <header class="topbar">
-  <h1 class="logo">FundiLoop</h1>
-  <div class="topbar-right">
-    <button id="wake-toggle" class="small" type="button" aria-pressed="false" title="Listen for the wake word">WAKE OFF</button>
+  <div class="topbar-left">
+    <h1 class="logo">FundiLoop</h1>
     <span id="mode-badge" class="mock" title="LIVE only when the real Meta models are connected">MOCK</span>
+  </div>
+  <div class="stage-tabs" id="stage-tabs">
+    <button class="stage-tab active" data-tab="diagram" type="button">Diagram</button>
+    <button class="stage-tab" data-tab="breadboard" type="button">Breadboard</button>
+    <button class="stage-tab" data-tab="code" type="button">&lt;/&gt; Code</button>
+  </div>
+  <div class="topbar-right">
+    <button id="wake-toggle" class="small" type="button" aria-pressed="false">WAKE OFF</button>
     <button id="settings-btn" class="icon-btn" type="button" aria-label="Settings">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
     </button>
   </div>
 </header>
 
-<main>
-  <div class="hero">
-    <h2 class="hero-title">Hi, I'm Fundi</h2>
-    <p>Tell me what you want to build. I'll plan it, wire it with you, and check every step.</p>
-  </div>
+<!-- ═══ WORKSPACE ════════════════════════════════════════════════════ -->
+<div class="workspace" id="workspace">
 
-  <div class="orb-container">
-    <canvas id="orb-canvas" width="320" height="320" aria-hidden="true"></canvas>
-  </div>
+  <!-- ─── LEFT GUIDE PANEL ────────────────────────────────────────── -->
+  <aside class="guide-panel" id="guide-panel">
 
-  <div id="learn-chapter" class="chapter-title" hidden></div>
-  <div id="instruction" role="status">Hi! I'm ready to help you with your circuit.</div>
-  
-  <div id="state-line" class="chip-row"></div>
-  <progress id="learn-progress" max="100" value="0" hidden></progress>
-
-  <div id="rollcall-bar" class="panel" hidden>
-    <div id="rollcall-q"></div>
-    <div class="btn-row" style="margin-top:8px">
-      <button id="rollcall-ready" class="small" type="button">READY — START BUILDING</button>
-    </div>
-  </div>
-
-  <!-- learn troubleshoot + stretch live in the left drawer. -->
-
-  <div class="mic-container">
-    <button id="talk" class="mic" type="button">
-      <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
-    </button>
-    <p class="mic-hint">Tap to speak</p>
-  </div>
-
-  <div id="talk-hint" class="fine"></div>
-
-  <div class="btn-row" style="margin-bottom: 1rem; justify-content: center;">
-    <button id="handoff-learn" class="small" type="button" hidden>START LEARNING</button>
-  </div>
-
-  <section id="learn-sec" class="panel">
-    <h2>Learn a project</h2>
-    <div class="btn-row" style="margin-bottom: 1rem;">
-      <button id="learn-upload" class="small" type="button">UPLOAD PARTS PHOTO</button>
-    </div>
-    <input id="learn-file" type="file" accept="image/*" hidden>
-    <ol id="learn-parts" class="list"></ol>
-    
-    <label>Project Name</label>
-    <input id="learn-project" type="text" placeholder="e.g. Weather Station">
-    
-    <label>Board</label>
-    <select id="learn-board">
-      <option value="esp32_devkit">ESP32 DevKit</option>
-      <option value="arduino_uno">Arduino Uno</option>
-    </select>
-    
-    <div class="btn-row" style="margin-top: 1rem;">
-      <button id="learn-suggest" class="small">SUGGEST</button>
-      <button id="cook-resume" class="small" hidden>RESUME</button>
-    </div>
-    <div id="learn-results-head" class="fine" style="margin-top: 1rem;"></div>
-    <ol id="learn-cards" class="list" style="margin-top: 0.5rem;"></ol>
-  </section>
-
-  <!-- Guided/Diagnostic home panels: implementations kept, unreachable
-       from the Learning-first UI. -->
-  <div id="guided-home" hidden>
-  <div class="panel">
-    <h2>Verification</h2>
-    <div id="verify">No measurements yet. Press CHECK NOW to begin.</div>
-  </div>
-
-  <div class="panel">
-    <h2>Steps</h2>
-    <ol id="checklist" class="list"></ol>
-  </div>
-
-  <div class="btn-row typed-row">
-    <input id="guide-ask-input" type="text" placeholder="Ask me something..." autocomplete="off">
-    <button id="guide-ask-send" class="small" type="button">Send</button>
-  </div>
-
-  <div class="btn-row" style="margin-top: 1rem; justify-content: center;">
-    <button id="replay" class="small" type="button">Replay</button>
-    <button id="describe" class="small" type="button">Describe</button>
-    <button id="mute" class="small" type="button">Mute</button>
-  </div>
-  </div>
-
-  <section id="passport-sec" class="panel" hidden>
-    <h2>Passport</h2>
-    <div id="passport"></div>
-  </section>
-
-  <!-- code-sec (firmware + learn schematic + learn flash) lives in the
-       left drawer now; see the drawer markup before the script tag. -->
-
-</main>
-
-<div id="resume-bar" hidden>
-  <span id="resume-text"></span>
-  <button id="resume-go" class="small" type="button">RESUME</button>
-</div>
-
-<div id="flash-dialog" hidden>
-  <div class="modal-card flash-card" role="dialog" aria-modal="true" aria-label="Flashing">
-    <h2 id="flash-title">Flashing…</h2>
-    <pre id="flash-console" aria-live="polite"></pre>
-    <progress id="flash-progress" max="100" value="0"></progress>
-    <div id="flash-summary" class="fine"></div>
-    <div class="btn-row" style="margin-top: 1rem;">
-      <button id="flash-close" class="small" type="button">Close</button>
-    </div>
-  </div>
-</div>
-
-<div id="settings-modal" hidden>
-  <div class="modal-card" role="dialog" aria-label="Settings">
-    <h2>Settings</h2>
-    <label>Serial Port</label>
-    <div class="btn-row">
-      <select id="serial-port"></select>
-      <select id="serial-baud">
-        <option value="115200">115200</option>
-        <option value="9600">9600</option>
-      </select>
-    </div>
-    <div class="btn-row" style="margin-top: 0.5rem;">
-      <button id="save-serial" class="small">Save Serial</button>
-      <button id="serial-detect" class="small">Auto Detect</button>
-    </div>
-    <div id="serial-msg" class="fine"></div>
-    
-    <label>Code Analysis</label>
-    <textarea id="code" placeholder="Paste code here..."></textarea>
-    
-    <label>Simulate Fault</label>
-    <select id="fault">
-      <option value="">None</option>
-      <option>SDA_SCL_SWAPPED</option>
-      <option>LOOSE_GND</option>
-      <option>CODE_PIN_MISMATCH</option>
-      <option>SENSOR_DISCONNECTED</option>
-      <option>LED_REVERSED</option>
-    </select>
-
-    <label>Voice</label>
-    <select id="voice">
-      <option value="">Auto</option>
-    </select>
-    <button id="test-voice" class="small">Test Voice</button>
-    <div id="voice-status" class="fine"></div>
-
-    <div class="btn-row" style="margin-top: 1rem;">
-      <button id="rescan" class="small">Rescan</button>
-    </div>
-
-    <div class="btn-row" style="margin-top: 1.5rem;">
-      <button id="settings-close" class="small">Close</button>
-    </div>
-  </div>
-</div>
-
-<div id="cook" hidden>
-  <div class="cook-container">
-    <div class="cook-top">
-      <div>
-        <div id="cook-project" class="cook-project"></div>
-        <div id="cook-step" class="cook-step"></div>
+    <!-- Phase 1 hero (hidden once learning starts) -->
+    <div class="guide-hero" id="guide-hero">
+      <div class="orb-container">
+        <canvas id="orb-canvas" width="260" height="260" aria-hidden="true"></canvas>
       </div>
-      <div class="orb-container-small">
-        <canvas id="cook-orb-canvas" width="80" height="80" aria-hidden="true"></canvas>
-      </div>
-      <div class="btn-row">
-        <button id="cook-stop" class="small" type="button">STOP</button>
-        <button id="cook-exit" class="small" type="button">EXIT</button>
+      <h2 class="hero-title">Hi, I'm Fundi</h2>
+      <p class="hero-sub">Tell me what you want to build.</p>
+    </div>
+
+    <!-- Learn-mode status (Phase 1 only) -->
+    <div id="instruction" role="status" class="instruction-bubble">
+      Hi! I'm ready to help you with your circuit.
+    </div>
+    <div id="state-line" class="chip-row"></div>
+    <div id="learn-chapter" class="chapter-title" hidden></div>
+    <progress id="learn-progress" max="100" value="0" hidden class="progress-bar"></progress>
+
+    <!-- Learn-mode confirm card -->
+    <div id="confirm-bar" class="coach-card" hidden>
+      <div id="confirm-q"></div>
+      <div class="btn-row" style="margin-top:8px">
+        <button id="confirm-yes" class="small" type="button">CONFIRM</button>
+        <button id="confirm-no" class="small" type="button">NOT YET</button>
       </div>
     </div>
-    
-    <div class="cook-progress"><div id="cook-bar"></div></div>
 
-    <!-- The action row moved into the coach bar (TALK + primary) and its
-         overflow (CHECK, PHASE DONE, AUTO, CONFIRM, REPEAT, LOOK, MOVE
-         ON). cook-ready stays as the scripted fallback; the coach
-         primary is the visible READY path. -->
-    <div class="btn-row cook-btns cook-actions" style="flex-wrap: wrap;" hidden>
-      <button id="cook-ready" class="small" type="button" hidden>READY</button>
+    <!-- Roll-call READY card -->
+    <div id="rollcall-bar" class="coach-card" hidden>
+      <div id="rollcall-q"></div>
+      <div class="btn-row" style="margin-top:8px">
+        <button id="rollcall-ready" class="small primary-btn" type="button">READY — START BUILDING</button>
+      </div>
     </div>
 
-    <div class="cook-split">
-      <div class="cook-talk">
-        <div id="cook-chapter" class="chapter-title" hidden></div>
-        <div id="cook-instruction" role="status" class="panel"></div>
-        <div id="cook-heard" class="fine"></div>
-        <!-- Step code, troubleshoot, and stretch live in the left drawer. -->
+    <!-- ── IDEATION SECTION ── -->
+    <section id="learn-sec" class="panel">
+      <div class="input-row">
+        <input id="learn-project" type="text" placeholder="e.g. Ultrasonic parking sensor" class="prompt-input" autocomplete="off">
+        <button id="learn-suggest" class="action-btn" type="button" aria-label="Plan project">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+      <div class="board-row">
+        <label class="small-label">Board</label>
+        <select id="learn-board" class="board-select">
+          <option value="esp32_devkit">ESP32 DevKit</option>
+          <option value="arduino_uno">Arduino Uno</option>
+        </select>
+        <button id="learn-upload" class="ghost-btn" type="button">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          Photo
+        </button>
+        <input id="learn-file" type="file" accept="image/*" hidden>
+      </div>
+      <ol id="learn-parts" class="parts-list"></ol>
+      <div id="learn-results-head" class="fine" style="margin-top:0.4rem"></div>
+      <ol id="learn-cards" class="project-cards"></ol>
+      <div class="btn-row" style="margin-top:0.5rem; justify-content:center">
+        <button id="cook-resume" class="small" hidden type="button">RESUME</button>
+        <button id="handoff-learn" class="small" type="button" hidden>START LEARNING</button>
+      </div>
+    </section>
 
-        <div id="cook-nudge" class="panel" hidden>
-          <span id="cook-nudge-text"></span>
-          <button id="cook-nudge-x" class="small" type="button">DISMISS</button>
-        </div>
+    <div id="talk-hint" class="fine"></div>
 
-        <div id="cook-coach-confirm" class="panel" hidden>
-          <div id="cook-coach-confirm-text"></div>
-          <div class="btn-row" style="margin-top:8px">
-            <button id="cook-coach-yes" class="small" type="button">CONFIRM</button>
-            <button id="cook-coach-no" class="small" type="button">DENY</button>
-          </div>
-        </div>
+    <!-- ══════════════════════════════════════════════════════════════
+         LEARNING LEAF — replaces cook-overlay; lives in left panel.
+         Hidden until a project session starts (enterCookMode shows it).
+         Phases 2–5 guide content all lives here, stage stays clear.
+    ══════════════════════════════════════════════════════════════════ -->
+    <section id="cook-leaf" class="cook-leaf" hidden>
 
-        <div id="cook-killed" class="panel" hidden>
-          <span>Coach stopped.</span>
-          <button id="cook-arm" class="small" type="button">ARM</button>
+      <!-- Project title + orb + step counter -->
+      <div class="leaf-head">
+        <canvas id="cook-orb-canvas" width="80" height="80" class="coach-orb" aria-hidden="true"></canvas>
+        <div class="leaf-head-text">
+          <div id="cook-project" class="cook-project-title"></div>
+          <div id="cook-step" class="cook-step-label"></div>
         </div>
+      </div>
+      <div class="cook-progress"><div id="cook-bar"></div></div>
+      <div id="cook-chapter" class="chapter-title" hidden></div>
 
-        <div class="btn-row cook-btns">
-          <input id="cook-ask-input" type="text" placeholder="Type to the coach…" style="flex:2">
-          <button id="cook-ask-send" class="small" type="button">ASK</button>
+      <!-- ── Step instruction (Phase 2 wiring, Phase 5 rescue) ── -->
+      <div id="cook-instruction" role="status" class="instruction-bubble leaf-instruction">
+        Follow the wiring on the board.
+      </div>
+      <div id="cook-heard" class="heard-text"></div>
+
+      <!-- Phase 2: wire-by-wire guide leaf (mirrors the schematic) -->
+      <div id="cook-guide-panel" class="leaf-wire-guide" hidden>
+        <h3>Key wiring</h3>
+        <div id="cook-guide-parts" class="parts-grid"></div>
+        <ol id="cook-guide-steps" class="guide-steps"></ol>
+      </div>
+
+      <!-- Parts needed this step -->
+      <ol id="cook-parts" class="cook-chips"></ol>
+
+      <!-- Evidence / verification status -->
+      <div id="cook-status" class="fine cook-status-text"></div>
+
+      <!-- Phase 5: rescue card (fault detected) -->
+      <div id="rescue-card" class="coach-card fault-card" hidden>
+        <h3>⚠ Rescue</h3>
+        <div id="rescue-msg" role="status"></div>
+        <div id="rescue-suspect" class="fine" style="margin-top:0.25rem"></div>
+        <div class="btn-row" style="margin-top:0.5rem">
+          <button id="rescue-complete" class="small" type="button">MARK COMPLETE ANYWAY</button>
         </div>
+      </div>
+
+      <!-- Nudge / kill / coach-confirm banners -->
+      <div id="cook-nudge" class="coach-card warn-card" hidden>
+        <span id="cook-nudge-text"></span>
+        <button id="cook-nudge-x" class="ghost-btn" type="button">Dismiss</button>
+      </div>
+      <div id="cook-killed" class="coach-card fault-card" hidden>
+        Coach is stopped.
+        <button id="cook-arm" class="small" type="button">ARM</button>
+      </div>
+      <div id="cook-coach-confirm" class="coach-card" hidden>
+        <div id="cook-coach-confirm-text"></div>
+        <div class="btn-row" style="margin-top:8px">
+          <button id="cook-coach-yes" class="small" type="button">CONFIRM</button>
+          <button id="cook-coach-no" class="small" type="button">DENY</button>
+        </div>
+      </div>
+
+      <!-- Eyeball confirm (unverifiable step) -->
+      <div id="cook-eyeball" hidden>
+        <div id="cook-eyeball-q" role="status" class="fine" style="margin-bottom:0.4rem"></div>
+        <div class="btn-row">
+          <button id="cook-eyeball-yes" class="small" type="button">YES — IT WORKS</button>
+          <button id="cook-eyeball-no" class="small" type="button">NOT YET</button>
+        </div>
+      </div>
+
+      <!-- Step code (view while building) -->
+      <div id="cook-stepcode" class="leaf-code-block" hidden>
+        <div class="code-header">
+          <span class="small-label">Step firmware</span>
+          <button id="cook-copy-step" class="ghost-btn" type="button">Copy</button>
+          <button id="cook-fetch-step" class="ghost-btn" type="button">Refresh</button>
+        </div>
+        <pre id="cook-step-out" class="code-block"></pre>
+      </div>
+
+      <!-- Ask the coach -->
+      <div class="ask-row">
+        <input id="cook-ask-input" class="ask-input" type="text" placeholder="Ask the coach…" autocomplete="off">
+        <button id="cook-ask-send" class="ghost-btn" type="button">Ask</button>
+      </div>
+
+      <!-- Hands-free toggle -->
+      <label class="handsfree-toggle">
+        <input id="cook-handsfree" type="checkbox"> Hands-free mode
+      </label>
+
+      <!-- Phase 4: done + final code -->
+      <div id="cook-done" hidden>
+        <div class="code-header" style="margin-top:0.75rem">
+          <span class="small-label">Project firmware</span>
+          <button id="cook-copy" class="ghost-btn" type="button">Copy</button>
+          <button id="cook-code" class="ghost-btn" type="button">Send</button>
+        </div>
+        <pre id="cook-code-out" class="code-block"></pre>
+      </div>
+
+      <!-- Troubleshoot / stretch ideas -->
+      <ol id="cook-troubleshoot" class="list" hidden></ol>
+      <div id="cook-stretch" class="panel" hidden></div>
+
+    </section><!-- /cook-leaf -->
+
+    <!-- Guided/Diagnostic panels (unreachable from Learning UI) -->
+    <div id="guided-home" hidden>
+      <div class="panel">
+        <h3>Verification</h3>
+        <div id="verify">No measurements yet.</div>
       </div>
       <div class="panel">
-        <h2>Wiring schematic</h2>
-        <div class="fine">Wires draw in with the tutor. Toggle breadboard to see the holes.</div>
-        <div class="btn-row schematic-view-toggle">
+        <h3>Steps</h3>
+        <ol id="checklist" class="list"></ol>
+      </div>
+      <div class="btn-row">
+        <input id="guide-ask-input" type="text" placeholder="Ask me something..." autocomplete="off">
+        <button id="guide-ask-send" class="small" type="button">Send</button>
+      </div>
+      <div class="btn-row" style="margin-top:0.75rem; justify-content:center">
+        <button id="replay" class="small" type="button">Replay</button>
+        <button id="describe" class="small" type="button">Describe</button>
+        <button id="mute" class="small" type="button">Mute</button>
+      </div>
+    </div>
+
+    <section id="passport-sec" class="panel" hidden>
+      <h3>Passport</h3>
+      <div id="passport"></div>
+    </section>
+
+  </aside><!-- /guide-panel -->
+
+  <!-- ─── RIGHT STAGE (diagrams fill this completely) ──────────── -->
+  <main class="stage" id="stage">
+
+    <div class="stage-panel active" id="stage-diagram">
+      <div class="stage-inner">
+        <div class="stage-empty" id="diagram-empty">
+          <div class="stage-empty-icon">
+            <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.25"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          </div>
+          <p>Your circuit diagram will appear here once you start a project.</p>
+        </div>
+        <div class="btn-row schematic-view-toggle" id="schematic-toggle-row" style="display:none">
           <button type="button" class="small schematic-view-btn active" data-view="cards">Pin cards</button>
           <button type="button" class="small schematic-view-btn" data-view="breadboard">Breadboard</button>
         </div>
-        <div id="cook-schematic-svg"></div>
-        <div id="cook-schematic-sel" class="fine"></div>
-        <div id="cook-schematic-wires" class="fine"></div>
-        <!-- Download/speak moved to the coach overflow; connect/flash
-             moved to the left drawer flash section. -->
+        <div id="schematic-svg" class="schematic-canvas"></div>
+        <div id="schematic-sel" class="fine"></div>
+        <div id="schematic-wires" class="wire-list fine"></div>
+        <div class="stage-toolbar" id="schematic-toolbar" hidden>
+          <button id="schematic-download" class="ghost-btn" type="button">↓ SVG</button>
+          <button id="schematic-speak" class="ghost-btn" type="button">▶ Speak wires</button>
+          <span style="flex:1"></span>
+          <button id="schematic-zoom-out" class="ghost-btn" type="button" title="Zoom out">−</button>
+          <span id="schematic-zoom-label" class="fine" style="min-width:3rem;text-align:center">50%</span>
+          <button id="schematic-zoom-in" class="ghost-btn" type="button" title="Zoom in">+</button>
+          <button id="schematic-zoom-fit" class="ghost-btn" type="button" title="Reset zoom">Fit</button>
+        </div>
       </div>
     </div>
 
-    <div class="panel" id="cook-guide-panel" hidden>
-      <h2>Build guide</h2>
-      <h3>Gather all the parts</h3>
-      <div id="cook-guide-parts"></div>
-      <h3>Assembly, step by step</h3>
-      <ol id="cook-guide-steps" class="guide-steps"></ol>
-      <div class="fine">Tap a step to hear each wire as it lights up in the diagram.</div>
+    <div class="stage-panel" id="stage-breadboard">
+      <div class="stage-inner">
+        <div class="stage-empty" id="breadboard-empty">
+          <div class="stage-empty-icon">
+            <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.25"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/></svg>
+          </div>
+          <p>The breadboard wiring view will appear once building starts.</p>
+        </div>
+        <div id="cook-schematic-svg" class="schematic-canvas"></div>
+        <div id="cook-schematic-sel" class="fine"></div>
+        <div id="cook-schematic-wires" class="wire-list fine"></div>
+        <div class="stage-toolbar" id="cook-schematic-toolbar" hidden>
+          <button id="cook-schematic-download" class="ghost-btn" type="button">↓ SVG</button>
+          <button id="cook-schematic-speak" class="ghost-btn" type="button">▶ Speak wires</button>
+          <span style="flex:1"></span>
+          <button id="cook-schematic-zoom-out" class="ghost-btn" type="button" title="Zoom out">−</button>
+          <span id="cook-schematic-zoom-label" class="fine" style="min-width:3rem;text-align:center">50%</span>
+          <button id="cook-schematic-zoom-in" class="ghost-btn" type="button" title="Zoom in">+</button>
+          <button id="cook-schematic-zoom-fit" class="ghost-btn" type="button" title="Reset zoom">Fit</button>
+        </div>
+      </div>
     </div>
 
-    <ol id="cook-parts" class="cook-chips"></ol>
+    <div class="stage-panel" id="stage-code-panel">
+      <div class="stage-inner code-stage">
+        <div class="code-header-stage">
+          <span class="small-label" id="stage-code-label">Firmware</span>
+          <div id="stage-code-kind" class="fine" style="margin:0"></div>
+          <div style="flex:1"></div>
+          <button id="stage-copy-code" class="ghost-btn" type="button">Copy</button>
+          <button id="stage-send-code" class="ghost-btn" type="button">Send to Board</button>
+        </div>
+        <pre id="stage-code-out" class="code-block code-stage-pre"></pre>
+      </div>
+    </div>
 
-    <div id="cook-status" class="panel">No measurements yet.</div>
+  </main><!-- /stage -->
+</div><!-- /workspace -->
 
-    <label class="cook-handsfree">
-      <input id="cook-handsfree" type="checkbox"> Hands-free mode
-    </label>
-    
-    <!-- cook-done (final code) lives in the left drawer. -->
+<!-- ═══ COACH BAR — thin action strip at bottom of stage ═══════════
+     Contains ONLY the single primary action + mic/mute/more.
+     All step content lives in #cook-leaf in the left panel.
+═══════════════════════════════════════════════════════════════════ -->
+<div id="coach-bar" hidden>
+  <div id="coach-text" class="coach-bar-text" role="status"></div>
+  <div class="coach-actions">
+    <button id="coach-primary" class="primary-btn coach-primary-btn" type="button">Next</button>
+    <button id="cook-talk" class="icon-action-btn" type="button" title="Talk" aria-label="Talk">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+    </button>
+    <button id="coach-voice" class="icon-action-btn" type="button" title="Mute voice">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+    </button>
+    <button id="coach-more" class="icon-action-btn" type="button" title="More actions">···</button>
   </div>
+  <div id="coach-overflow" class="btn-row" hidden>
+    <button id="cook-repeat" class="small" type="button">REPEAT</button>
+    <button id="cook-look" class="small" type="button">LOOK</button>
+    <button id="cook-schematic-download-overflow" class="small" type="button">DOWNLOAD SVG</button>
+    <button id="cook-schematic-speak-overflow" class="small" type="button">SPEAK WIRES</button>
+  <!-- /coach-overflow -->
+  </div>
+  <button id="cook-ready" class="small" type="button" hidden>READY</button>
 </div>
 
-<!-- Three-zone layout: center stage above, coach bar fixed at the
-     bottom, drawers collapsed on the edges. All ids below are the same
-     ones the script has always wired; only their homes changed. -->
+<!-- ═══ DEPLOY BAR — port + connect + deploy ═══════════════════════ -->
+<div id="deploy-bar" hidden>
+  <span id="deploy-label" class="deploy-label">Deploy firmware</span>
+  <span id="cook-flash-status" class="fine deploy-status" role="status"></span>
+  <progress id="cook-webflash-progress" max="100" value="0" hidden class="deploy-progress"></progress>
+  <select id="cook-flash-port" aria-label="Serial port" class="port-select"></select>
+  <button id="cook-web-connect" class="deploy-btn connect-btn" type="button">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+    Connect
+  </button>
+  <button id="cook-deploy" class="deploy-btn deploy-primary" type="button">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+    Deploy
+  </button>
+</div>
+<!-- /deploy-bar -->
+
+<!-- ═══ LEFT DRAWER — code + flash + fix-it + log ══════════════════ -->
 <button id="left-drawer-tab" class="drawer-tab left" type="button">CODE</button>
 <aside id="left-drawer" class="drawer left" hidden>
   <div class="drawer-head">
@@ -288,79 +363,59 @@
   <section id="code-sec" class="panel" hidden>
     <h2>Project Firmware</h2>
     <div id="code-kind" class="fine"></div>
-    <div class="btn-row" style="margin-bottom: 1rem;">
+    <div class="btn-row" style="margin-bottom:0.75rem">
       <button id="send-code" class="small" type="button">Send to Board</button>
       <button id="copy-code" class="small" type="button">Copy</button>
     </div>
-    <pre id="code-out"></pre>
+    <pre id="code-out" class="code-block"></pre>
     <div id="schematic-panel">
       <h3>Wiring schematic</h3>
-      <div class="fine">Wires draw in with the tutor. Toggle breadboard to see the holes.</div>
-      <div class="btn-row schematic-view-toggle">
+      <div class="fine">Wires draw in with the tutor.</div>
+      <div class="btn-row schematic-view-toggle" style="margin:0.5rem 0">
         <button type="button" class="small schematic-view-btn active" data-view="cards">Pin cards</button>
         <button type="button" class="small schematic-view-btn" data-view="breadboard">Breadboard</button>
       </div>
-      <div id="schematic-svg"></div>
-      <div id="schematic-sel" class="fine"></div>
-      <div id="schematic-wires" class="fine"></div>
-      <div class="btn-row" style="margin-top: 0.5rem;">
-        <button id="schematic-download" class="small" type="button">Download SVG</button>
-        <button id="schematic-speak" class="small" type="button">Speak wires</button>
+      <div id="schematic-svg-drawer" class="schematic-canvas"></div>
+      <div id="schematic-wires-drawer" class="fine" style="white-space:pre-line;text-align:left"></div>
+      <div class="btn-row" style="margin-top:0.5rem">
+        <button id="schematic-download-drawer" class="small" type="button">Download SVG</button>
+        <button id="schematic-speak-drawer" class="small" type="button">Speak wires</button>
       </div>
-      <div class="fine" style="margin-top: 0.75rem;">FLASH FINAL uses the server's native esptool at 921600 baud, the same auto-reset upload path as Arduino IDE.</div>
-      <div class="btn-row" style="margin-top: 0.5rem;">
+      <div class="fine" style="margin-top:0.75rem">FLASH ESP32 uses native esptool at 921600 baud.</div>
+      <div class="btn-row" style="margin-top:0.5rem">
         <select id="flash-port" aria-label="ESP32 serial port"></select>
         <button id="flash-final" class="small" type="button">FLASH FINAL</button>
       </div>
       <div id="flash-status" class="fine"></div>
-      <div class="fine" style="margin-top: 0.75rem;">Or flash from this browser over Web Serial (Chrome/Edge): CONNECT BOARD picks the port, then FLASH IN BROWSER writes the finished firmware.</div>
-      <div class="btn-row" style="margin-top: 0.5rem;">
+      <div class="fine" style="margin-top:0.75rem">Or flash from this browser over Web Serial (Chrome/Edge).</div>
+      <div class="btn-row" style="margin-top:0.5rem">
         <button id="web-connect" class="small" type="button">CONNECT BOARD</button>
         <button id="web-flash" class="small" type="button">FLASH IN BROWSER</button>
       </div>
-      <progress id="webflash-progress" max="100" value="0" hidden style="width: 100%;"></progress>
+      <progress id="webflash-progress" max="100" value="0" hidden style="width:100%"></progress>
       <div id="webflash-status" class="fine"></div>
     </div>
   </section>
 
-  <div id="cook-done" hidden>
-    <div class="panel" style="margin-top: 1rem;">
-      <h2>Project Code</h2>
-      <div class="btn-row" style="margin-bottom: 1rem;">
-        <button id="cook-code" class="small" type="button">SEND CODE</button>
-        <button id="cook-copy" class="small" type="button">COPY</button>
-      </div>
-      <pre id="cook-code-out"></pre>
-    </div>
-  </div>
-
   <section class="panel">
     <h3>Fix-it</h3>
     <ol id="learn-troubleshoot" class="list" hidden></ol>
-    <ol id="cook-troubleshoot" class="list" hidden></ol>
-    <div id="rescue-card" class="panel" hidden>
-      <h3>Rescue</h3>
-      <div id="rescue-msg" role="status"></div>
-      <div id="rescue-suspect" class="fine"></div>
-      <div class="btn-row" style="margin-top: 0.5rem;">
-        <button id="rescue-complete" class="small" type="button" title="Finish without telemetry proof (logged as unverified)">MARK COMPLETE ANYWAY</button>
-      </div>
-    </div>
   </section>
 
   <section class="panel">
     <h3>What's next</h3>
     <div id="learn-stretch" class="panel" hidden></div>
-    <div id="cook-stretch" class="panel" hidden></div>
   </section>
 
   <section class="panel">
     <h3>Coach</h3>
     <ol id="coach-log" class="list"></ol>
   </section>
+
 <!-- /left-drawer -->
 </aside>
 
+<!-- ═══ RIGHT DRAWER — live serial monitor ═════════════════════════ -->
 <button id="right-drawer-tab" class="drawer-tab right" type="button">MONITOR</button>
 <aside id="right-drawer" class="drawer right" hidden>
   <div class="drawer-head">
@@ -368,40 +423,83 @@
     <button id="right-drawer-close" class="small" type="button">Close</button>
   </div>
   <div id="monitor-meta" class="fine">Not connected.</div>
-  <pre id="monitor-out" aria-live="polite"></pre>
-  <div class="btn-row" style="margin-top: 0.5rem;">
+  <div id="monitor-port-row" class="monitor-port-row">
+    <select id="monitor-port" aria-label="Board port"></select>
+    <button id="monitor-refresh" class="small" type="button">Refresh</button>
+  </div>
+  <pre id="monitor-out" aria-live="polite" class="monitor-out"></pre>
+  <div class="btn-row" style="margin-top:0.5rem">
     <button id="monitor-start" class="small" type="button">START</button>
     <button id="monitor-stop" class="small" type="button">STOP</button>
   </div>
 <!-- /right-drawer -->
 </aside>
 
-<div id="coach-bar" hidden>
-  <div id="coach-text" role="status"></div>
-  <div class="coach-actions">
-    <button id="coach-primary" class="primary" type="button">Next</button>
-    <button id="cook-talk" class="small" type="button">TALK</button>
-    <button id="coach-voice" class="small" type="button">Mute</button>
-    <button id="coach-more" class="small" type="button">···</button>
-  </div>
-  <div id="coach-overflow" class="btn-row" hidden>
-    <button id="cook-repeat" class="small" type="button">REPEAT</button>
-    <button id="cook-look" class="small" type="button">LOOK</button>
-    <button id="cook-schematic-download" class="small" type="button">DOWNLOAD SVG</button>
-    <button id="cook-schematic-speak" class="small" type="button">SPEAK WIRES</button>
-  <!-- /coach-overflow -->
+<!-- ═══ FLOATING MIC (home screen only) ════════════════════════════ -->
+<button id="talk" class="fab-mic" type="button" aria-label="Push to talk">
+  <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+</button>
+
+<!-- ═══ MODALS ═══════════════════════════════════════════════════════ -->
+<div id="flash-dialog" hidden>
+  <div class="modal-card flash-card" role="dialog" aria-modal="true" aria-label="Flashing">
+    <h2 id="flash-title" style="margin:0 0 1rem">Flashing…</h2>
+    <pre id="flash-console" aria-live="polite"></pre>
+    <progress id="flash-progress" max="100" value="0" style="width:100%;margin-bottom:0.5rem"></progress>
+    <div id="flash-summary" class="fine"></div>
+    <div class="btn-row" style="margin-top:1rem">
+      <button id="flash-close" class="small" type="button">Close</button>
+    </div>
   </div>
 </div>
 
-<div id="deploy-bar" hidden>
-  <span id="deploy-label">Deploy firmware</span>
-  <span id="cook-flash-status" class="fine" role="status"></span>
-  <progress id="cook-webflash-progress" max="100" value="0" hidden></progress>
-  <select id="cook-flash-port" aria-label="ESP32 serial port for server deploy"></select>
-  <button id="cook-web-connect" class="small" type="button">CONNECT BOARD</button>
-  <button id="cook-deploy" class="primary" type="button">DEPLOY</button>
+<div id="settings-modal" hidden>
+  <div class="modal-card" role="dialog" aria-label="Settings">
+    <h2 style="margin:0 0 1rem">Settings</h2>
+    <label>Serial Port</label>
+    <div class="btn-row">
+      <select id="serial-port"></select>
+      <select id="serial-baud">
+        <option value="115200">115200</option>
+        <option value="9600">9600</option>
+      </select>
+    </div>
+    <div class="btn-row" style="margin-top:0.5rem">
+      <button id="save-serial" class="small">Save Serial</button>
+      <button id="serial-detect" class="small">Auto Detect</button>
+    </div>
+    <div id="serial-msg" class="fine"></div>
+    <label>Code Analysis</label>
+    <textarea id="code" placeholder="Paste code here..."></textarea>
+    <label>Simulate Fault</label>
+    <select id="fault">
+      <option value="">None</option>
+      <option>SDA_SCL_SWAPPED</option>
+      <option>LOOSE_GND</option>
+      <option>CODE_PIN_MISMATCH</option>
+      <option>SENSOR_DISCONNECTED</option>
+      <option>LED_REVERSED</option>
+    </select>
+    <label>Voice</label>
+    <select id="voice"><option value="">Auto</option></select>
+    <button id="test-voice" class="small">Test Voice</button>
+    <div id="voice-status" class="fine"></div>
+    <div class="btn-row" style="margin-top:1rem">
+      <button id="rescan" class="small">Rescan</button>
+    </div>
+    <div class="btn-row" style="margin-top:1.5rem">
+      <button id="settings-close" class="small">Close</button>
+    </div>
+  </div>
 </div>
-<!-- /deploy-bar -->
+
+<div id="resume-bar" hidden>
+  <span id="resume-text"></span>
+  <button id="resume-go" class="small" type="button">RESUME</button>
+</div>
+
+<!-- #cook shim — keeps JS references alive; never shown -->
+<div id="cook" hidden aria-hidden="true"></div>
 
 <script src="/app.js"></script>
 </body>

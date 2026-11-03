@@ -256,7 +256,8 @@ def telemetry_diagnose_system(board: str | None = None) -> str:
 
 
 def telemetry_diagnose_user(lines: list, wires: list,
-                            project_title: str) -> str:
+                            project_title: str, device: str | None = None,
+                            healthy: list | None = None) -> str:
     """Ask Fundi which wire to suspect for a stalled stream."""
     compact = [
         {"part": w.get("part"), "part_pin": w.get("part_pin"),
@@ -264,10 +265,18 @@ def telemetry_diagnose_user(lines: list, wires: list,
         for w in (wires or []) if isinstance(w, dict)
     ]
     tail = [str(line)[:200] for line in (lines or [])][-30:]
+    scope = ""
+    if device:
+        scope = "Failed device: %s. " % device
+        if healthy:
+            scope += "Still healthy: %s. " % ", ".join(
+                str(h) for h in healthy)
+        scope += ("Suspect a wire on the failed device; the healthy "
+                  "ones exonerate shared power and ground.\n")
     return (
-        "Project: %s.\nRecent telemetry lines: %s\nNetlist wires: %s\n"
+        "Project: %s.\n%sRecent telemetry lines: %s\nNetlist wires: %s\n"
         "Write the diagnosis in the required JSON format."
-        % (project_title or "project", json.dumps(tail),
+        % (project_title or "project", scope, json.dumps(tail),
            json.dumps(compact))
     )
 
@@ -278,7 +287,8 @@ def learning_code_prompt(project_title: str, plan: list, visible_parts: list,
 
     The telemetry contract is load-bearing: the build proves itself
     through live serial lines, so every firmware MUST open Serial at
-    115200 and print readings plus a STATUS heartbeat every loop.
+    115200 and print one tagged line per device plus a SYS heartbeat
+    every loop.
     """
     return (
         "Generate the complete Arduino (.ino) firmware for this "
@@ -286,16 +296,21 @@ def learning_code_prompt(project_title: str, plan: list, visible_parts: list,
         "Telemetry contract (REQUIRED — the build is verified from "
         "these lines, and firmware without them is rejected): open "
         "Serial at 115200 baud in setup(); every loop() MUST print "
-        "the live readings with units (e.g. Distance: 45cm) plus a "
-        "heartbeat line containing STATUS, even for builds with no "
-        "sensor — never run silent.\n"
+        "one tagged line per device as DEVICE | METRIC | VALUE | UNIT "
+        "(e.g. HC-SR04 | DIST | 45.0 | cm, BME280 | TEMP | 24.5 | C, "
+        "LED | STATE | HIGH | -) plus a SYS | HEARTBEAT | OK | - line, "
+        "even for builds with no sensor — never run silent. Report a "
+        "dead reading as its metric with TIMEOUT, e.g. "
+        "HC-SR04 | DIST | TIMEOUT | cm.\n"
         "project: %s\ntarget board: %s (%s logic)\nplan: %s\n"
         "visible parts: %s\nmeasured sensor evidence: %s\n"
         "board pin map (USE THESE EXACT NUMBERS): SDA=%s SCL=%s LED=%s. "
         "I2C addresses seen on the bus: %s. "
         "Pin numbers MUST come from the board pin map; I2C addresses "
         "from measured evidence where present, else the interface "
-        "defaults in the plan."
+        "defaults in the plan.\n"
+        "Reply with the complete .ino sketch only — no JSON, "
+        "no fences, no prose."
         % (project_title, pin_map.get("label", pin_map.get("board", "?")),
            pin_map.get("voltage", "?"), json.dumps(plan)[:3000],
            ", ".join(visible_parts), json.dumps(verified)[:2000],

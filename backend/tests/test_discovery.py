@@ -528,6 +528,15 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(len(Muse.calls), 1)
         self.assertNotIn("hint", res)
 
+    def test_plan_mock_mode_returns_valid_project(self):
+        res = discovery.plan_projects([], "Ultrasonic parking sensor",
+                                      None, board="esp32_devkit")
+        self.assertEqual(len(res["projects"]), 1)
+        proj = res["projects"][0]
+        self.assertTrue(proj["steps"])
+        self.assertIn("ultrasonic", proj["title"].lower())
+        self.assertNotIn("hint", res)
+
     def test_prompt_request_mode_drops_visibility_rule(self):
         from backend.app.capabilities import AVAILABLE_TESTS
         from backend.app.prompts import plan_system_prompt
