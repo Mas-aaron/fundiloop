@@ -7,8 +7,8 @@ telemetry from the real board proves it works. It is not a chatbot, not a
 RAG app, and not a simple image analyzer.
 
 Current focus is **Learning mode** (board-general — ESP32 DevKit and
-Arduino Uno, tap-paced, telemetry-proven). The camera-verified Guided
-Assembly / Diagnostic flows are paused for now (see below).
+Arduino Uno, tap-paced, telemetry-proven). An additional camera-verified
+layer adds live overhead vision on top (see below).
 
 ## Repo layout
 
@@ -22,12 +22,12 @@ Assembly / Diagnostic flows are paused for now (see below).
   (`PING`, `I2C_SCAN`, `READ_SENSOR`, `SELFTEST` over USB serial as JSON lines)
 - `frontend/` — web UI served at `/` (plain HTML/JS, no framework)
 - `.env.example` — config template (`SERIAL_PORT`, Meta keys, TTS + coach +
-  toolchain settings; `CAMERA_*` keys belong to the paused camera path)
+  toolchain settings; `CAMERA_*` keys feed the additional camera feature)
 - Legacy Day-1 files (`backend/main.py`, `backend/static/`, `esp32/`,
   `CameraWebServer_fundiloop/`) are kept for reference; the app runs from
   `backend/app/` + `frontend/`.
-- `scripts/e2e_mock_demo.py` — mock-mode rehearsal of the paused guided /
-  diagnostic run (kept for when the camera path resumes).
+- `scripts/e2e_mock_demo.py` — mock-mode rehearsal of the additional guided /
+  diagnostic run.
 
 ## Architecture
 
@@ -82,11 +82,16 @@ and a right stage.
 
 ## How each Meta tool is used
 
-- **Muse Spark** (`MetaClaudeAdapter`): plans projects, writes teach-style
-  chapters, generates the Arduino firmware, and diagnoses stalled telemetry
-  streams. JSON callers validate and retry once on bad output; firmware
-  codegen runs as plain text with its own longer timeout. Advisory only —
-  telemetry decides pass/fail.
+- **SAM 3.1** (`MetaSAMAdapter`): grounds part regions in uploaded photos —
+  one call per part prompt (plus jumper wire + breadboard), overlapped 8 at
+  a time — returning labeled boxes + confidences for the scene reading.
+- **Muse Spark** (`MetaClaudeAdapter`): reads each uploaded photo (a 448px
+  still plus the SAM regions) into structured scene JSON — visible parts,
+  connections, uncertainties; plans projects; writes teach-style chapters;
+  generates the Arduino firmware; and diagnoses stalled telemetry streams.
+  JSON callers validate and retry once on bad output; firmware codegen runs
+  as plain text with its own longer timeout. Advisory only — telemetry
+  decides pass/fail.
 - **Voice Transcribe** (`MetaVoiceAdapter`): transcribes push-to-talk
   uploads from `POST /api/voice/transcribe`. Transcripts containing
   "done", "next", "move on", "finish", "complete", or "ready" advance the
@@ -137,14 +142,15 @@ share one busy guard; checks and flashes block each other with a retap
 prompt instead of dead-ending. Server flashes are audit-logged to
 `backend/logs/coach_audit.jsonl`.
 
-## Paused for now — camera path
+## Additional feature — live camera verification
 
-The overhead-camera loop is paused; the code stays in the repo but the UI
-and this README focus on Learning mode:
+On top of the core Learning flow, an additional camera-verified layer
+watches the bench live:
 
-- ESP32-CAM overhead frames + motion-gated change detection
-  (`camera_client.py`, `change_detector.py`).
-- SAM 3.1 segmentation of settled frames (`MetaSAMAdapter`).
+- ESP32-CAM overhead frames + motion-gated change detection, so vision
+  runs on settled frames only (`camera_client.py`, `change_detector.py`).
+- Per-turn sense pass: settled frame + SAM regions + serial probe merged
+  before every Muse decision.
 - Guided Assembly / Diagnostic sensor-verified flows, including the fault
   library (`SDA_SCL_SWAPPED`, `LOOSE_GND`, `CODE_PIN_MISMATCH`,
   `SENSOR_DISCONNECTED`, `LED_REVERSED`).
@@ -216,8 +222,11 @@ board — never the model's word alone.
 
 There is no fixed project catalog. Discovery is generative:
 
-- `POST /discover/parts` reports what equipment is visible in an uploaded
-  parts photo.
+- `POST /discover/upload` saves an equipment photo (no camera needed);
+  `POST /discover/parts` reports what is visible in it via
+  `understand_scene`: SAM grounds the regions, Muse reads the still into
+  structured JSON, and Python cross-checks every named part against a SAM
+  box (0.6 confidence bar; failures land in `uncertainties`, never raise).
 - `POST /discover/projects` returns model-generated build plans, each step
   mapped to a real verification test.
 - The `AVAILABLE_TESTS` registry (`backend/app/capabilities.py`) lists the
@@ -236,6 +245,7 @@ MOCK_META=false
 META_API_KEY=<key>
 META_API_BASE_URL=https://api.meta.ai/v1
 MUSE_MODEL=muse-spark-1.3
+SAM_MODEL=sam-3.1
 VOICE_MODEL=meta-voice-1
 TTS_PROVIDER=kokoro
 KOKORO_VOICE=af_heart
